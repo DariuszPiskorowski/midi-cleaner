@@ -2,19 +2,21 @@
 
 Hermes MIDI Fidelity Engine project scaffold.
 
-This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 2**: environment guard plus MIDI candidate import to Hermes note-event JSON.
+This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 3**: environment guard, MIDI candidate import, and lightweight WAV stem analysis.
 
 ## Current Milestone
 
-Milestone 2 implements:
+Milestone 3 implements:
 - Python package scaffold
 - Strict Python 3.11 guard
 - Runtime/environment report via CLI doctor command
 - MIDI candidate import from `.mid` using `mido`
 - Hermes note-event JSON export and import report JSON
-- Tests for guard behavior, CLI JSON output, and MIDI import behavior
+- WAV stem feature extraction using `numpy`, `scipy`, and `soundfile`
+- Audio feature JSON export and audio analysis report JSON
+- Tests for guard behavior, MIDI import, and audio analysis behavior
 
-MIDI cleaning, WAV comparison, rendering, UI, and ML are not implemented yet.
+MIDI-vs-WAV validation, MIDI cleaning, rendering, UI, and ML are not implemented yet.
 
 ## Requirements
 
@@ -71,6 +73,18 @@ Example:
 
 ```powershell
 uv run midi-cleaner midi import-candidate .\candidate.mid --source ripx --layer bass --output .\artifacts\note_events.json --report .\artifacts\midi_import_report.json
+```
+
+## WAV Stem Analysis
+
+```powershell
+uv run midi-cleaner audio analyze-stem INPUT_WAV --layer bass --output OUTPUT_JSON --report REPORT_JSON
+```
+
+Example:
+
+```powershell
+uv run midi-cleaner audio analyze-stem .\stem.wav --layer bass --output .\artifacts\audio_features.json --report .\artifacts\audio_analysis_report.json
 ```
 
 ## Planned Pipeline

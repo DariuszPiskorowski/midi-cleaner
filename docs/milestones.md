@@ -16,6 +16,13 @@
 - Export import report JSON with note/track/tempo/warning counts.
 - Keep WAV analysis and cleaner logic out of this milestone.
 
+## Milestone 3 - Lightweight WAV Stem Analyzer
+- Add lightweight WAV analysis with `numpy`, `scipy`, and `soundfile`.
+- Add CLI command `midi-cleaner audio analyze-stem`.
+- Extract per-frame and global deterministic audio features.
+- Export feature document JSON and analysis report JSON.
+- Keep MIDI-vs-WAV validation and cleaner actions out of this milestone.
+
 ## Future Milestones (Planned)
 - Compare note-event candidates against WAV stems.
 - Classify actions: KEEP, MUTE, MERGE, SHORTEN, QUANTIZE, REASSIGN, DELETE.

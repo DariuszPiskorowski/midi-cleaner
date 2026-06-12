@@ -7,14 +7,17 @@ from rich.console import Console
 from rich.table import Table
 
 from midi_cleaner import __version__
+from midi_cleaner.audio.analyzer import AudioAnalysisError, analyze_stem
 from midi_cleaner.midi.importer import MidiImportError, import_midi_candidate
 from midi_cleaner.runtime.report import RuntimeReport, build_runtime_report
 
 app = typer.Typer(add_completion=False, help="Hermes MIDI Fidelity Engine CLI")
 midi_app = typer.Typer(help="MIDI candidate import tools.")
+audio_app = typer.Typer(help="Audio stem analysis tools.")
 console = Console()
 
 app.add_typer(midi_app, name="midi")
+app.add_typer(audio_app, name="audio")
 
 
 def version_callback(value: bool) -> None:
@@ -134,6 +137,35 @@ def import_candidate(
         f"notes={import_report.note_count}, "
         f"tracks={import_report.track_count}, "
         f"warnings={import_report.warning_count}"
+    )
+
+
+@audio_app.command("analyze-stem")
+def analyze_stem_command(
+    input_wav: Path = typer.Argument(..., help="Path to input WAV stem file."),
+    layer: str = typer.Option(..., "--layer", help="Logical instrument layer, e.g. bass."),
+    output: Path = typer.Option(..., "--output", help="Output path for audio feature JSON."),
+    report: Path = typer.Option(..., "--report", help="Output path for analysis report JSON."),
+) -> None:
+    try:
+        document, analysis_report = analyze_stem(input_wav=input_wav, layer=layer)
+    except AudioAnalysisError as exc:
+        typer.echo(f"Audio analysis failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    report.parent.mkdir(parents=True, exist_ok=True)
+
+    output.write_text(document.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    analysis_report.output_file = str(output)
+    report.write_text(analysis_report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    typer.echo(
+        "Analyzed WAV stem: "
+        f"frames={analysis_report.frame_count}, "
+        f"onsets={analysis_report.onset_count}, "
+        f"warnings={analysis_report.warning_count}"
     )
 
 
