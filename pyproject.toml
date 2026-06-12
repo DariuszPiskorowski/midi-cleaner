@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "midi-cleaner"
+version = "0.1.0"
+description = "Hermes MIDI Fidelity Engine - Milestone 1 environment guard"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "typer>=0.12,<1.0",
+  "rich>=13.7,<14.0",
+  "pydantic>=2.8,<3.0",
+  "packaging>=24.1,<25.0",
+]
+
+[project.scripts]
+midi-cleaner = "midi_cleaner.cli:app"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.2,<9.0",
+  "ruff>=0.5,<1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
