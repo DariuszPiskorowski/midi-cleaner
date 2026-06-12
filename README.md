@@ -2,17 +2,19 @@
 
 Hermes MIDI Fidelity Engine project scaffold.
 
-This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 1** only: project skeleton and strict runtime environment guard.
+This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 2**: environment guard plus MIDI candidate import to Hermes note-event JSON.
 
 ## Current Milestone
 
-Milestone 1 implements:
+Milestone 2 implements:
 - Python package scaffold
 - Strict Python 3.11 guard
 - Runtime/environment report via CLI doctor command
-- Basic tests for guard behavior and CLI JSON output
+- MIDI candidate import from `.mid` using `mido`
+- Hermes note-event JSON export and import report JSON
+- Tests for guard behavior, CLI JSON output, and MIDI import behavior
 
-No MIDI cleaning or audio processing is implemented yet.
+MIDI cleaning, WAV comparison, rendering, UI, and ML are not implemented yet.
 
 ## Requirements
 
@@ -57,6 +59,18 @@ Write JSON report to file:
 
 ```powershell
 uv run midi-cleaner doctor --output runtime_report.json
+```
+
+## MIDI Candidate Import
+
+```powershell
+uv run midi-cleaner midi import-candidate INPUT_MIDI --source ripx --layer bass --output OUTPUT_JSON --report REPORT_JSON
+```
+
+Example:
+
+```powershell
+uv run midi-cleaner midi import-candidate .\candidate.mid --source ripx --layer bass --output .\artifacts\note_events.json --report .\artifacts\midi_import_report.json
 ```
 
 ## Planned Pipeline

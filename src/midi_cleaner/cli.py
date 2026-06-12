@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import typer
@@ -8,10 +7,14 @@ from rich.console import Console
 from rich.table import Table
 
 from midi_cleaner import __version__
+from midi_cleaner.midi.importer import MidiImportError, import_midi_candidate
 from midi_cleaner.runtime.report import RuntimeReport, build_runtime_report
 
 app = typer.Typer(add_completion=False, help="Hermes MIDI Fidelity Engine CLI")
+midi_app = typer.Typer(help="MIDI candidate import tools.")
 console = Console()
+
+app.add_typer(midi_app, name="midi")
 
 
 def version_callback(value: bool) -> None:
@@ -102,6 +105,36 @@ def doctor(
 
     if report.status == "error":
         raise typer.Exit(code=1)
+
+
+@midi_app.command("import-candidate")
+def import_candidate(
+    input_midi: Path = typer.Argument(..., help="Path to input candidate .mid file."),
+    source: str = typer.Option(..., "--source", help="Candidate source label, e.g. ripx."),
+    layer: str = typer.Option(..., "--layer", help="Logical instrument layer, e.g. bass."),
+    output: Path = typer.Option(..., "--output", help="Output path for note-event JSON."),
+    report: Path = typer.Option(..., "--report", help="Output path for import report JSON."),
+) -> None:
+    try:
+        document, import_report = import_midi_candidate(input_midi, source=source, layer=layer)
+    except MidiImportError as exc:
+        typer.echo(f"Import failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    report.parent.mkdir(parents=True, exist_ok=True)
+
+    output.write_text(document.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    import_report.output_file = str(output)
+    report.write_text(import_report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    typer.echo(
+        "Imported MIDI candidate: "
+        f"notes={import_report.note_count}, "
+        f"tracks={import_report.track_count}, "
+        f"warnings={import_report.warning_count}"
+    )
 
 
 if __name__ == "__main__":
