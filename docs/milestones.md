@@ -23,7 +23,13 @@
 - Export feature document JSON and analysis report JSON.
 - Keep MIDI-vs-WAV validation and cleaner actions out of this milestone.
 
+## Milestone 4 - First MIDI-vs-Audio Validation Pass
+- Add CLI command `midi-cleaner validate midi-vs-audio`.
+- Validate imported note events against analyzed audio frame features.
+- Compute deterministic per-note confidence and recommended action.
+- Export note validation JSON and validation report JSON.
+- Keep cleaning, rewriting, and pitch/harmonic validation out of this milestone.
+
 ## Future Milestones (Planned)
-- Compare note-event candidates against WAV stems.
 - Classify actions: KEEP, MUTE, MERGE, SHORTEN, QUANTIZE, REASSIGN, DELETE.
 - Export cleaned MIDI and machine-readable QA reports.

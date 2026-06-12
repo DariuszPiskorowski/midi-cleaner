@@ -10,14 +10,21 @@ from midi_cleaner import __version__
 from midi_cleaner.audio.analyzer import AudioAnalysisError, analyze_stem
 from midi_cleaner.midi.importer import MidiImportError, import_midi_candidate
 from midi_cleaner.runtime.report import RuntimeReport, build_runtime_report
+from midi_cleaner.validation.midi_audio import (
+    MidiAudioValidationError,
+    ValidationParameters,
+    validate_midi_vs_audio,
+)
 
 app = typer.Typer(add_completion=False, help="Hermes MIDI Fidelity Engine CLI")
 midi_app = typer.Typer(help="MIDI candidate import tools.")
 audio_app = typer.Typer(help="Audio stem analysis tools.")
+validate_app = typer.Typer(help="MIDI-vs-audio validation tools.")
 console = Console()
 
 app.add_typer(midi_app, name="midi")
 app.add_typer(audio_app, name="audio")
+app.add_typer(validate_app, name="validate")
 
 
 def version_callback(value: bool) -> None:
@@ -166,6 +173,56 @@ def analyze_stem_command(
         f"frames={analysis_report.frame_count}, "
         f"onsets={analysis_report.onset_count}, "
         f"warnings={analysis_report.warning_count}"
+    )
+
+
+@validate_app.command("midi-vs-audio")
+def validate_midi_vs_audio_command(
+    notes: Path = typer.Option(..., "--notes", help="Path to note_events.json."),
+    audio_features: Path = typer.Option(
+        ..., "--audio-features", help="Path to audio_features.json."
+    ),
+    output: Path = typer.Option(..., "--output", help="Output path for note validation JSON."),
+    report: Path = typer.Option(..., "--report", help="Output path for validation report JSON."),
+    onset_window_ms: float = typer.Option(50.0, "--onset-window-ms"),
+    minimum_rms: float = typer.Option(0.001, "--minimum-rms"),
+    minimum_onset_score: float = typer.Option(0.01, "--minimum-onset-score"),
+    review_threshold: float = typer.Option(0.45, "--review-threshold"),
+    keep_threshold: float = typer.Option(0.70, "--keep-threshold"),
+) -> None:
+    params = ValidationParameters(
+        onset_window_ms=onset_window_ms,
+        minimum_rms=minimum_rms,
+        minimum_onset_score=minimum_onset_score,
+        review_threshold=review_threshold,
+        keep_threshold=keep_threshold,
+    )
+
+    try:
+        document, validation_report = validate_midi_vs_audio(
+            notes_file=notes,
+            audio_features_file=audio_features,
+            params=params,
+        )
+    except MidiAudioValidationError as exc:
+        typer.echo(f"Validation failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    report.parent.mkdir(parents=True, exist_ok=True)
+
+    output.write_text(document.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    validation_report.output_file = str(output)
+    report.write_text(validation_report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    typer.echo(
+        "Validated MIDI vs audio: "
+        f"notes={validation_report.note_count}, "
+        f"keep={validation_report.keep_count}, "
+        f"review={validation_report.review_count}, "
+        f"mute_candidates={validation_report.mute_candidate_count}, "
+        f"warnings={validation_report.warning_count}"
     )
 
 
