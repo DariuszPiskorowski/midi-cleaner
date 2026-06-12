@@ -2,11 +2,11 @@
 
 Hermes MIDI Fidelity Engine project scaffold.
 
-This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 5**: environment guard, import/analysis/validation, and non-destructive cleanup plan generation.
+This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 6**: environment guard, import/analysis/validation, cleanup planning, and review MIDI export.
 
 ## Current Milestone
 
-Milestone 5 implements:
+Milestone 6 implements:
 - Python package scaffold
 - Strict Python 3.11 guard
 - Runtime/environment report via CLI doctor command
@@ -16,9 +16,10 @@ Milestone 5 implements:
 - Audio feature JSON export and audio analysis report JSON
 - MIDI-vs-audio heuristic validation into note validation JSON and report JSON
 - Non-destructive cleanup plan generation from note validation JSON
-- Tests for guard behavior, MIDI import, audio analysis, validation, and cleanup planning
+- Non-destructive review MIDI export grouped by cleanup action
+- Tests for guard behavior, MIDI import, audio analysis, validation, cleanup planning, and review MIDI export
 
-MIDI rewriting/export, destructive note deletion, rendering, UI, and ML are not implemented yet.
+Final cleaned MIDI rewriting/export, destructive note deletion, rendering, UI, and ML are not implemented yet.
 
 ## Requirements
 
@@ -111,6 +112,18 @@ Example:
 
 ```powershell
 uv run midi-cleaner cleanup plan --validation .\artifacts\note_validation.json --output .\artifacts\cleanup_plan.json --report .\artifacts\cleanup_plan_report.json
+```
+
+## Review MIDI Export (Non-Destructive)
+
+```powershell
+uv run midi-cleaner cleanup export-review-midi --notes NOTE_EVENTS_JSON --plan CLEANUP_PLAN_JSON --output-dir OUTPUT_DIR --report REPORT_JSON
+```
+
+Example:
+
+```powershell
+uv run midi-cleaner cleanup export-review-midi --notes .\artifacts\note_events.json --plan .\artifacts\cleanup_plan.json --output-dir .\artifacts\review_midi --report .\artifacts\review_midi\export_report.json
 ```
 
 ## Planned Pipeline

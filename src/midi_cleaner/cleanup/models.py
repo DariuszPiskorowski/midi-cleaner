@@ -35,3 +35,20 @@ class CleanupPlanReport(BaseModel):
     warning_count: int
     warnings: list[str]
     output_file: str | None
+
+
+class ReviewMidiExportFile(BaseModel):
+    action: str
+    path: str
+    note_count: int
+
+
+class ReviewMidiExportReport(BaseModel):
+    notes_file: str
+    cleanup_plan_file: str
+    status: Literal["ok", "error"]
+    layer: str
+    ticks_per_beat: int
+    exported_files: list[ReviewMidiExportFile]
+    warning_count: int
+    warnings: list[str]

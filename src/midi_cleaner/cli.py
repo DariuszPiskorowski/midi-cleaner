@@ -8,6 +8,11 @@ from rich.table import Table
 
 from midi_cleaner import __version__
 from midi_cleaner.audio.analyzer import AudioAnalysisError, analyze_stem
+from midi_cleaner.cleanup.midi_exporter import (
+    ReviewMidiExportError,
+    ReviewMidiExportParameters,
+    export_review_midi,
+)
 from midi_cleaner.cleanup.planner import (
     CleanupPlanError,
     CleanupPlannerParameters,
@@ -273,6 +278,49 @@ def cleanup_plan_command(
         f"review={plan_report.review_count}, "
         f"mute={plan_report.mute_count}, "
         f"delete_candidates={plan_report.delete_candidate_count}"
+    )
+
+
+@cleanup_app.command("export-review-midi")
+def cleanup_export_review_midi_command(
+    notes: Path = typer.Option(..., "--notes", help="Path to note_events.json."),
+    plan: Path = typer.Option(..., "--plan", help="Path to cleanup_plan.json."),
+    output_dir: Path = typer.Option(..., "--output-dir", help="Directory for exported review MIDI files."),
+    report: Path = typer.Option(..., "--report", help="Output path for export report JSON."),
+    ticks_per_beat: int = typer.Option(960, "--ticks-per-beat"),
+    track_name_prefix: str = typer.Option("Hermes", "--track-name-prefix"),
+    include_delete_candidates: bool = typer.Option(
+        True,
+        "--include-delete-candidates/--no-include-delete-candidates",
+    ),
+) -> None:
+    params = ReviewMidiExportParameters(
+        ticks_per_beat=ticks_per_beat,
+        track_name_prefix=track_name_prefix,
+        include_delete_candidates=include_delete_candidates,
+    )
+
+    try:
+        export_report = export_review_midi(
+            notes_file=notes,
+            cleanup_plan_file=plan,
+            output_dir=output_dir,
+            params=params,
+        )
+    except ReviewMidiExportError as exc:
+        typer.echo(f"Review MIDI export failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(export_report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    counts = {item.action: item.note_count for item in export_report.exported_files}
+    typer.echo(
+        "exported review MIDI: "
+        f"keep={counts.get('KEEP', 0)}, "
+        f"review={counts.get('REVIEW', 0)}, "
+        f"muted={counts.get('MUTE', 0)}, "
+        f"delete_candidates={counts.get('DELETE_CANDIDATE', 0)}"
     )
 
 

@@ -37,6 +37,13 @@
 - Allow optional `DELETE_CANDIDATE` planning only as metadata.
 - Export cleanup plan JSON and cleanup plan report JSON.
 
+## Milestone 6 - Non-Destructive Review MIDI Export
+- Add CLI command `midi-cleaner cleanup export-review-midi`.
+- Export grouped review MIDI files: KEEP, REVIEW, MUTE, optional DELETE_CANDIDATE.
+- Preserve note pitch, velocity, and timing from note events.
+- Keep export non-destructive: no final cleaned MIDI and no note deletion.
+- Export machine-readable MIDI export report JSON.
+
 ## Future Milestones (Planned)
 - Classify actions: KEEP, MUTE, MERGE, SHORTEN, QUANTIZE, REASSIGN, DELETE.
 - Export cleaned MIDI and machine-readable QA reports.
