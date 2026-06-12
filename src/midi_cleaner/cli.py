@@ -219,6 +219,11 @@ def validate_midi_vs_audio_command(
     audio_features: Path = typer.Option(
         ..., "--audio-features", help="Path to audio_features.json."
     ),
+    audio_aligned_notes: Path | None = typer.Option(
+        None,
+        "--audio-aligned-notes",
+        help="Optional path to audio_aligned_note_events.json.",
+    ),
     output: Path = typer.Option(..., "--output", help="Output path for note validation JSON."),
     report: Path = typer.Option(..., "--report", help="Output path for validation report JSON."),
     onset_window_ms: float = typer.Option(50.0, "--onset-window-ms"),
@@ -240,6 +245,7 @@ def validate_midi_vs_audio_command(
             notes_file=notes,
             audio_features_file=audio_features,
             params=params,
+            audio_aligned_notes_file=audio_aligned_notes,
         )
     except MidiAudioValidationError as exc:
         typer.echo(f"Validation failed: {exc}", err=True)
@@ -388,7 +394,11 @@ def cleanup_export_review_midi_command(
     ),
     output_dir: Path = typer.Option(..., "--output-dir", help="Directory for exported review MIDI files."),
     report: Path = typer.Option(..., "--report", help="Output path for export report JSON."),
-    ticks_per_beat: int = typer.Option(960, "--ticks-per-beat"),
+    ticks_per_beat: int | None = typer.Option(
+        None,
+        "--ticks-per-beat",
+        help="Override output ticks-per-beat (default: note_events ticks_per_beat).",
+    ),
     track_name_prefix: str = typer.Option("Hermes", "--track-name-prefix"),
     include_delete_candidates: bool = typer.Option(
         True,
@@ -437,7 +447,11 @@ def cleanup_export_cleaned_midi_command(
     ),
     output_dir: Path = typer.Option(..., "--output-dir", help="Directory for exported cleaned MIDI files."),
     report: Path = typer.Option(..., "--report", help="Output path for cleaned export report JSON."),
-    ticks_per_beat: int = typer.Option(960, "--ticks-per-beat"),
+    ticks_per_beat: int | None = typer.Option(
+        None,
+        "--ticks-per-beat",
+        help="Override output ticks-per-beat (default: note_events ticks_per_beat).",
+    ),
     track_name_prefix: str = typer.Option("Hermes", "--track-name-prefix"),
     include_review_in_cleaned: bool = typer.Option(
         False,
@@ -514,7 +528,11 @@ def process_stem_command(
         False,
         "--allow-delete-candidates/--no-allow-delete-candidates",
     ),
-    ticks_per_beat: int = typer.Option(960, "--ticks-per-beat"),
+    ticks_per_beat: int | None = typer.Option(
+        None,
+        "--ticks-per-beat",
+        help="Override output ticks-per-beat (default: note_events ticks_per_beat).",
+    ),
     track_name_prefix: str = typer.Option("Hermes", "--track-name-prefix"),
     include_review_in_cleaned: bool = typer.Option(
         False,

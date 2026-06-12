@@ -39,6 +39,10 @@ class NoteValidationDocument(BaseModel):
 class MidiAudioValidationReport(BaseModel):
     notes_file: str
     audio_features_file: str
+    timing_source: Literal["audio_aligned_seconds", "original_note_events_seconds"] = (
+        "original_note_events_seconds"
+    )
+    audio_aligned_notes_file: str | None = None
     status: Literal["ok", "error"]
     layer: str
     note_count: int

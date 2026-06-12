@@ -130,6 +130,37 @@ def _extract_note_on_times_sec(midi_path: Path) -> list[float]:
     return note_on_times
 
 
+def _extract_first_note_interval_sec(midi_path: Path) -> tuple[float, float]:
+    midi_file = mido.MidiFile(str(midi_path))
+    track = midi_file.tracks[0]
+
+    absolute_tick = 0
+    tempo_us_per_beat = 500000
+    start_tick: int | None = None
+    end_tick: int | None = None
+
+    for message in track:
+        absolute_tick += message.time
+        if message.type == "set_tempo":
+            tempo_us_per_beat = int(message.tempo)
+            continue
+
+        if message.type == "note_on" and message.velocity > 0 and start_tick is None:
+            start_tick = absolute_tick
+            continue
+
+        if message.type == "note_off" or (message.type == "note_on" and message.velocity == 0):
+            if start_tick is not None:
+                end_tick = absolute_tick
+                break
+
+    if start_tick is None or end_tick is None:
+        raise AssertionError("Expected one complete note interval in exported MIDI")
+
+    tick_to_sec = (tempo_us_per_beat / 1_000_000.0) / float(midi_file.ticks_per_beat)
+    return start_tick * tick_to_sec, end_tick * tick_to_sec
+
+
 def _write_audio_aligned_notes(
     tmp_path: Path,
     note_id: str,
@@ -216,6 +247,44 @@ def test_keep_notes_export_only_to_keep_mid(tmp_path: Path) -> None:
     assert _extract_note_pairs(review_path) == []
     assert _extract_note_pairs(muted_path) == []
     assert any(item.action == "KEEP" and item.note_count == 1 for item in report.exported_files)
+
+
+def test_review_export_auto_uses_note_events_ticks_per_beat(tmp_path: Path) -> None:
+    notes = [_note("n_keep", 60, 90, 120, 360)]
+    actions = [_action("n_keep", "KEEP")]
+    notes_path, plan_path = _write_inputs(tmp_path, notes, actions)
+
+    report = export_review_midi(
+        notes_file=notes_path,
+        cleanup_plan_file=plan_path,
+        output_dir=tmp_path / "out",
+        params=ReviewMidiExportParameters(),
+    )
+
+    keep_midi = mido.MidiFile(str(tmp_path / "out" / "keep.mid"))
+    assert keep_midi.ticks_per_beat == 480
+    assert report.ticks_per_beat == 480
+    assert report.exported_ticks_per_beat == 480
+    assert report.ticks_per_beat_source == "auto_from_note_events"
+
+
+def test_review_export_user_override_ticks_per_beat(tmp_path: Path) -> None:
+    notes = [_note("n_keep", 60, 90, 120, 360)]
+    actions = [_action("n_keep", "KEEP")]
+    notes_path, plan_path = _write_inputs(tmp_path, notes, actions)
+
+    report = export_review_midi(
+        notes_file=notes_path,
+        cleanup_plan_file=plan_path,
+        output_dir=tmp_path / "out",
+        params=ReviewMidiExportParameters(ticks_per_beat=960),
+    )
+
+    keep_midi = mido.MidiFile(str(tmp_path / "out" / "keep.mid"))
+    assert keep_midi.ticks_per_beat == 960
+    assert report.ticks_per_beat == 960
+    assert report.exported_ticks_per_beat == 960
+    assert report.ticks_per_beat_source == "user_override"
 
 
 def test_review_notes_export_only_to_review_mid(tmp_path: Path) -> None:
@@ -362,5 +431,34 @@ def test_review_export_uses_audio_aligned_seconds_when_provided(tmp_path: Path) 
     assert note_on_times
     assert abs(note_on_times[0] - 0.215) <= 0.002
     assert report.timing_source == "audio_aligned_seconds"
+    assert report.ticks_per_beat_source == "user_override"
     assert report.max_export_time_error_ms <= 2.0
     assert report.mean_export_time_error_ms <= 2.0
+
+
+def test_review_export_round_trips_aligned_interval_with_strict_timing(tmp_path: Path) -> None:
+    notes = [_note("n_keep", 67, 100, 500, 700)]
+    actions = [_action("n_keep", "KEEP")]
+    notes_path, plan_path = _write_inputs(tmp_path, notes, actions)
+    aligned_path = _write_audio_aligned_notes(
+        tmp_path,
+        note_id="n_keep",
+        aligned_start_sec=1.000,
+        aligned_end_sec=1.250,
+    )
+
+    report = export_review_midi(
+        notes_file=notes_path,
+        cleanup_plan_file=plan_path,
+        output_dir=tmp_path / "out",
+        params=ReviewMidiExportParameters(
+            ticks_per_beat=960,
+            audio_aligned_notes_file=aligned_path,
+        ),
+    )
+
+    start_sec, end_sec = _extract_first_note_interval_sec(tmp_path / "out" / "keep.mid")
+    assert abs(start_sec - 1.000) <= 0.001
+    assert abs(end_sec - 1.250) <= 0.001
+    assert report.max_export_time_error_ms <= 1.0
+    assert report.mean_export_time_error_ms <= 1.0

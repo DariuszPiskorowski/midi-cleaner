@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Rules for AI coding agents in `midi-cleaner` during Milestone 9:
+Rules for AI coding agents in `midi-cleaner` during Milestone 10.1:
 
 - Keep the Python environment guard strict for Python 3.11.x.
 - Run all commands through `uv run` when executing project tools.
@@ -12,6 +12,13 @@ Rules for AI coding agents in `midi-cleaner` during Milestone 9:
 - Milestone 7 exports conservative cleaned/review/rejected MIDI files.
 - Milestone 8 orchestrates existing stages.
 - Milestone 9 generates static QA artifacts from existing pipeline outputs.
+- Milestone 10 aligns note timing to canonical WAV/audio seconds.
+- Milestone 10.1 ensures validation and cleanup consume aligned timing when available.
+- Synchronization is critical.
+- Global offset search must run before local per-note alignment.
+- Do not rely on BPM/bar calculations for timing alignment.
+- Keep export ticks_per_beat defaulted from source note_events unless explicitly overridden.
+- Do not commit generated project outputs under `projects/*`.
 - Do not add dependencies.
 - Do not implement web UI.
 - Do not implement new validation heuristics, pitch validation, rendering, ML, or DAW integration.

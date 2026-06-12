@@ -65,6 +65,21 @@
 - Keep reporting deterministic and dependency-light using Python standard library.
 - Do not add new heuristics; summarize existing stage outputs.
 
+## Milestone 10 - Audio-Time Canonical Note Alignment
+- Add CLI command `midi-cleaner validate align-audio-time`.
+- Produce `analysis/audio_aligned_note_events.json` using WAV/audio seconds as canonical time.
+- Produce `analysis/audio_alignment_report.json` with alignment quality metrics.
+- Keep synchronization independent from BPM/bar assumptions.
+
+## Milestone 10.1 - Alignment Integration Hardening
+- Fix Milestone 10 integration so validation uses aligned timing when alignment data exists.
+- Ensure cleanup review/cleaned exports use aligned timing when alignment data exists.
+- Use coarse global offset search before local per-note snapping.
+- Keep synchronization anchored to WAV/audio seconds; do not rely on BPM/bar calculations.
+- Default export ticks-per-beat to source note_events ticks-per-beat unless user override is provided.
+- Expand QA artifacts to show Audio-Time Alignment / Sync timing sources and precision metrics.
+- Keep generated `projects/*` outputs ignored and out of commits.
+
 ## Future Milestones (Planned)
 - Classify actions: KEEP, MUTE, MERGE, SHORTEN, QUANTIZE, REASSIGN, DELETE.
 - Export cleaned MIDI and machine-readable QA reports.

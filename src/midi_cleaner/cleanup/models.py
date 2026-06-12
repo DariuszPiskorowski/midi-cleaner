@@ -50,6 +50,9 @@ class ReviewMidiExportReport(BaseModel):
     status: Literal["ok", "error"]
     layer: str
     ticks_per_beat: int
+    ticks_per_beat_source: Literal["auto_from_note_events", "user_override"] = (
+        "auto_from_note_events"
+    )
     timing_source: Literal["audio_aligned_seconds", "original_midi_ticks"]
     max_export_time_error_ms: float
     mean_export_time_error_ms: float
@@ -76,6 +79,9 @@ class CleanedMidiExportReport(BaseModel):
     status: Literal["ok", "error"]
     layer: str
     ticks_per_beat: int
+    ticks_per_beat_source: Literal["auto_from_note_events", "user_override"] = (
+        "auto_from_note_events"
+    )
     timing_source: Literal["audio_aligned_seconds", "original_midi_ticks"]
     max_export_time_error_ms: float
     mean_export_time_error_ms: float

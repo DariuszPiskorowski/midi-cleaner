@@ -52,6 +52,14 @@ class AudioAlignedNoteDocument(BaseModel):
     layer: str
     sample_rate: int
     audio_duration_sec: float
+    timing_source: Literal["audio_time_seconds"] = "audio_time_seconds"
+    global_search_enabled: bool = True
+    global_offset_ms: float = 0.0
+    global_offset_sec: float = 0.0
+    global_confidence: float = 0.0
+    global_offset_applied: bool = False
+    global_search_window_ms: float = 0.0
+    global_search_step_ms: float = 0.0
     alignment_parameters: dict[str, float | bool | str]
     notes: list[AudioAlignedNoteEvent]
 
@@ -61,6 +69,14 @@ class AudioAlignmentReport(BaseModel):
     audio_features_file: str
     status: Literal["ok", "error"]
     layer: str
+    timing_source: Literal["audio_time_seconds"] = "audio_time_seconds"
+    global_search_enabled: bool = True
+    global_offset_ms: float = 0.0
+    global_offset_sec: float = 0.0
+    global_confidence: float = 0.0
+    global_offset_applied: bool = False
+    global_search_window_ms: float = 0.0
+    global_search_step_ms: float = 0.0
     note_count: int
     aligned_count: int
     keep_original_count: int

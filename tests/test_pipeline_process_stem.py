@@ -82,6 +82,14 @@ def test_process_stem_creates_expected_structure_and_reports(tmp_path: Path) -> 
     pipeline_report = json.loads((project_dir / "reports" / "pipeline_report.json").read_text(encoding="utf-8"))
     assert pipeline_report["status"] == "ok"
 
+    validation_report = json.loads(
+        (project_dir / "analysis" / "midi_audio_validation_report.json").read_text(encoding="utf-8")
+    )
+    assert validation_report["timing_source"] == "audio_aligned_seconds"
+    assert validation_report["audio_aligned_notes_file"] == str(
+        project_dir / "analysis" / "audio_aligned_note_events.json"
+    )
+
 
 def test_pipeline_report_aggregates_warnings(tmp_path: Path) -> None:
     midi_path = tmp_path / "candidate_warn.mid"

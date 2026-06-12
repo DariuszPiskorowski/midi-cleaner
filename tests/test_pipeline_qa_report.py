@@ -90,6 +90,29 @@ def _write_pipeline_like_project(tmp_path: Path, include_optional: bool = True) 
         note_validation.model_dump_json(indent=2) + "\n",
         encoding="utf-8",
     )
+    (project_dir / "analysis" / "midi_audio_validation_report.json").write_text(
+        json.dumps(
+            {
+                "notes_file": "analysis/note_events.json",
+                "audio_features_file": "analysis/audio_features.json",
+                "timing_source": "audio_aligned_seconds",
+                "audio_aligned_notes_file": "analysis/audio_aligned_note_events.json",
+                "status": "ok",
+                "layer": "bass",
+                "note_count": 4,
+                "keep_count": 1,
+                "review_count": 1,
+                "mute_candidate_count": 2,
+                "mean_confidence": 0.45,
+                "warning_count": 0,
+                "warnings": [],
+                "output_file": "analysis/note_validation.json",
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     cleanup_plan = CleanupPlanDocument(
         schema_version="0.1.0",
@@ -346,6 +369,8 @@ def test_csv_contains_expected_rows(tmp_path: Path) -> None:
     assert "start_correction_ms" in rows[0]
     assert "alignment_action" in rows[0]
     assert "alignment_confidence" in rows[0]
+    assert "validation_action" in rows[0]
+    assert "plan_action" in rows[0]
 
 
 def test_html_contains_sections_and_escaped_content(tmp_path: Path) -> None:
@@ -355,9 +380,29 @@ def test_html_contains_sections_and_escaped_content(tmp_path: Path) -> None:
 
     html_text = (project_dir / "reports" / "qa_report.html").read_text(encoding="utf-8")
     assert "Hermes Static QA Report" in html_text
-    assert "Audio Alignment" in html_text
+    assert "Audio-Time Alignment / Sync" in html_text
+    assert "validation_timing_source" in html_text
+    assert "review_export_timing_source" in html_text
+    assert "cleaned_export_timing_source" in html_text
+    assert "global_offset_ms" in html_text
+    assert "max_export_time_error_ms" in html_text
     assert "Top 25 Lowest-Confidence Notes" in html_text
     assert "&lt;unsafe&gt;" in html_text
+
+
+def test_summary_contains_audio_sync_fields(tmp_path: Path) -> None:
+    project_dir = _write_pipeline_like_project(tmp_path)
+
+    summary = generate_qa_report(project_dir, None, QAReportParameters())
+
+    assert summary.validation_timing_source == "audio_aligned_seconds"
+    assert summary.review_export_timing_source == "audio_aligned_seconds"
+    assert summary.cleaned_export_timing_source == "audio_aligned_seconds"
+    assert summary.global_offset_ms == 0.0
+    assert summary.global_confidence == 0.0
+    assert summary.global_offset_applied is False
+    assert summary.max_export_time_error_ms == 0.6
+    assert summary.mean_export_time_error_ms == 0.2
 
 
 def test_missing_optional_reports_warns_but_succeeds(tmp_path: Path) -> None:

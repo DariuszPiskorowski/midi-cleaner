@@ -5,6 +5,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+from midi_cleaner.alignment.models import AudioAlignedNoteDocument, AudioAlignedNoteEvent
 from midi_cleaner.audio.models import AudioFeatureDocument, AudioFrameFeature, AudioGlobalFeatures
 from midi_cleaner.cli import app
 from midi_cleaner.midi.models import NoteEvent, NoteEventDocument, TempoEvent
@@ -86,6 +87,74 @@ def _write_documents(
     audio_path.write_text(audio_doc.model_dump_json(indent=2) + "\n", encoding="utf-8")
 
     return notes_path, audio_path
+
+
+def _write_aligned_notes_document(
+    tmp_path: Path,
+    note_id: str,
+    aligned_start_sec: float,
+    aligned_end_sec: float,
+) -> Path:
+    aligned_doc = AudioAlignedNoteDocument(
+        schema_version="0.1.0",
+        notes_file="note_events.json",
+        audio_features_file="audio_features.json",
+        layer="bass",
+        sample_rate=44100,
+        audio_duration_sec=2.0,
+        alignment_parameters={
+            "onset_search_window_ms": 250.0,
+            "offset_search_window_ms": 350.0,
+            "min_onset_score": 0.005,
+            "min_rms": 0.001,
+            "snap_start_to_audio_onset": True,
+            "snap_end_to_energy_offset": True,
+            "max_start_correction_ms": 500.0,
+            "max_end_correction_ms": 800.0,
+            "low_confidence_action": "KEEP_ORIGINAL_LOW_CONFIDENCE",
+            "global_search_enabled": True,
+            "global_max_search_offset_ms": 3000.0,
+            "global_search_step_ms": 20.0,
+            "global_min_confidence": 0.05,
+            "apply_global_offset_before_local_snap": True,
+        },
+        notes=[
+            AudioAlignedNoteEvent(
+                note_id=note_id,
+                source="ripx",
+                layer="bass",
+                pitch_midi=45,
+                pitch_name="A2",
+                velocity=100,
+                channel=0,
+                original_start_sec=0.6,
+                original_end_sec=0.8,
+                original_duration_sec=0.2,
+                original_start_tick=0,
+                original_end_tick=0,
+                aligned_start_sec=aligned_start_sec,
+                aligned_end_sec=aligned_end_sec,
+                aligned_duration_sec=aligned_end_sec - aligned_start_sec,
+                start_correction_ms=(aligned_start_sec - 0.6) * 1000.0,
+                end_correction_ms=(aligned_end_sec - 0.8) * 1000.0,
+                duration_correction_ms=0.0,
+                nearest_audio_onset_sec=aligned_start_sec,
+                nearest_audio_offset_sec=aligned_end_sec,
+                onset_error_before_ms=0.0,
+                onset_error_after_ms=0.0,
+                local_rms=0.02,
+                local_onset_score=0.3,
+                sustained_energy_ratio=0.8,
+                alignment_confidence=0.9,
+                alignment_action="ALIGNED",
+                reasons=["test"],
+            )
+        ],
+    )
+
+    aligned_path = tmp_path / "audio_aligned_note_events.json"
+    aligned_path.write_text(aligned_doc.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    return aligned_path
 
 
 def test_aligned_note_gets_keep_recommendation(tmp_path: Path) -> None:
@@ -225,6 +294,56 @@ def test_layer_mismatch_adds_warning_but_succeeds(tmp_path: Path) -> None:
     assert report.status == "ok"
     assert report.warning_count == 1
     assert "Layer mismatch" in report.warnings[0]
+
+
+def test_validation_uses_audio_aligned_timing_when_provided(tmp_path: Path) -> None:
+    notes = [_make_note("n_aligned", 0.60, 0.80)]
+    frames = [
+        AudioFrameFeature(
+            frame_index=0,
+            start_sec=0.10,
+            end_sec=0.20,
+            rms=0.02,
+            peak=0.6,
+            zero_crossing_rate=0.2,
+            spectral_centroid_hz=300.0,
+            spectral_rolloff_hz=1000.0,
+            is_silent=False,
+            onset_score=0.3,
+        ),
+        AudioFrameFeature(
+            frame_index=1,
+            start_sec=0.20,
+            end_sec=0.30,
+            rms=0.015,
+            peak=0.5,
+            zero_crossing_rate=0.2,
+            spectral_centroid_hz=320.0,
+            spectral_rolloff_hz=1050.0,
+            is_silent=False,
+            onset_score=0.02,
+        ),
+    ]
+
+    notes_path, audio_path = _write_documents(tmp_path, notes, frames)
+    aligned_path = _write_aligned_notes_document(
+        tmp_path,
+        note_id="n_aligned",
+        aligned_start_sec=0.10,
+        aligned_end_sec=0.30,
+    )
+
+    document, report = validate_midi_vs_audio(
+        notes_file=notes_path,
+        audio_features_file=audio_path,
+        params=ValidationParameters(),
+        audio_aligned_notes_file=aligned_path,
+    )
+
+    assert report.timing_source == "audio_aligned_seconds"
+    assert report.audio_aligned_notes_file == str(aligned_path)
+    assert report.keep_count == 1
+    assert abs(document.validations[0].start_sec - 0.10) <= 1e-9
 
 
 def test_cli_writes_validation_and_report_and_counts(tmp_path: Path) -> None:

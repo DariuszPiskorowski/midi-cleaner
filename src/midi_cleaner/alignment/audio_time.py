@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -31,6 +32,11 @@ class AudioTimeAlignmentParameters:
     max_start_correction_ms: float = 500.0
     max_end_correction_ms: float = 800.0
     low_confidence_action: str = "KEEP_ORIGINAL_LOW_CONFIDENCE"
+    global_search_enabled: bool = True
+    global_max_search_offset_ms: float = 3000.0
+    global_search_step_ms: float = 20.0
+    global_min_confidence: float = 0.05
+    apply_global_offset_before_local_snap: bool = True
 
 
 def _load_note_document(path: Path) -> NoteEventDocument:
@@ -70,6 +76,104 @@ def _build_prev_rms(frames: list[AudioFrameFeature]) -> dict[int, float]:
         mapping[frame.frame_index] = previous
         previous = frame.rms
     return mapping
+
+
+def _build_audio_onset_evidence(
+    frames: list[AudioFrameFeature],
+    params: AudioTimeAlignmentParameters,
+) -> list[tuple[float, float]]:
+    evidence: list[tuple[float, float]] = []
+    prev_rms = 0.0
+
+    for frame in frames:
+        rms_delta = frame.rms - prev_rms
+        prev_rms = frame.rms
+
+        has_onset = frame.onset_score >= params.min_onset_score
+        has_energy = frame.rms >= params.min_rms
+        has_rise = rms_delta > 0.0
+        if not (has_onset and has_energy and has_rise):
+            continue
+
+        weight = float(frame.onset_score + rms_delta + frame.rms)
+        evidence.append((float(frame.start_sec), max(1e-9, weight)))
+
+    return evidence
+
+
+def _search_global_offset(
+    midi_onsets_sec: list[float],
+    audio_evidence: list[tuple[float, float]],
+    params: AudioTimeAlignmentParameters,
+) -> tuple[float, float]:
+    if not params.global_search_enabled:
+        return 0.0, 0.0
+
+    if not midi_onsets_sec or not audio_evidence:
+        return 0.0, 0.0
+
+    if params.global_search_step_ms <= 0:
+        return 0.0, 0.0
+
+    max_offset_sec = params.global_max_search_offset_ms / 1000.0
+    step_sec = params.global_search_step_ms / 1000.0
+    if max_offset_sec <= 0:
+        return 0.0, 0.0
+
+    audio_times = [item[0] for item in audio_evidence]
+    audio_weights = [item[1] for item in audio_evidence]
+    max_weight = max(audio_weights)
+    if max_weight <= 0:
+        return 0.0, 0.0
+
+    match_window_sec = max(0.08, step_sec * 3.0)
+
+    offset_steps = int(math.floor((2.0 * max_offset_sec) / step_sec))
+    candidate_offsets = [(-max_offset_sec + (step_sec * idx)) for idx in range(offset_steps + 1)]
+
+    best_offset = 0.0
+    best_confidence = -1.0
+
+    for offset_sec in candidate_offsets:
+        weighted_score_sum = 0.0
+        matched_count = 0
+
+        for onset_sec in midi_onsets_sec:
+            shifted_onset = onset_sec + offset_sec
+            insert_idx = bisect_left(audio_times, shifted_onset)
+
+            nearest: tuple[float, float] | None = None
+            if insert_idx < len(audio_times):
+                nearest = (audio_times[insert_idx], audio_weights[insert_idx])
+            if insert_idx > 0:
+                left = (audio_times[insert_idx - 1], audio_weights[insert_idx - 1])
+                if nearest is None or abs(left[0] - shifted_onset) < abs(nearest[0] - shifted_onset):
+                    nearest = left
+
+            if nearest is None:
+                continue
+
+            distance = abs(nearest[0] - shifted_onset)
+            if distance > match_window_sec:
+                continue
+
+            normalized_weight = nearest[1] / max_weight
+            proximity = 1.0 - (distance / match_window_sec)
+            weighted_score_sum += normalized_weight * proximity
+            matched_count += 1
+
+        score_per_note = weighted_score_sum / len(midi_onsets_sec)
+        coverage = matched_count / len(midi_onsets_sec)
+        confidence = (0.7 * score_per_note) + (0.3 * coverage)
+
+        if confidence > best_confidence:
+            best_confidence = confidence
+            best_offset = offset_sec
+
+    if best_confidence < 0:
+        return 0.0, 0.0
+
+    return float(best_offset), float(max(0.0, min(1.0, best_confidence)))
 
 
 def _best_onset_candidate(
@@ -268,6 +372,31 @@ def align_notes_to_audio_time(
     prev_rms_by_index = _build_prev_rms(frames)
     next_rms_by_index = _build_next_rms(frames)
 
+    midi_onsets_sec = sorted(float(note.start_sec) for note in note_document.notes)
+    audio_evidence = _build_audio_onset_evidence(frames, params)
+    global_offset_sec, global_confidence = _search_global_offset(
+        midi_onsets_sec=midi_onsets_sec,
+        audio_evidence=audio_evidence,
+        params=params,
+    )
+    global_offset_applied = (
+        params.global_search_enabled
+        and params.apply_global_offset_before_local_snap
+        and global_confidence >= params.global_min_confidence
+    )
+    if params.global_search_enabled and global_confidence < params.global_min_confidence:
+        if not audio_evidence:
+            warnings.append("Global offset search found no reliable audio onset evidence; using offset 0.")
+        elif not midi_onsets_sec:
+            warnings.append("Global offset search found no MIDI onset events; using offset 0.")
+        else:
+            warnings.append(
+                "Global offset confidence below threshold; using offset 0. "
+                f"confidence={global_confidence:.4f}"
+            )
+    if not global_offset_applied:
+        global_offset_sec = 0.0
+
     onset_window_sec = params.onset_search_window_ms / 1000.0
     offset_window_sec = params.offset_search_window_ms / 1000.0
 
@@ -280,17 +409,28 @@ def align_notes_to_audio_time(
         original_end_sec = float(note.end_sec)
         original_duration_sec = max(0.0, float(note.duration_sec))
 
-        onset_candidates = _window_frames(frames, original_start_sec, onset_window_sec)
+        start_anchor_sec = (
+            original_start_sec + global_offset_sec
+            if global_offset_applied
+            else original_start_sec
+        )
+        end_anchor_sec = (
+            original_end_sec + global_offset_sec
+            if global_offset_applied
+            else original_end_sec
+        )
+
+        onset_candidates = _window_frames(frames, start_anchor_sec, onset_window_sec)
         strong_onset, weak_onset = _best_onset_candidate(
             onset_candidates=onset_candidates,
             prev_rms_by_index=prev_rms_by_index,
-            note_start_sec=original_start_sec,
+            note_start_sec=start_anchor_sec,
             params=params,
         )
 
-        local_frame = _nearest_frame(onset_candidates, original_start_sec)
+        local_frame = _nearest_frame(onset_candidates, start_anchor_sec)
         if local_frame is None:
-            local_frame = _nearest_frame(frames, original_start_sec)
+            local_frame = _nearest_frame(frames, start_anchor_sec)
 
         local_rms = float(local_frame.rms) if local_frame is not None else 0.0
         local_onset_score = float(local_frame.onset_score) if local_frame is not None else 0.0
@@ -301,36 +441,44 @@ def align_notes_to_audio_time(
         elif weak_onset is not None and weak_onset.onset_score > 0.0:
             nearest_audio_onset_sec = float(weak_onset.start_sec)
 
-        aligned_start_sec = original_start_sec
-        alignment_action = params.low_confidence_action
+        aligned_start_sec = start_anchor_sec
+        alignment_action = "ALIGNED" if global_offset_applied else params.low_confidence_action
+
+        if global_offset_applied:
+            reasons.append("applied coarse global offset before local note snapping")
 
         if strong_onset is not None:
-            start_shift_ms = (strong_onset.start_sec - original_start_sec) * 1000.0
+            start_local_shift_ms = (strong_onset.start_sec - start_anchor_sec) * 1000.0
             if not params.snap_start_to_audio_onset:
-                alignment_action = params.low_confidence_action
-                reasons.append("snap_start_to_audio_onset disabled; kept original start")
-            elif abs(start_shift_ms) <= params.max_start_correction_ms:
+                if not global_offset_applied:
+                    alignment_action = params.low_confidence_action
+                reasons.append("snap_start_to_audio_onset disabled; kept anchor start")
+            elif abs(start_local_shift_ms) <= params.max_start_correction_ms:
                 aligned_start_sec = float(strong_onset.start_sec)
                 alignment_action = "ALIGNED"
                 reasons.append("snapped start to strongest local audio onset")
             else:
                 alignment_action = "REVIEW_TIMING"
-                reasons.append("start correction exceeds max_start_correction_ms; kept original start")
+                reasons.append("local start correction exceeds max_start_correction_ms; kept anchor start")
         else:
             if local_rms < params.min_rms and local_onset_score < params.min_onset_score:
-                alignment_action = "NO_AUDIO_EVIDENCE"
-                reasons.append("no audio onset or RMS evidence near note start")
+                if not global_offset_applied:
+                    alignment_action = "NO_AUDIO_EVIDENCE"
+                    reasons.append("no audio onset or RMS evidence near note start")
+                else:
+                    reasons.append("no strong local onset after global offset; kept globally shifted start")
             else:
-                alignment_action = params.low_confidence_action
-                reasons.append("no strong onset in search window; kept original start")
+                if not global_offset_applied:
+                    alignment_action = params.low_confidence_action
+                reasons.append("no strong onset in search window; kept anchor start")
 
         fallback_end_sec = aligned_start_sec + original_duration_sec
-        offset_candidates = _window_frames(frames, original_end_sec, offset_window_sec)
+        offset_candidates = _window_frames(frames, end_anchor_sec, offset_window_sec)
         offset_frame = _best_offset_candidate(
             offset_candidates=offset_candidates,
             next_rms_by_index=next_rms_by_index,
             aligned_start_sec=aligned_start_sec,
-            original_end_sec=original_end_sec,
+            original_end_sec=end_anchor_sec,
             local_rms=local_rms,
             params=params,
         )
@@ -339,15 +487,15 @@ def align_notes_to_audio_time(
         aligned_end_sec = fallback_end_sec
 
         if params.snap_end_to_energy_offset and offset_frame is not None:
-            end_shift_ms = (offset_frame.start_sec - original_end_sec) * 1000.0
-            if abs(end_shift_ms) <= params.max_end_correction_ms:
+            end_local_shift_ms = (offset_frame.start_sec - end_anchor_sec) * 1000.0
+            if abs(end_local_shift_ms) <= params.max_end_correction_ms:
                 aligned_end_sec = float(offset_frame.start_sec)
                 nearest_audio_offset_sec = float(offset_frame.start_sec)
                 reasons.append("snapped end to local audio energy drop")
                 if alignment_action == params.low_confidence_action:
                     alignment_action = "ALIGNED"
             else:
-                reasons.append("end correction exceeds max_end_correction_ms; preserved duration")
+                reasons.append("local end correction exceeds max_end_correction_ms; preserved duration")
         else:
             reasons.append("preserved original duration for end timing")
 
@@ -450,6 +598,14 @@ def align_notes_to_audio_time(
         layer=note_document.layer,
         sample_rate=audio_document.sample_rate,
         audio_duration_sec=audio_document.duration_sec,
+        timing_source="audio_time_seconds",
+        global_search_enabled=params.global_search_enabled,
+        global_offset_ms=float(global_offset_sec * 1000.0),
+        global_offset_sec=float(global_offset_sec),
+        global_confidence=float(global_confidence),
+        global_offset_applied=global_offset_applied,
+        global_search_window_ms=params.global_max_search_offset_ms,
+        global_search_step_ms=params.global_search_step_ms,
         alignment_parameters={
             "onset_search_window_ms": params.onset_search_window_ms,
             "offset_search_window_ms": params.offset_search_window_ms,
@@ -460,6 +616,11 @@ def align_notes_to_audio_time(
             "max_start_correction_ms": params.max_start_correction_ms,
             "max_end_correction_ms": params.max_end_correction_ms,
             "low_confidence_action": params.low_confidence_action,
+            "global_search_enabled": params.global_search_enabled,
+            "global_max_search_offset_ms": params.global_max_search_offset_ms,
+            "global_search_step_ms": params.global_search_step_ms,
+            "global_min_confidence": params.global_min_confidence,
+            "apply_global_offset_before_local_snap": params.apply_global_offset_before_local_snap,
         },
         notes=aligned_notes,
     )
@@ -469,6 +630,14 @@ def align_notes_to_audio_time(
         audio_features_file=str(audio_features_file),
         status="ok",
         layer=note_document.layer,
+        timing_source="audio_time_seconds",
+        global_search_enabled=params.global_search_enabled,
+        global_offset_ms=float(global_offset_sec * 1000.0),
+        global_offset_sec=float(global_offset_sec),
+        global_confidence=float(global_confidence),
+        global_offset_applied=global_offset_applied,
+        global_search_window_ms=params.global_max_search_offset_ms,
+        global_search_step_ms=params.global_search_step_ms,
         note_count=len(aligned_notes),
         aligned_count=aligned_count,
         keep_original_count=keep_original_count,

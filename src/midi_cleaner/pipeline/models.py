@@ -58,6 +58,12 @@ class QASummary(BaseModel):
     delete_candidate_count: int
     cleaned_note_count: int
     rejected_note_count: int
+    validation_timing_source: str | None
+    review_export_timing_source: str | None
+    cleaned_export_timing_source: str | None
+    global_offset_ms: float | None
+    global_confidence: float | None
+    global_offset_applied: bool | None
     aligned_count: int
     keep_original_count: int
     review_timing_count: int
@@ -65,6 +71,8 @@ class QASummary(BaseModel):
     median_abs_start_correction_ms: float | None
     p95_abs_start_correction_ms: float | None
     max_abs_start_correction_ms: float | None
+    max_export_time_error_ms: float | None
+    mean_export_time_error_ms: float | None
     mean_confidence: float | None
     min_confidence: float | None
     max_confidence: float | None

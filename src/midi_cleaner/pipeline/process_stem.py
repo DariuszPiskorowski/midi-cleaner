@@ -46,7 +46,7 @@ class PipelineProcessParameters:
     cleanup_review_threshold: float = 0.70
     delete_threshold: float = 0.20
     allow_delete_candidates: bool = False
-    ticks_per_beat: int = 960
+    ticks_per_beat: int | None = None
     track_name_prefix: str = "Hermes"
     include_review_in_cleaned: bool = False
     write_empty_files: bool = True
@@ -107,6 +107,8 @@ def process_stem_pipeline(
                     "minimum_onset_score": params.minimum_onset_score,
                     "review_threshold": params.review_threshold,
                     "keep_threshold": params.keep_threshold,
+                    "timing_source": "audio_aligned_seconds",
+                    "audio_aligned_notes_file": str(analysis_dir / "audio_aligned_note_events.json"),
                 },
                 "cleanup": {
                     "mute_threshold": params.mute_threshold,
@@ -229,6 +231,7 @@ def process_stem_pipeline(
         validation_document, validation_report = validate_midi_vs_audio(
             notes_file=note_events_path,
             audio_features_file=audio_features_path,
+            audio_aligned_notes_file=audio_aligned_note_events_path,
             params=ValidationParameters(
                 onset_window_ms=params.onset_window_ms,
                 minimum_rms=params.minimum_rms,
@@ -242,6 +245,11 @@ def process_stem_pipeline(
         _write_json(midi_audio_validation_report_path, validation_report)
         output_files["note_validation"] = str(note_validation_path)
         output_files["midi_audio_validation_report"] = str(midi_audio_validation_report_path)
+        output_files["validation_timing_source"] = validation_report.timing_source
+        if validation_report.audio_aligned_notes_file is not None:
+            output_files["validation_audio_aligned_notes_file"] = (
+                validation_report.audio_aligned_notes_file
+            )
         stages.append(
             PipelineStageReport(
                 name="midi_audio_validation",

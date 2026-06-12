@@ -22,7 +22,7 @@ class CleanedMidiExportError(Exception):
 
 @dataclass(frozen=True)
 class CleanedMidiExportParameters:
-    ticks_per_beat: int = 960
+    ticks_per_beat: int | None = None
     track_name_prefix: str = "Hermes"
     include_review_in_cleaned: bool = False
     write_empty_files: bool = True
@@ -203,9 +203,18 @@ def export_cleaned_midi(
     )
 
     source_ticks_per_beat = int(note_document.ticks_per_beat)
-    exported_ticks_per_beat = int(params.ticks_per_beat)
-    if exported_ticks_per_beat <= 0:
+    if params.ticks_per_beat is None:
         exported_ticks_per_beat = source_ticks_per_beat
+        ticks_per_beat_source = "auto_from_note_events"
+    else:
+        exported_ticks_per_beat = int(params.ticks_per_beat)
+        ticks_per_beat_source = "user_override"
+        if exported_ticks_per_beat <= 0:
+            warnings.append(
+                "Invalid ticks_per_beat override; using note_events ticks_per_beat instead."
+            )
+            exported_ticks_per_beat = source_ticks_per_beat
+            ticks_per_beat_source = "auto_from_note_events"
 
     tempo_us_per_beat = _tempo_us_per_beat_from_document(note_document)
     ticks_per_second = _ticks_per_second(exported_ticks_per_beat, tempo_us_per_beat)
@@ -320,6 +329,7 @@ def export_cleaned_midi(
         status="ok",
         layer=note_document.layer,
         ticks_per_beat=exported_ticks_per_beat,
+        ticks_per_beat_source=ticks_per_beat_source,
         timing_source=(
             "audio_aligned_seconds" if use_audio_aligned_seconds else "original_midi_ticks"
         ),

@@ -89,6 +89,41 @@ def test_audio_onset_alignment_moves_note_start_close_to_pulse(tmp_path: Path) -
     assert abs(aligned_note.aligned_start_sec - aligned_note.original_start_sec) >= 0.45
 
 
+def test_global_offset_alignment_recovers_large_shift_before_local_snap(tmp_path: Path) -> None:
+    wav_path = tmp_path / "pulse_global.wav"
+    midi_path = tmp_path / "candidate_global.mid"
+    notes_path = tmp_path / "note_events.json"
+    audio_features_path = tmp_path / "audio_features.json"
+
+    _write_pulse_wav(wav_path, pulses_sec=[1.0], duration_sec=4.0)
+    _write_single_note_midi(midi_path, start_sec=3.0, end_sec=3.25)
+
+    notes_doc, _ = import_midi_candidate(midi_path, source="ripx", layer="bass")
+    audio_doc, _ = analyze_stem(wav_path, layer="bass")
+
+    notes_path.write_text(notes_doc.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    audio_features_path.write_text(audio_doc.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    aligned_doc, aligned_report = align_notes_to_audio_time(
+        notes_file=notes_path,
+        audio_features_file=audio_features_path,
+        params=AudioTimeAlignmentParameters(
+            onset_search_window_ms=120.0,
+            max_start_correction_ms=120.0,
+            global_max_search_offset_ms=3000.0,
+            global_search_step_ms=10.0,
+            global_min_confidence=0.05,
+        ),
+    )
+
+    aligned_note = aligned_doc.notes[0]
+    assert aligned_note.alignment_action == "ALIGNED"
+    assert abs(aligned_note.aligned_start_sec - 1.0) <= 0.04
+    assert aligned_report.global_offset_applied is True
+    assert abs(aligned_report.global_offset_sec + 2.0) <= 0.12
+    assert aligned_report.global_confidence >= 0.05
+
+
 def test_no_audio_evidence_keeps_original_timing(tmp_path: Path) -> None:
     wav_path = tmp_path / "silence.wav"
     midi_path = tmp_path / "candidate.mid"

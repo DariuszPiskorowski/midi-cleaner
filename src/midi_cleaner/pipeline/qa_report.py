@@ -225,6 +225,27 @@ def _write_html(
         f"<li>{escape(key)}: {escape(value)}</li>" for key, value in summary.output_files.items()
     )
 
+    sync_rows = [
+        ("validation_timing_source", str(summary.validation_timing_source)),
+        ("review_export_timing_source", str(summary.review_export_timing_source)),
+        ("cleaned_export_timing_source", str(summary.cleaned_export_timing_source)),
+        ("global_offset_ms", str(summary.global_offset_ms)),
+        ("global_confidence", str(summary.global_confidence)),
+        ("global_offset_applied", str(summary.global_offset_applied)),
+        ("aligned_count", str(summary.aligned_count)),
+        ("keep_original_count", str(summary.keep_original_count)),
+        ("review_timing_count", str(summary.review_timing_count)),
+        ("no_audio_evidence_count", str(summary.no_audio_evidence_count)),
+        ("median_abs_start_correction_ms", str(summary.median_abs_start_correction_ms)),
+        ("p95_abs_start_correction_ms", str(summary.p95_abs_start_correction_ms)),
+        ("max_abs_start_correction_ms", str(summary.max_abs_start_correction_ms)),
+        ("max_export_time_error_ms", str(summary.max_export_time_error_ms)),
+        ("mean_export_time_error_ms", str(summary.mean_export_time_error_ms)),
+    ]
+    sync_rows_html = "".join(
+        f"<tr><th>{escape(name)}</th><td>{escape(value)}</td></tr>" for name, value in sync_rows
+    )
+
     html_doc = f"""<!doctype html>
 <html lang='en'>
 <head>
@@ -275,14 +296,19 @@ def _write_html(
   <h2>Output Files</h2>
   <ul>{output_items}</ul>
 
-  <h2>Counts by Action</h2>
-  <p>Validation and cleanup action counts are summarized in the table above and in <code>qa_summary.json</code>.</p>
+    <h2>Counts by Action</h2>
+    <p>Validation and cleanup action counts are summarized in the table above and in <code>qa_summary.json</code>.</p>
 
-    <h2>Audio Alignment</h2>
+    <h2>Audio-Time Alignment / Sync</h2>
     <p>
-        Alignment metrics are computed from <code>audio_alignment_report.json</code> and include
-        aligned, keep-original, review-timing, and correction distribution statistics.
+        This section reports whether validation and export stages are using audio-aligned seconds,
+        plus global offset and export timing precision metrics.
     </p>
+    <table border='1' cellpadding='6' cellspacing='0'>
+        <tbody>
+            {sync_rows_html}
+        </tbody>
+    </table>
 
   {_rows_table_html(f"Top {top_n} Lowest-Confidence Notes", lowest_confidence)}
   {_rows_table_html(f"Top {top_n} Weak-Onset Notes", weakest_onset)}
@@ -311,6 +337,7 @@ def generate_qa_report(
     note_validation_path = project_dir / "analysis" / "note_validation.json"
     audio_aligned_notes_path = project_dir / "analysis" / "audio_aligned_note_events.json"
     audio_alignment_report_path = project_dir / "analysis" / "audio_alignment_report.json"
+    midi_audio_validation_report_path = project_dir / "analysis" / "midi_audio_validation_report.json"
     cleanup_plan_path = project_dir / "cleanup" / "cleanup_plan.json"
     cleaned_export_report_path = project_dir / "midi" / "cleaned" / "cleaned_export_report.json"
     review_export_report_path = project_dir / "midi" / "review" / "export_report.json"
@@ -345,16 +372,56 @@ def generate_qa_report(
     if note_validation is None and cleanup_plan is None:
         raise QAReportError("Missing both required inputs: analysis/note_validation.json and cleanup/cleanup_plan.json")
 
+    validation_timing_source: str | None = None
+    if midi_audio_validation_report_path.exists():
+        validation_report_payload = _read_json(midi_audio_validation_report_path)
+        raw_validation_timing_source = validation_report_payload.get("timing_source")
+        if isinstance(raw_validation_timing_source, str):
+            validation_timing_source = raw_validation_timing_source
+    else:
+        warnings.append(f"Missing MIDI-audio validation report: {midi_audio_validation_report_path}")
+
     cleaned_note_count = 0
     rejected_note_count = 0
+    cleaned_export_timing_source: str | None = None
+    review_export_timing_source: str | None = None
+    export_max_errors_ms: list[float] = []
+    export_mean_errors_ms: list[float] = []
+
     if cleaned_export_report_path.exists():
         cleaned_export_report = _read_json(cleaned_export_report_path)
         cleaned_note_count = int(cleaned_export_report.get("cleaned_note_count", 0))
         rejected_note_count = int(cleaned_export_report.get("rejected_note_count", 0))
+
+        raw_cleaned_timing_source = cleaned_export_report.get("timing_source")
+        if isinstance(raw_cleaned_timing_source, str):
+            cleaned_export_timing_source = raw_cleaned_timing_source
+
+        raw_cleaned_max_error = cleaned_export_report.get("max_export_time_error_ms")
+        if isinstance(raw_cleaned_max_error, (int, float)):
+            export_max_errors_ms.append(float(raw_cleaned_max_error))
+
+        raw_cleaned_mean_error = cleaned_export_report.get("mean_export_time_error_ms")
+        if isinstance(raw_cleaned_mean_error, (int, float)):
+            export_mean_errors_ms.append(float(raw_cleaned_mean_error))
     else:
         warnings.append(f"Missing cleaned export report: {cleaned_export_report_path}")
 
-    if not review_export_report_path.exists():
+    if review_export_report_path.exists():
+        review_export_report = _read_json(review_export_report_path)
+
+        raw_review_timing_source = review_export_report.get("timing_source")
+        if isinstance(raw_review_timing_source, str):
+            review_export_timing_source = raw_review_timing_source
+
+        raw_review_max_error = review_export_report.get("max_export_time_error_ms")
+        if isinstance(raw_review_max_error, (int, float)):
+            export_max_errors_ms.append(float(raw_review_max_error))
+
+        raw_review_mean_error = review_export_report.get("mean_export_time_error_ms")
+        if isinstance(raw_review_mean_error, (int, float)):
+            export_mean_errors_ms.append(float(raw_review_mean_error))
+    else:
         warnings.append(f"Missing review export report: {review_export_report_path}")
 
     if not pipeline_report_path.exists():
@@ -389,6 +456,9 @@ def generate_qa_report(
     median_abs_start_correction_ms: float | None = None
     p95_abs_start_correction_ms: float | None = None
     max_abs_start_correction_ms: float | None = None
+    global_offset_ms: float | None = None
+    global_confidence: float | None = None
+    global_offset_applied: bool | None = None
 
     if alignment_report is not None:
         aligned_count = alignment_report.aligned_count
@@ -398,6 +468,9 @@ def generate_qa_report(
         median_abs_start_correction_ms = alignment_report.median_abs_start_correction_ms
         p95_abs_start_correction_ms = alignment_report.p95_abs_start_correction_ms
         max_abs_start_correction_ms = alignment_report.max_abs_start_correction_ms
+        global_offset_ms = alignment_report.global_offset_ms
+        global_confidence = alignment_report.global_confidence
+        global_offset_applied = alignment_report.global_offset_applied
     elif aligned_notes is not None:
         aligned_count = sum(1 for item in aligned_notes.notes if item.alignment_action == "ALIGNED")
         keep_original_count = sum(
@@ -422,6 +495,13 @@ def generate_qa_report(
             p95_index = int((len(sorted_corrections) - 1) * 0.95)
             p95_abs_start_correction_ms = sorted_corrections[p95_index]
             max_abs_start_correction_ms = sorted_corrections[-1]
+
+    max_export_time_error_ms = max(export_max_errors_ms) if export_max_errors_ms else None
+    mean_export_time_error_ms = (
+        (sum(export_mean_errors_ms) / len(export_mean_errors_ms))
+        if export_mean_errors_ms
+        else None
+    )
 
     confidences = [row.confidence for row in rows]
     mean_confidence = sum(confidences) / len(confidences) if confidences else None
@@ -463,6 +543,12 @@ def generate_qa_report(
         delete_candidate_count=delete_candidate_count,
         cleaned_note_count=cleaned_note_count,
         rejected_note_count=rejected_note_count,
+        validation_timing_source=validation_timing_source,
+        review_export_timing_source=review_export_timing_source,
+        cleaned_export_timing_source=cleaned_export_timing_source,
+        global_offset_ms=global_offset_ms,
+        global_confidence=global_confidence,
+        global_offset_applied=global_offset_applied,
         aligned_count=aligned_count,
         keep_original_count=keep_original_count,
         review_timing_count=review_timing_count,
@@ -470,6 +556,8 @@ def generate_qa_report(
         median_abs_start_correction_ms=median_abs_start_correction_ms,
         p95_abs_start_correction_ms=p95_abs_start_correction_ms,
         max_abs_start_correction_ms=max_abs_start_correction_ms,
+        max_export_time_error_ms=max_export_time_error_ms,
+        mean_export_time_error_ms=mean_export_time_error_ms,
         mean_confidence=mean_confidence,
         min_confidence=min_confidence,
         max_confidence=max_confidence,

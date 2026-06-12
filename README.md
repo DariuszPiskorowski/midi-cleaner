@@ -4,9 +4,18 @@ Hermes MIDI Fidelity Engine project scaffold.
 
 This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 10**: audio-time canonical note alignment and aligned-second MIDI export.
 
+Milestone 10.1 integration and reporting hardening is now in place:
+- Validation consumes audio-aligned timing when alignment data exists.
+- Cleanup exports consume audio-aligned timing when alignment data exists.
+- WAV/audio seconds are canonical for synchronization.
+- BPM/bar calculations are not trusted for synchronization.
+- A coarse global offset search runs before local per-note alignment.
+- Export ticks-per-beat defaults to source note_events ticks-per-beat unless explicitly overridden.
+- Generated projects outputs under `projects/*` are ignored and should not be committed.
+
 ## Current Milestone
 
-Milestone 10 implements:
+Milestone 10 and 10.1 implement:
 - Python package scaffold
 - Strict Python 3.11 guard
 - Runtime/environment report via CLI doctor command
@@ -22,7 +31,9 @@ Milestone 10 implements:
 - Static QA artifacts: qa_summary.json, qa_notes.csv, qa_report.html
 - Audio-time canonical note alignment into analysis/audio_aligned_note_events.json
 - Audio alignment report in analysis/audio_alignment_report.json
+- Validation uses aligned timing via audio_aligned_note_events.json when available
 - Review/cleaned MIDI export using aligned_start_sec/aligned_end_sec when alignment data is provided
+- QA report includes explicit Audio-Time Alignment / Sync metrics and timing sources
 - Tests for guard behavior, MIDI import, audio analysis, validation, cleanup planning, review MIDI export, cleaned MIDI export, process-stem pipeline, and QA reports
 
 Destructive note deletion, rendering, UI, and ML are not implemented yet.
