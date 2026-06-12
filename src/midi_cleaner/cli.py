@@ -30,6 +30,11 @@ from midi_cleaner.pipeline.process_stem import (
     PipelineProcessParameters,
     process_stem_pipeline,
 )
+from midi_cleaner.pipeline.qa_report import (
+    QAReportError,
+    QAReportParameters,
+    generate_qa_report,
+)
 from midi_cleaner.runtime.report import RuntimeReport, build_runtime_report
 from midi_cleaner.validation.models import MidiAudioValidationReport
 from midi_cleaner.validation.midi_audio import (
@@ -471,6 +476,36 @@ def process_stem_command(
         f"keep={cleaned_count}, "
         f"review={review_count}, "
         f"rejected={rejected_count}"
+    )
+
+
+@pipeline_app.command("qa-report")
+def pipeline_qa_report_command(
+    project_dir: Path = typer.Option(..., "--project-dir", help="Pipeline project directory."),
+    output_dir: Path | None = typer.Option(
+        None,
+        "--output-dir",
+        help="Output directory for QA artifacts (default: PROJECT_DIR/reports).",
+    ),
+    top_n: int = typer.Option(25, "--top-n"),
+    include_csv: bool = typer.Option(True, "--include-csv/--no-include-csv"),
+    include_html: bool = typer.Option(True, "--include-html/--no-include-html"),
+) -> None:
+    params = QAReportParameters(top_n=top_n, include_csv=include_csv, include_html=include_html)
+
+    try:
+        summary = generate_qa_report(project_dir=project_dir, output_dir=output_dir, params=params)
+    except QAReportError as exc:
+        typer.echo(f"qa-report failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        "QA report complete: "
+        f"notes={summary.total_notes}, "
+        f"keep={summary.keep_count}, "
+        f"review={summary.review_count}, "
+        f"mute={summary.mute_count}, "
+        f"warnings={summary.warning_count}"
     )
 
 

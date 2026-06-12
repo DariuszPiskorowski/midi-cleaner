@@ -2,11 +2,11 @@
 
 Hermes MIDI Fidelity Engine project scaffold.
 
-This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 8**: end-to-end orchestration for one MIDI candidate and one WAV stem.
+This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 9**: static QA artifact generation from completed pipeline outputs.
 
 ## Current Milestone
 
-Milestone 8 implements:
+Milestone 9 implements:
 - Python package scaffold
 - Strict Python 3.11 guard
 - Runtime/environment report via CLI doctor command
@@ -19,7 +19,8 @@ Milestone 8 implements:
 - Non-destructive review MIDI export grouped by cleanup action
 - Conservative cleaned/review/rejected MIDI export from cleanup plan
 - One-command process-stem pipeline that orchestrates existing stages
-- Tests for guard behavior, MIDI import, audio analysis, validation, cleanup planning, review MIDI export, cleaned MIDI export, and process-stem pipeline
+- Static QA artifacts: qa_summary.json, qa_notes.csv, qa_report.html
+- Tests for guard behavior, MIDI import, audio analysis, validation, cleanup planning, review MIDI export, cleaned MIDI export, process-stem pipeline, and QA reports
 
 Destructive note deletion, rendering, UI, and ML are not implemented yet.
 
@@ -150,6 +151,18 @@ Example:
 
 ```powershell
 uv run midi-cleaner pipeline process-stem --midi .\candidate.mid --wav .\stem.wav --source ripx --layer bass --project-dir .\artifacts\pipeline_run
+```
+
+## Static QA Report
+
+```powershell
+uv run midi-cleaner pipeline qa-report --project-dir PROJECT_DIR
+```
+
+Example:
+
+```powershell
+uv run midi-cleaner pipeline qa-report --project-dir .\artifacts\pipeline_run
 ```
 
 ## Planned Pipeline

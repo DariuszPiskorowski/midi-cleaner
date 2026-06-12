@@ -1,0 +1,293 @@
+from __future__ import annotations
+
+import csv
+import json
+from pathlib import Path
+
+from typer.testing import CliRunner
+
+from midi_cleaner.cleanup.models import (
+    CleanedMidiExportFile,
+    CleanedMidiExportReport,
+    CleanupAction,
+    CleanupPlanDocument,
+    ReviewMidiExportFile,
+    ReviewMidiExportReport,
+)
+from midi_cleaner.cli import app
+from midi_cleaner.pipeline.models import PipelineReport, PipelineStageReport
+from midi_cleaner.pipeline.qa_report import QAReportError, QAReportParameters, generate_qa_report
+from midi_cleaner.validation.models import NoteValidation, NoteValidationDocument
+
+
+runner = CliRunner()
+
+
+def _validation(
+    note_id: str,
+    confidence: float,
+    action: str,
+    onset_score: float,
+    mean_rms: float,
+    reasons: list[str],
+) -> NoteValidation:
+    return NoteValidation(
+        note_id=note_id,
+        pitch_midi=60,
+        pitch_name="C4",
+        layer="bass",
+        source="ripx",
+        start_sec=0.0,
+        end_sec=0.5,
+        duration_sec=0.5,
+        nearest_onset_sec=0.0,
+        onset_error_ms=0.0,
+        onset_score=onset_score,
+        max_rms_during_note=0.02,
+        mean_rms_during_note=mean_rms,
+        sustained_energy_ratio=0.8,
+        energy_match_score=0.7,
+        duration_match_score=0.8,
+        confidence=confidence,
+        recommended_action=action,
+        reasons=reasons,
+    )
+
+
+def _write_pipeline_like_project(tmp_path: Path, include_optional: bool = True) -> Path:
+    project_dir = tmp_path / "pipeline_project"
+    (project_dir / "analysis").mkdir(parents=True, exist_ok=True)
+    (project_dir / "cleanup").mkdir(parents=True, exist_ok=True)
+    (project_dir / "midi" / "cleaned").mkdir(parents=True, exist_ok=True)
+    (project_dir / "midi" / "review").mkdir(parents=True, exist_ok=True)
+    (project_dir / "reports").mkdir(parents=True, exist_ok=True)
+
+    note_validation = NoteValidationDocument(
+        schema_version="0.1.0",
+        notes_file="analysis/note_events.json",
+        audio_features_file="analysis/audio_features.json",
+        layer="bass",
+        validation_parameters={
+            "onset_window_ms": 50.0,
+            "minimum_rms": 0.001,
+            "minimum_onset_score": 0.01,
+            "review_threshold": 0.45,
+            "keep_threshold": 0.70,
+        },
+        validations=[
+            _validation("k", 0.9, "KEEP", 0.2, 0.01, ["high confidence match"]),
+            _validation("r", 0.6, "REVIEW", 0.02, 0.005, ["manual review", "<unsafe>"]),
+            _validation("m", 0.2, "MUTE_CANDIDATE", 0.001, 0.0005, ["low RMS"]),
+            _validation("d", 0.1, "MUTE_CANDIDATE", 0.0, 0.0001, ["no overlap"]),
+        ],
+    )
+    (project_dir / "analysis" / "note_validation.json").write_text(
+        note_validation.model_dump_json(indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    cleanup_plan = CleanupPlanDocument(
+        schema_version="0.1.0",
+        validation_file="analysis/note_validation.json",
+        layer="bass",
+        planner_parameters={
+            "mute_threshold": 0.45,
+            "review_threshold": 0.70,
+            "delete_threshold": 0.20,
+            "allow_delete_candidates": True,
+        },
+        actions=[
+            CleanupAction(
+                note_id="k",
+                original_recommended_action="KEEP",
+                plan_action="KEEP",
+                confidence=0.9,
+                reasons=["keep"],
+                source_validation={"recommended_action": "KEEP"},
+            ),
+            CleanupAction(
+                note_id="r",
+                original_recommended_action="REVIEW",
+                plan_action="REVIEW",
+                confidence=0.6,
+                reasons=["review"],
+                source_validation={"recommended_action": "REVIEW"},
+            ),
+            CleanupAction(
+                note_id="m",
+                original_recommended_action="MUTE_CANDIDATE",
+                plan_action="MUTE",
+                confidence=0.2,
+                reasons=["mute"],
+                source_validation={"recommended_action": "MUTE_CANDIDATE"},
+            ),
+            CleanupAction(
+                note_id="d",
+                original_recommended_action="MUTE_CANDIDATE",
+                plan_action="DELETE_CANDIDATE",
+                confidence=0.1,
+                reasons=["delete"],
+                source_validation={"recommended_action": "MUTE_CANDIDATE"},
+            ),
+        ],
+    )
+    (project_dir / "cleanup" / "cleanup_plan.json").write_text(
+        cleanup_plan.model_dump_json(indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    if include_optional:
+        cleaned_report = CleanedMidiExportReport(
+            notes_file="analysis/note_events.json",
+            cleanup_plan_file="cleanup/cleanup_plan.json",
+            status="ok",
+            layer="bass",
+            ticks_per_beat=960,
+            cleaned_note_count=1,
+            review_note_count=1,
+            rejected_note_count=2,
+            exported_files=[
+                CleanedMidiExportFile(
+                    role="CLEANED",
+                    path="midi/cleaned/cleaned.mid",
+                    note_count=1,
+                    included_plan_actions=["KEEP"],
+                )
+            ],
+            warning_count=0,
+            warnings=[],
+        )
+        (project_dir / "midi" / "cleaned" / "cleaned_export_report.json").write_text(
+            cleaned_report.model_dump_json(indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        review_report = ReviewMidiExportReport(
+            notes_file="analysis/note_events.json",
+            cleanup_plan_file="cleanup/cleanup_plan.json",
+            status="ok",
+            layer="bass",
+            ticks_per_beat=960,
+            exported_files=[
+                ReviewMidiExportFile(action="KEEP", path="midi/review/keep.mid", note_count=1)
+            ],
+            warning_count=0,
+            warnings=[],
+        )
+        (project_dir / "midi" / "review" / "export_report.json").write_text(
+            review_report.model_dump_json(indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        pipeline_report = PipelineReport(
+            status="ok",
+            input_midi="candidate.mid",
+            input_wav="stem.wav",
+            source="ripx",
+            layer="bass",
+            project_dir=str(project_dir),
+            stages=[
+                PipelineStageReport(
+                    name="dummy",
+                    status="ok",
+                    output_files=[],
+                    warning_count=1,
+                    warnings=["stage warning"],
+                )
+            ],
+            output_files={},
+            warning_count=1,
+            warnings=["pipeline warning"],
+        )
+        (project_dir / "reports" / "pipeline_report.json").write_text(
+            pipeline_report.model_dump_json(indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    return project_dir
+
+
+def test_qa_report_creates_summary_csv_and_html(tmp_path: Path) -> None:
+    project_dir = _write_pipeline_like_project(tmp_path)
+
+    summary = generate_qa_report(project_dir, None, QAReportParameters())
+
+    assert summary.status == "ok"
+    assert (project_dir / "reports" / "qa_summary.json").exists()
+    assert (project_dir / "reports" / "qa_notes.csv").exists()
+    assert (project_dir / "reports" / "qa_report.html").exists()
+
+
+def test_summary_counts_actions_correctly(tmp_path: Path) -> None:
+    project_dir = _write_pipeline_like_project(tmp_path)
+
+    summary = generate_qa_report(project_dir, None, QAReportParameters())
+
+    assert summary.keep_count == 1
+    assert summary.review_count == 1
+    assert summary.mute_count == 1
+    assert summary.delete_candidate_count == 1
+
+
+def test_csv_contains_expected_rows(tmp_path: Path) -> None:
+    project_dir = _write_pipeline_like_project(tmp_path)
+
+    generate_qa_report(project_dir, None, QAReportParameters())
+
+    with (project_dir / "reports" / "qa_notes.csv").open("r", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == 4
+    assert any(row["note_id"] == "k" for row in rows)
+
+
+def test_html_contains_sections_and_escaped_content(tmp_path: Path) -> None:
+    project_dir = _write_pipeline_like_project(tmp_path)
+
+    generate_qa_report(project_dir, None, QAReportParameters())
+
+    html_text = (project_dir / "reports" / "qa_report.html").read_text(encoding="utf-8")
+    assert "Hermes Static QA Report" in html_text
+    assert "Top 25 Lowest-Confidence Notes" in html_text
+    assert "&lt;unsafe&gt;" in html_text
+
+
+def test_missing_optional_reports_warns_but_succeeds(tmp_path: Path) -> None:
+    project_dir = _write_pipeline_like_project(tmp_path, include_optional=False)
+
+    summary = generate_qa_report(project_dir, None, QAReportParameters())
+
+    assert summary.status == "ok"
+    assert summary.warning_count >= 1
+
+
+def test_missing_project_dir_fails(tmp_path: Path) -> None:
+    missing_dir = tmp_path / "does_not_exist"
+
+    try:
+        generate_qa_report(missing_dir, None, QAReportParameters())
+        assert False, "Expected QAReportError"
+    except QAReportError:
+        assert True
+
+
+def test_cli_qa_report_command_works(tmp_path: Path) -> None:
+    project_dir = _write_pipeline_like_project(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "pipeline",
+            "qa-report",
+            "--project-dir",
+            str(project_dir),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert (project_dir / "reports" / "qa_summary.json").exists()
+    assert (project_dir / "reports" / "qa_notes.csv").exists()
+    assert (project_dir / "reports" / "qa_report.html").exists()
+
+    summary = json.loads((project_dir / "reports" / "qa_summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "ok"

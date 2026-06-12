@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Rules for AI coding agents in `midi-cleaner` during Milestone 8:
+Rules for AI coding agents in `midi-cleaner` during Milestone 9:
 
 - Keep the Python environment guard strict for Python 3.11.x.
 - Run all commands through `uv run` when executing project tools.
@@ -11,8 +11,8 @@ Rules for AI coding agents in `midi-cleaner` during Milestone 8:
 - Milestone 6 exports non-destructive review MIDI files.
 - Milestone 7 exports conservative cleaned/review/rejected MIDI files.
 - Milestone 8 orchestrates existing stages.
+- Milestone 9 generates static QA artifacts from existing pipeline outputs.
 - Do not add dependencies.
-- Do not implement new validation heuristics.
-- Do not implement UI, DAW integration, rendering, pitch validation, or ML.
-- Do not shell out to the CLI from pipeline code; call internal functions.
+- Do not implement web UI.
+- Do not implement new validation heuristics, pitch validation, rendering, ML, or DAW integration.
 - Update and maintain tests with every behavior change.

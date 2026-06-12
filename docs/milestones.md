@@ -58,6 +58,13 @@
 - Aggregate stage warnings and statuses into `pipeline_report.json`.
 - Keep orchestration non-destructive and call internal functions directly.
 
+## Milestone 9 - Static QA Report Generation
+- Add CLI command `midi-cleaner pipeline qa-report`.
+- Generate static QA artifacts from completed pipeline outputs.
+- Export `qa_summary.json`, optional `qa_notes.csv`, optional `qa_report.html`.
+- Keep reporting deterministic and dependency-light using Python standard library.
+- Do not add new heuristics; summarize existing stage outputs.
+
 ## Future Milestones (Planned)
 - Classify actions: KEEP, MUTE, MERGE, SHORTEN, QUANTIZE, REASSIGN, DELETE.
 - Export cleaned MIDI and machine-readable QA reports.

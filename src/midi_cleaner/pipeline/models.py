@@ -24,3 +24,41 @@ class PipelineReport(BaseModel):
     output_files: dict[str, str]
     warning_count: int
     warnings: list[str]
+
+
+class QANoteRow(BaseModel):
+    note_id: str
+    pitch_midi: int
+    pitch_name: str
+    start_sec: float
+    end_sec: float
+    duration_sec: float
+    confidence: float
+    validation_action: str
+    plan_action: str | None
+    onset_score: float
+    mean_rms_during_note: float
+    sustained_energy_ratio: float
+    reasons: str
+
+
+class QASummary(BaseModel):
+    status: Literal["ok", "error"]
+    project_dir: str
+    layer: str | None
+    total_notes: int
+    keep_count: int
+    review_count: int
+    mute_count: int
+    delete_candidate_count: int
+    cleaned_note_count: int
+    rejected_note_count: int
+    mean_confidence: float | None
+    min_confidence: float | None
+    max_confidence: float | None
+    low_confidence_count: int
+    weak_onset_count: int
+    low_rms_count: int
+    output_files: dict[str, str]
+    warning_count: int
+    warnings: list[str]
