@@ -2,11 +2,11 @@
 
 Hermes MIDI Fidelity Engine project scaffold.
 
-This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 9**: static QA artifact generation from completed pipeline outputs.
+This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 10**: audio-time canonical note alignment and aligned-second MIDI export.
 
 ## Current Milestone
 
-Milestone 9 implements:
+Milestone 10 implements:
 - Python package scaffold
 - Strict Python 3.11 guard
 - Runtime/environment report via CLI doctor command
@@ -20,6 +20,9 @@ Milestone 9 implements:
 - Conservative cleaned/review/rejected MIDI export from cleanup plan
 - One-command process-stem pipeline that orchestrates existing stages
 - Static QA artifacts: qa_summary.json, qa_notes.csv, qa_report.html
+- Audio-time canonical note alignment into analysis/audio_aligned_note_events.json
+- Audio alignment report in analysis/audio_alignment_report.json
+- Review/cleaned MIDI export using aligned_start_sec/aligned_end_sec when alignment data is provided
 - Tests for guard behavior, MIDI import, audio analysis, validation, cleanup planning, review MIDI export, cleaned MIDI export, process-stem pipeline, and QA reports
 
 Destructive note deletion, rendering, UI, and ML are not implemented yet.
@@ -105,6 +108,18 @@ Example:
 uv run midi-cleaner validate midi-vs-audio --notes .\artifacts\note_events.json --audio-features .\artifacts\audio_features.json --output .\artifacts\note_validation.json --report .\artifacts\midi_audio_validation_report.json
 ```
 
+## Audio-Time Note Alignment
+
+```powershell
+uv run midi-cleaner validate align-audio-time --notes NOTE_EVENTS_JSON --audio-features AUDIO_FEATURES_JSON --output OUTPUT_JSON --report REPORT_JSON
+```
+
+Example:
+
+```powershell
+uv run midi-cleaner validate align-audio-time --notes .\artifacts\note_events.json --audio-features .\artifacts\audio_features.json --output .\artifacts\audio_aligned_note_events.json --report .\artifacts\audio_alignment_report.json
+```
+
 ## Cleanup Plan (Non-Destructive)
 
 ```powershell
@@ -123,6 +138,12 @@ uv run midi-cleaner cleanup plan --validation .\artifacts\note_validation.json -
 uv run midi-cleaner cleanup export-review-midi --notes NOTE_EVENTS_JSON --plan CLEANUP_PLAN_JSON --output-dir OUTPUT_DIR --report REPORT_JSON
 ```
 
+Optional aligned timing input:
+
+```powershell
+uv run midi-cleaner cleanup export-review-midi --notes NOTE_EVENTS_JSON --plan CLEANUP_PLAN_JSON --audio-aligned-notes AUDIO_ALIGNED_NOTE_EVENTS_JSON --output-dir OUTPUT_DIR --report REPORT_JSON
+```
+
 Example:
 
 ```powershell
@@ -133,6 +154,12 @@ uv run midi-cleaner cleanup export-review-midi --notes .\artifacts\note_events.j
 
 ```powershell
 uv run midi-cleaner cleanup export-cleaned-midi --notes NOTE_EVENTS_JSON --plan CLEANUP_PLAN_JSON --output-dir OUTPUT_DIR --report REPORT_JSON
+```
+
+Optional aligned timing input:
+
+```powershell
+uv run midi-cleaner cleanup export-cleaned-midi --notes NOTE_EVENTS_JSON --plan CLEANUP_PLAN_JSON --audio-aligned-notes AUDIO_ALIGNED_NOTE_EVENTS_JSON --output-dir OUTPUT_DIR --report REPORT_JSON
 ```
 
 Example:

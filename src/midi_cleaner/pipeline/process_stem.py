@@ -6,6 +6,10 @@ import json
 
 from pydantic import BaseModel
 
+from midi_cleaner.alignment.audio_time import (
+    AudioTimeAlignmentParameters,
+    align_notes_to_audio_time,
+)
 from midi_cleaner.audio.analyzer import analyze_stem
 from midi_cleaner.cleanup.cleaned_exporter import (
     CleanedMidiExportParameters,
@@ -29,6 +33,15 @@ class PipelineProcessParameters:
     minimum_onset_score: float = 0.01
     review_threshold: float = 0.45
     keep_threshold: float = 0.70
+    onset_search_window_ms: float = 250.0
+    offset_search_window_ms: float = 350.0
+    alignment_min_onset_score: float = 0.005
+    alignment_min_rms: float = 0.001
+    snap_start_to_audio_onset: bool = True
+    snap_end_to_energy_offset: bool = True
+    max_start_correction_ms: float = 500.0
+    max_end_correction_ms: float = 800.0
+    low_confidence_action: str = "KEEP_ORIGINAL_LOW_CONFIDENCE"
     mute_threshold: float = 0.45
     cleanup_review_threshold: float = 0.70
     delete_threshold: float = 0.20
@@ -101,6 +114,17 @@ def process_stem_pipeline(
                     "delete_threshold": params.delete_threshold,
                     "allow_delete_candidates": params.allow_delete_candidates,
                 },
+                "alignment": {
+                    "onset_search_window_ms": params.onset_search_window_ms,
+                    "offset_search_window_ms": params.offset_search_window_ms,
+                    "min_onset_score": params.alignment_min_onset_score,
+                    "min_rms": params.alignment_min_rms,
+                    "snap_start_to_audio_onset": params.snap_start_to_audio_onset,
+                    "snap_end_to_energy_offset": params.snap_end_to_energy_offset,
+                    "max_start_correction_ms": params.max_start_correction_ms,
+                    "max_end_correction_ms": params.max_end_correction_ms,
+                    "low_confidence_action": params.low_confidence_action,
+                },
                 "midi_export": {
                     "ticks_per_beat": params.ticks_per_beat,
                     "track_name_prefix": params.track_name_prefix,
@@ -163,7 +187,42 @@ def process_stem_pipeline(
         )
         warnings.extend([f"audio_analysis: {item}" for item in audio_report.warnings])
 
-        # Stage 3: MIDI-vs-audio validation
+        # Stage 3: Audio-time note alignment
+        current_stage = "audio_time_alignment"
+        audio_aligned_note_events_path = analysis_dir / "audio_aligned_note_events.json"
+        audio_alignment_report_path = analysis_dir / "audio_alignment_report.json"
+        aligned_document, alignment_report = align_notes_to_audio_time(
+            notes_file=note_events_path,
+            audio_features_file=audio_features_path,
+            params=AudioTimeAlignmentParameters(
+                onset_search_window_ms=params.onset_search_window_ms,
+                offset_search_window_ms=params.offset_search_window_ms,
+                min_onset_score=params.alignment_min_onset_score,
+                min_rms=params.alignment_min_rms,
+                snap_start_to_audio_onset=params.snap_start_to_audio_onset,
+                snap_end_to_energy_offset=params.snap_end_to_energy_offset,
+                max_start_correction_ms=params.max_start_correction_ms,
+                max_end_correction_ms=params.max_end_correction_ms,
+                low_confidence_action=params.low_confidence_action,
+            ),
+        )
+        alignment_report.output_file = str(audio_aligned_note_events_path)
+        _write_json(audio_aligned_note_events_path, aligned_document)
+        _write_json(audio_alignment_report_path, alignment_report)
+        output_files["audio_aligned_note_events"] = str(audio_aligned_note_events_path)
+        output_files["audio_alignment_report"] = str(audio_alignment_report_path)
+        stages.append(
+            PipelineStageReport(
+                name="audio_time_alignment",
+                status="ok",
+                output_files=[str(audio_aligned_note_events_path), str(audio_alignment_report_path)],
+                warning_count=alignment_report.warning_count,
+                warnings=alignment_report.warnings,
+            )
+        )
+        warnings.extend([f"audio_time_alignment: {item}" for item in alignment_report.warnings])
+
+        # Stage 4: MIDI-vs-audio validation
         current_stage = "midi_audio_validation"
         note_validation_path = analysis_dir / "note_validation.json"
         midi_audio_validation_report_path = analysis_dir / "midi_audio_validation_report.json"
@@ -194,7 +253,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"midi_audio_validation: {item}" for item in validation_report.warnings])
 
-        # Stage 4: Cleanup planning
+        # Stage 5: Cleanup planning
         current_stage = "cleanup_plan"
         cleanup_plan_path = cleanup_dir / "cleanup_plan.json"
         cleanup_plan_report_path = cleanup_dir / "cleanup_plan_report.json"
@@ -223,7 +282,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"cleanup_plan: {item}" for item in cleanup_report.warnings])
 
-        # Stage 5: Review MIDI export
+        # Stage 6: Review MIDI export
         current_stage = "review_midi_export"
         review_export_report_path = review_midi_dir / "export_report.json"
         review_export_report = export_review_midi(
@@ -234,6 +293,7 @@ def process_stem_pipeline(
                 ticks_per_beat=params.ticks_per_beat,
                 track_name_prefix=params.track_name_prefix,
                 include_delete_candidates=params.include_delete_candidates,
+                audio_aligned_notes_file=audio_aligned_note_events_path,
             ),
         )
         _write_json(review_export_report_path, review_export_report)
@@ -252,7 +312,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"review_midi_export: {item}" for item in review_export_report.warnings])
 
-        # Stage 6: Cleaned MIDI export
+        # Stage 7: Cleaned MIDI export
         current_stage = "cleaned_midi_export"
         cleaned_export_report_path = cleaned_midi_dir / "cleaned_export_report.json"
         cleaned_export_report = export_cleaned_midi(
@@ -264,6 +324,7 @@ def process_stem_pipeline(
                 track_name_prefix=params.track_name_prefix,
                 include_review_in_cleaned=params.include_review_in_cleaned,
                 write_empty_files=params.write_empty_files,
+                audio_aligned_notes_file=audio_aligned_note_events_path,
             ),
         )
         _write_json(cleaned_export_report_path, cleaned_export_report)

@@ -1,9 +1,18 @@
+# Local pipeline/project outputs
+projects/*
+!projects/.gitkeep
+
+# Python/uv local environment and caches
 .venv/
 __pycache__/
-*.py[cod]
-*.pyo
 .pytest_cache/
 .ruff_cache/
+
+# Local build/test artifacts
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
 .coverage
 htmlcov/
 *.egg-info/

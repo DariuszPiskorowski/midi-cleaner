@@ -6,6 +6,11 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+from midi_cleaner.alignment.models import (
+    AudioAlignedNoteDocument,
+    AudioAlignedNoteEvent,
+    AudioAlignmentReport,
+)
 from midi_cleaner.cleanup.models import (
     CleanedMidiExportFile,
     CleanedMidiExportReport,
@@ -137,12 +142,98 @@ def _write_pipeline_like_project(tmp_path: Path, include_optional: bool = True) 
     )
 
     if include_optional:
+        aligned_doc = AudioAlignedNoteDocument(
+            schema_version="0.1.0",
+            notes_file="analysis/note_events.json",
+            audio_features_file="analysis/audio_features.json",
+            layer="bass",
+            sample_rate=44100,
+            audio_duration_sec=1.0,
+            alignment_parameters={
+                "onset_search_window_ms": 250.0,
+                "offset_search_window_ms": 350.0,
+                "min_onset_score": 0.005,
+                "min_rms": 0.001,
+                "snap_start_to_audio_onset": True,
+                "snap_end_to_energy_offset": True,
+                "max_start_correction_ms": 500.0,
+                "max_end_correction_ms": 800.0,
+                "low_confidence_action": "KEEP_ORIGINAL_LOW_CONFIDENCE",
+            },
+            notes=[
+                AudioAlignedNoteEvent(
+                    note_id="k",
+                    source="ripx",
+                    layer="bass",
+                    pitch_midi=60,
+                    pitch_name="C4",
+                    velocity=90,
+                    channel=0,
+                    original_start_sec=0.0,
+                    original_end_sec=0.5,
+                    original_duration_sec=0.5,
+                    original_start_tick=0,
+                    original_end_tick=240,
+                    aligned_start_sec=0.01,
+                    aligned_end_sec=0.51,
+                    aligned_duration_sec=0.5,
+                    start_correction_ms=10.0,
+                    end_correction_ms=10.0,
+                    duration_correction_ms=0.0,
+                    nearest_audio_onset_sec=0.01,
+                    nearest_audio_offset_sec=0.51,
+                    onset_error_before_ms=0.0,
+                    onset_error_after_ms=10.0,
+                    local_rms=0.01,
+                    local_onset_score=0.2,
+                    sustained_energy_ratio=0.8,
+                    alignment_confidence=0.9,
+                    alignment_action="ALIGNED",
+                    reasons=["test"],
+                )
+            ],
+        )
+        (project_dir / "analysis" / "audio_aligned_note_events.json").write_text(
+            aligned_doc.model_dump_json(indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        alignment_report = AudioAlignmentReport(
+            notes_file="analysis/note_events.json",
+            audio_features_file="analysis/audio_features.json",
+            status="ok",
+            layer="bass",
+            note_count=4,
+            aligned_count=2,
+            keep_original_count=1,
+            review_timing_count=1,
+            no_audio_evidence_count=0,
+            median_abs_start_correction_ms=10.0,
+            p95_abs_start_correction_ms=18.0,
+            max_abs_start_correction_ms=20.0,
+            warning_count=0,
+            warnings=[],
+            output_file="analysis/audio_aligned_note_events.json",
+        )
+        (project_dir / "analysis" / "audio_alignment_report.json").write_text(
+            alignment_report.model_dump_json(indent=2) + "\n",
+            encoding="utf-8",
+        )
+
         cleaned_report = CleanedMidiExportReport(
             notes_file="analysis/note_events.json",
             cleanup_plan_file="cleanup/cleanup_plan.json",
+            audio_aligned_notes_file="analysis/audio_aligned_note_events.json",
             status="ok",
             layer="bass",
             ticks_per_beat=960,
+            timing_source="audio_aligned_seconds",
+            max_export_time_error_ms=0.6,
+            mean_export_time_error_ms=0.2,
+            source_ticks_per_beat=480,
+            exported_ticks_per_beat=960,
+            tempo_us_per_beat=500000,
+            bpm=120.0,
             cleaned_note_count=1,
             review_note_count=1,
             rejected_note_count=2,
@@ -165,9 +256,17 @@ def _write_pipeline_like_project(tmp_path: Path, include_optional: bool = True) 
         review_report = ReviewMidiExportReport(
             notes_file="analysis/note_events.json",
             cleanup_plan_file="cleanup/cleanup_plan.json",
+            audio_aligned_notes_file="analysis/audio_aligned_note_events.json",
             status="ok",
             layer="bass",
             ticks_per_beat=960,
+            timing_source="audio_aligned_seconds",
+            max_export_time_error_ms=0.5,
+            mean_export_time_error_ms=0.2,
+            source_ticks_per_beat=480,
+            exported_ticks_per_beat=960,
+            tempo_us_per_beat=500000,
+            bpm=120.0,
             exported_files=[
                 ReviewMidiExportFile(action="KEEP", path="midi/review/keep.mid", note_count=1)
             ],
@@ -227,6 +326,9 @@ def test_summary_counts_actions_correctly(tmp_path: Path) -> None:
     assert summary.review_count == 1
     assert summary.mute_count == 1
     assert summary.delete_candidate_count == 1
+    assert summary.aligned_count == 2
+    assert summary.keep_original_count == 1
+    assert summary.review_timing_count == 1
 
 
 def test_csv_contains_expected_rows(tmp_path: Path) -> None:
@@ -239,6 +341,11 @@ def test_csv_contains_expected_rows(tmp_path: Path) -> None:
 
     assert len(rows) == 4
     assert any(row["note_id"] == "k" for row in rows)
+    assert "original_start_sec" in rows[0]
+    assert "aligned_start_sec" in rows[0]
+    assert "start_correction_ms" in rows[0]
+    assert "alignment_action" in rows[0]
+    assert "alignment_confidence" in rows[0]
 
 
 def test_html_contains_sections_and_escaped_content(tmp_path: Path) -> None:
@@ -248,6 +355,7 @@ def test_html_contains_sections_and_escaped_content(tmp_path: Path) -> None:
 
     html_text = (project_dir / "reports" / "qa_report.html").read_text(encoding="utf-8")
     assert "Hermes Static QA Report" in html_text
+    assert "Audio Alignment" in html_text
     assert "Top 25 Lowest-Confidence Notes" in html_text
     assert "&lt;unsafe&gt;" in html_text
 

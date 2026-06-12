@@ -7,6 +7,12 @@ from rich.console import Console
 from rich.table import Table
 
 from midi_cleaner import __version__
+from midi_cleaner.alignment.audio_time import (
+    AudioTimeAlignmentError,
+    AudioTimeAlignmentParameters,
+    align_notes_to_audio_time,
+)
+from midi_cleaner.alignment.models import AudioAlignmentReport
 from midi_cleaner.audio.analyzer import AudioAnalysisError, analyze_stem
 from midi_cleaner.cleanup.cleaned_exporter import (
     CleanedMidiExportError,
@@ -257,6 +263,77 @@ def validate_midi_vs_audio_command(
     )
 
 
+@validate_app.command("align-audio-time")
+def align_audio_time_command(
+    notes: Path = typer.Option(..., "--notes", help="Path to note_events.json."),
+    audio_features: Path = typer.Option(
+        ..., "--audio-features", help="Path to audio_features.json."
+    ),
+    output: Path = typer.Option(
+        ..., "--output", help="Output path for audio aligned note events JSON."
+    ),
+    report: Path = typer.Option(
+        ..., "--report", help="Output path for audio alignment report JSON."
+    ),
+    onset_search_window_ms: float = typer.Option(250.0, "--onset-search-window-ms"),
+    offset_search_window_ms: float = typer.Option(350.0, "--offset-search-window-ms"),
+    min_onset_score: float = typer.Option(0.005, "--min-onset-score"),
+    min_rms: float = typer.Option(0.001, "--min-rms"),
+    snap_start_to_audio_onset: bool = typer.Option(
+        True,
+        "--snap-start-to-audio-onset/--no-snap-start-to-audio-onset",
+    ),
+    snap_end_to_energy_offset: bool = typer.Option(
+        True,
+        "--snap-end-to-energy-offset/--no-snap-end-to-energy-offset",
+    ),
+    max_start_correction_ms: float = typer.Option(500.0, "--max-start-correction-ms"),
+    max_end_correction_ms: float = typer.Option(800.0, "--max-end-correction-ms"),
+    low_confidence_action: str = typer.Option(
+        "KEEP_ORIGINAL_LOW_CONFIDENCE", "--low-confidence-action"
+    ),
+) -> None:
+    params = AudioTimeAlignmentParameters(
+        onset_search_window_ms=onset_search_window_ms,
+        offset_search_window_ms=offset_search_window_ms,
+        min_onset_score=min_onset_score,
+        min_rms=min_rms,
+        snap_start_to_audio_onset=snap_start_to_audio_onset,
+        snap_end_to_energy_offset=snap_end_to_energy_offset,
+        max_start_correction_ms=max_start_correction_ms,
+        max_end_correction_ms=max_end_correction_ms,
+        low_confidence_action=low_confidence_action,
+    )
+
+    try:
+        document, alignment_report = align_notes_to_audio_time(
+            notes_file=notes,
+            audio_features_file=audio_features,
+            params=params,
+        )
+    except AudioTimeAlignmentError as exc:
+        typer.echo(f"Audio-time alignment failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    report.parent.mkdir(parents=True, exist_ok=True)
+
+    output.write_text(document.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    alignment_report.output_file = str(output)
+    report.write_text(alignment_report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    typer.echo(
+        "Audio-time note alignment complete: "
+        f"notes={alignment_report.note_count}, "
+        f"aligned={alignment_report.aligned_count}, "
+        f"keep_original={alignment_report.keep_original_count}, "
+        f"review={alignment_report.review_timing_count}, "
+        f"no_audio_evidence={alignment_report.no_audio_evidence_count}, "
+        f"warnings={alignment_report.warning_count}"
+    )
+
+
 @cleanup_app.command("plan")
 def cleanup_plan_command(
     validation: Path = typer.Option(..., "--validation", help="Path to note_validation.json."),
@@ -304,6 +381,11 @@ def cleanup_plan_command(
 def cleanup_export_review_midi_command(
     notes: Path = typer.Option(..., "--notes", help="Path to note_events.json."),
     plan: Path = typer.Option(..., "--plan", help="Path to cleanup_plan.json."),
+    audio_aligned_notes: Path | None = typer.Option(
+        None,
+        "--audio-aligned-notes",
+        help="Optional path to audio_aligned_note_events.json.",
+    ),
     output_dir: Path = typer.Option(..., "--output-dir", help="Directory for exported review MIDI files."),
     report: Path = typer.Option(..., "--report", help="Output path for export report JSON."),
     ticks_per_beat: int = typer.Option(960, "--ticks-per-beat"),
@@ -317,6 +399,7 @@ def cleanup_export_review_midi_command(
         ticks_per_beat=ticks_per_beat,
         track_name_prefix=track_name_prefix,
         include_delete_candidates=include_delete_candidates,
+        audio_aligned_notes_file=audio_aligned_notes,
     )
 
     try:
@@ -347,6 +430,11 @@ def cleanup_export_review_midi_command(
 def cleanup_export_cleaned_midi_command(
     notes: Path = typer.Option(..., "--notes", help="Path to note_events.json."),
     plan: Path = typer.Option(..., "--plan", help="Path to cleanup_plan.json."),
+    audio_aligned_notes: Path | None = typer.Option(
+        None,
+        "--audio-aligned-notes",
+        help="Optional path to audio_aligned_note_events.json.",
+    ),
     output_dir: Path = typer.Option(..., "--output-dir", help="Directory for exported cleaned MIDI files."),
     report: Path = typer.Option(..., "--report", help="Output path for cleaned export report JSON."),
     ticks_per_beat: int = typer.Option(960, "--ticks-per-beat"),
@@ -365,6 +453,7 @@ def cleanup_export_cleaned_midi_command(
         track_name_prefix=track_name_prefix,
         include_review_in_cleaned=include_review_in_cleaned,
         write_empty_files=write_empty_files,
+        audio_aligned_notes_file=audio_aligned_notes,
     )
 
     try:
@@ -401,6 +490,23 @@ def process_stem_command(
     minimum_onset_score: float = typer.Option(0.01, "--minimum-onset-score"),
     review_threshold: float = typer.Option(0.45, "--review-threshold"),
     keep_threshold: float = typer.Option(0.70, "--keep-threshold"),
+    onset_search_window_ms: float = typer.Option(250.0, "--onset-search-window-ms"),
+    offset_search_window_ms: float = typer.Option(350.0, "--offset-search-window-ms"),
+    alignment_min_onset_score: float = typer.Option(0.005, "--alignment-min-onset-score"),
+    alignment_min_rms: float = typer.Option(0.001, "--alignment-min-rms"),
+    snap_start_to_audio_onset: bool = typer.Option(
+        True,
+        "--snap-start-to-audio-onset/--no-snap-start-to-audio-onset",
+    ),
+    snap_end_to_energy_offset: bool = typer.Option(
+        True,
+        "--snap-end-to-energy-offset/--no-snap-end-to-energy-offset",
+    ),
+    max_start_correction_ms: float = typer.Option(500.0, "--max-start-correction-ms"),
+    max_end_correction_ms: float = typer.Option(800.0, "--max-end-correction-ms"),
+    low_confidence_action: str = typer.Option(
+        "KEEP_ORIGINAL_LOW_CONFIDENCE", "--low-confidence-action"
+    ),
     mute_threshold: float = typer.Option(0.45, "--mute-threshold"),
     cleanup_review_threshold: float = typer.Option(0.70, "--cleanup-review-threshold"),
     delete_threshold: float = typer.Option(0.20, "--delete-threshold"),
@@ -426,6 +532,15 @@ def process_stem_command(
         minimum_onset_score=minimum_onset_score,
         review_threshold=review_threshold,
         keep_threshold=keep_threshold,
+        onset_search_window_ms=onset_search_window_ms,
+        offset_search_window_ms=offset_search_window_ms,
+        alignment_min_onset_score=alignment_min_onset_score,
+        alignment_min_rms=alignment_min_rms,
+        snap_start_to_audio_onset=snap_start_to_audio_onset,
+        snap_end_to_energy_offset=snap_end_to_energy_offset,
+        max_start_correction_ms=max_start_correction_ms,
+        max_end_correction_ms=max_end_correction_ms,
+        low_confidence_action=low_confidence_action,
         mute_threshold=mute_threshold,
         cleanup_review_threshold=cleanup_review_threshold,
         delete_threshold=delete_threshold,
@@ -451,9 +566,21 @@ def process_stem_command(
         raise typer.Exit(code=1) from exc
 
     note_count = 0
+    aligned_count = 0
+    keep_original_timing_count = 0
+    review_timing_count = 0
     cleaned_count = 0
     review_count = 0
     rejected_count = 0
+    alignment_report_path = report.output_files.get("audio_alignment_report")
+    if alignment_report_path:
+        alignment_report = AudioAlignmentReport.model_validate_json(
+            Path(alignment_report_path).read_text(encoding="utf-8")
+        )
+        aligned_count = alignment_report.aligned_count
+        keep_original_timing_count = alignment_report.keep_original_count
+        review_timing_count = alignment_report.review_timing_count
+
     validation_report_path = report.output_files.get("midi_audio_validation_report")
     if validation_report_path:
         validation_report = MidiAudioValidationReport.model_validate_json(
@@ -473,6 +600,9 @@ def process_stem_command(
     typer.echo(
         "process-stem complete: "
         f"notes={note_count}, "
+        f"aligned={aligned_count}, "
+        f"keep_original_timing={keep_original_timing_count}, "
+        f"review_timing={review_timing_count}, "
         f"keep={cleaned_count}, "
         f"review={review_count}, "
         f"rejected={rejected_count}"

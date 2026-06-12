@@ -6,6 +6,7 @@ from pathlib import Path
 import mido
 from typer.testing import CliRunner
 
+from midi_cleaner.alignment.models import AudioAlignedNoteDocument, AudioAlignedNoteEvent
 from midi_cleaner.cleanup.cleaned_exporter import CleanedMidiExportParameters, export_cleaned_midi
 from midi_cleaner.cleanup.models import CleanupAction, CleanupPlanDocument
 from midi_cleaner.cli import app
@@ -108,6 +109,89 @@ def _extract_note_pairs_with_channel(midi_path: Path) -> list[tuple[int, int, in
                 pairs.append((message.note, velocity, message.channel, absolute_tick - start_tick))
 
     return pairs
+
+
+def _extract_note_on_times_sec(midi_path: Path) -> tuple[list[float], int, int]:
+    midi_file = mido.MidiFile(str(midi_path))
+    track = midi_file.tracks[0]
+
+    absolute_tick = 0
+    tempo_us_per_beat = 500000
+    note_on_times: list[float] = []
+
+    for message in track:
+        absolute_tick += message.time
+        if message.type == "set_tempo":
+            tempo_us_per_beat = int(message.tempo)
+        if message.type == "note_on" and message.velocity > 0:
+            note_on_times.append(
+                (absolute_tick / midi_file.ticks_per_beat) * (tempo_us_per_beat / 1_000_000)
+            )
+
+    return note_on_times, tempo_us_per_beat, midi_file.ticks_per_beat
+
+
+def _write_audio_aligned_notes(
+    tmp_path: Path,
+    note_id: str,
+    aligned_start_sec: float,
+    aligned_end_sec: float,
+) -> Path:
+    aligned_doc = AudioAlignedNoteDocument(
+        schema_version="0.1.0",
+        notes_file="note_events.json",
+        audio_features_file="audio_features.json",
+        layer="bass",
+        sample_rate=44100,
+        audio_duration_sec=2.0,
+        alignment_parameters={
+            "onset_search_window_ms": 250.0,
+            "offset_search_window_ms": 350.0,
+            "min_onset_score": 0.005,
+            "min_rms": 0.001,
+            "snap_start_to_audio_onset": True,
+            "snap_end_to_energy_offset": True,
+            "max_start_correction_ms": 500.0,
+            "max_end_correction_ms": 800.0,
+            "low_confidence_action": "KEEP_ORIGINAL_LOW_CONFIDENCE",
+        },
+        notes=[
+            AudioAlignedNoteEvent(
+                note_id=note_id,
+                source="ripx",
+                layer="bass",
+                pitch_midi=72,
+                pitch_name="C5",
+                velocity=88,
+                channel=3,
+                original_start_sec=0.0,
+                original_end_sec=0.0,
+                original_duration_sec=0.0,
+                original_start_tick=1000,
+                original_end_tick=1200,
+                aligned_start_sec=aligned_start_sec,
+                aligned_end_sec=aligned_end_sec,
+                aligned_duration_sec=aligned_end_sec - aligned_start_sec,
+                start_correction_ms=0.0,
+                end_correction_ms=0.0,
+                duration_correction_ms=0.0,
+                nearest_audio_onset_sec=aligned_start_sec,
+                nearest_audio_offset_sec=aligned_end_sec,
+                onset_error_before_ms=0.0,
+                onset_error_after_ms=0.0,
+                local_rms=0.01,
+                local_onset_score=0.02,
+                sustained_energy_ratio=0.8,
+                alignment_confidence=0.9,
+                alignment_action="ALIGNED",
+                reasons=["test"],
+            )
+        ],
+    )
+
+    aligned_path = tmp_path / "audio_aligned_note_events.json"
+    aligned_path.write_text(aligned_doc.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    return aligned_path
 
 
 def test_cleaned_contains_only_keep_by_default(tmp_path: Path) -> None:
@@ -252,3 +336,36 @@ def test_cli_writes_cleaned_review_rejected_and_report(tmp_path: Path) -> None:
     assert report["cleaned_note_count"] == 1
     assert report["review_note_count"] == 1
     assert report["rejected_note_count"] == 2
+
+
+def test_audio_aligned_seconds_drive_export_timing_with_strict_tolerance(tmp_path: Path) -> None:
+    note = _note("k", 72, 88, 1000, 1200, channel=3)
+    notes_path, plan_path = _write_inputs(tmp_path, [note], [_action("k", "KEEP")])
+    aligned_path = _write_audio_aligned_notes(
+        tmp_path,
+        note_id="k",
+        aligned_start_sec=0.123,
+        aligned_end_sec=0.287,
+    )
+
+    report = export_cleaned_midi(
+        notes_file=notes_path,
+        cleanup_plan_file=plan_path,
+        output_dir=tmp_path / "out",
+        params=CleanedMidiExportParameters(
+            ticks_per_beat=960,
+            audio_aligned_notes_file=aligned_path,
+        ),
+    )
+
+    note_on_times_sec, tempo_us_per_beat, exported_tpb = _extract_note_on_times_sec(
+        tmp_path / "out" / "cleaned.mid"
+    )
+
+    assert note_on_times_sec
+    assert abs(note_on_times_sec[0] - 0.123) <= 0.002
+    assert report.timing_source == "audio_aligned_seconds"
+    assert report.max_export_time_error_ms <= 2.0
+    assert report.mean_export_time_error_ms <= 2.0
+    assert tempo_us_per_beat == report.tempo_us_per_beat
+    assert exported_tpb == report.exported_ticks_per_beat

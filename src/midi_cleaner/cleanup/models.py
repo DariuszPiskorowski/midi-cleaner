@@ -46,9 +46,17 @@ class ReviewMidiExportFile(BaseModel):
 class ReviewMidiExportReport(BaseModel):
     notes_file: str
     cleanup_plan_file: str
+    audio_aligned_notes_file: str | None
     status: Literal["ok", "error"]
     layer: str
     ticks_per_beat: int
+    timing_source: Literal["audio_aligned_seconds", "original_midi_ticks"]
+    max_export_time_error_ms: float
+    mean_export_time_error_ms: float
+    source_ticks_per_beat: int
+    exported_ticks_per_beat: int
+    tempo_us_per_beat: int
+    bpm: float
     exported_files: list[ReviewMidiExportFile]
     warning_count: int
     warnings: list[str]
@@ -64,9 +72,17 @@ class CleanedMidiExportFile(BaseModel):
 class CleanedMidiExportReport(BaseModel):
     notes_file: str
     cleanup_plan_file: str
+    audio_aligned_notes_file: str | None
     status: Literal["ok", "error"]
     layer: str
     ticks_per_beat: int
+    timing_source: Literal["audio_aligned_seconds", "original_midi_ticks"]
+    max_export_time_error_ms: float
+    mean_export_time_error_ms: float
+    source_ticks_per_beat: int
+    exported_ticks_per_beat: int
+    tempo_us_per_beat: int
+    bpm: float
     cleaned_note_count: int
     review_note_count: int
     rejected_note_count: int

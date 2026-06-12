@@ -40,6 +40,8 @@ def _expected_paths(project_dir: Path) -> list[Path]:
         project_dir / "analysis" / "midi_import_report.json",
         project_dir / "analysis" / "audio_features.json",
         project_dir / "analysis" / "audio_analysis_report.json",
+        project_dir / "analysis" / "audio_aligned_note_events.json",
+        project_dir / "analysis" / "audio_alignment_report.json",
         project_dir / "analysis" / "note_validation.json",
         project_dir / "analysis" / "midi_audio_validation_report.json",
         project_dir / "cleanup" / "cleanup_plan.json",
@@ -130,5 +132,6 @@ def test_cli_process_stem_end_to_end(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert (project_dir / "reports" / "pipeline_report.json").exists()
+    assert (project_dir / "analysis" / "audio_aligned_note_events.json").exists()
     assert (project_dir / "midi" / "review" / "export_report.json").exists()
     assert (project_dir / "midi" / "cleaned" / "cleaned_export_report.json").exists()

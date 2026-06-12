@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from html import escape
 from pathlib import Path
 
+from midi_cleaner.alignment.models import (
+    AudioAlignedNoteDocument,
+    AudioAlignedNoteEvent,
+    AudioAlignmentReport,
+)
 from midi_cleaner.cleanup.models import CleanupPlanDocument
 from midi_cleaner.pipeline.models import PipelineReport, QANoteRow, QASummary
 from midi_cleaner.validation.models import NoteValidationDocument
@@ -34,6 +39,14 @@ def _load_cleanup_plan(path: Path) -> CleanupPlanDocument:
     return CleanupPlanDocument.model_validate_json(path.read_text(encoding="utf-8"))
 
 
+def _load_audio_aligned_document(path: Path) -> AudioAlignedNoteDocument:
+    return AudioAlignedNoteDocument.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _load_audio_alignment_report(path: Path) -> AudioAlignmentReport:
+    return AudioAlignmentReport.model_validate_json(path.read_text(encoding="utf-8"))
+
+
 def _load_pipeline_report(path: Path) -> PipelineReport:
     return PipelineReport.model_validate_json(path.read_text(encoding="utf-8"))
 
@@ -41,6 +54,7 @@ def _load_pipeline_report(path: Path) -> PipelineReport:
 def _build_rows(
     note_validation: NoteValidationDocument | None,
     cleanup_plan: CleanupPlanDocument | None,
+    aligned_notes: AudioAlignedNoteDocument | None,
     warnings: list[str],
 ) -> list[QANoteRow]:
     if note_validation is None:
@@ -52,16 +66,42 @@ def _build_rows(
             item.note_id: item.plan_action for item in cleanup_plan.actions
         }
 
+    aligned_by_note_id: dict[str, AudioAlignedNoteEvent] = {}
+    if aligned_notes is not None:
+        aligned_by_note_id = {item.note_id: item for item in aligned_notes.notes}
+
     validation_note_ids = {item.note_id for item in note_validation.validations}
     for note_id in plan_action_by_note_id:
         if note_id not in validation_note_ids:
             warnings.append(f"cleanup plan contains unknown note_id: {note_id}")
 
+    for note_id in aligned_by_note_id:
+        if note_id not in validation_note_ids:
+            warnings.append(f"audio alignment contains unknown note_id: {note_id}")
+
     rows: list[QANoteRow] = []
+    missing_alignment_count = 0
     for item in note_validation.validations:
         plan_action = plan_action_by_note_id.get(item.note_id)
         if cleanup_plan is not None and plan_action is None:
             warnings.append(f"validation note has no cleanup plan action: {item.note_id}")
+
+        aligned = aligned_by_note_id.get(item.note_id)
+        if aligned_notes is not None and aligned is None:
+            missing_alignment_count += 1
+
+        original_start_sec = float(item.start_sec)
+        aligned_start_sec = float(item.start_sec)
+        start_correction_ms = 0.0
+        alignment_action: str | None = None
+        alignment_confidence: float | None = None
+
+        if aligned is not None:
+            original_start_sec = float(aligned.original_start_sec)
+            aligned_start_sec = float(aligned.aligned_start_sec)
+            start_correction_ms = float(aligned.start_correction_ms)
+            alignment_action = aligned.alignment_action
+            alignment_confidence = float(aligned.alignment_confidence)
 
         rows.append(
             QANoteRow(
@@ -71,6 +111,11 @@ def _build_rows(
                 start_sec=item.start_sec,
                 end_sec=item.end_sec,
                 duration_sec=item.duration_sec,
+                original_start_sec=original_start_sec,
+                aligned_start_sec=aligned_start_sec,
+                start_correction_ms=start_correction_ms,
+                alignment_action=alignment_action,
+                alignment_confidence=alignment_confidence,
                 confidence=item.confidence,
                 validation_action=item.recommended_action,
                 plan_action=plan_action,
@@ -79,6 +124,11 @@ def _build_rows(
                 sustained_energy_ratio=item.sustained_energy_ratio,
                 reasons="; ".join(item.reasons),
             )
+        )
+
+    if missing_alignment_count > 0:
+        warnings.append(
+            f"audio alignment missing for {missing_alignment_count} validation notes"
         )
 
     return rows
@@ -96,6 +146,11 @@ def _write_csv(path: Path, rows: list[QANoteRow]) -> None:
                 "start_sec",
                 "end_sec",
                 "duration_sec",
+                "original_start_sec",
+                "aligned_start_sec",
+                "start_correction_ms",
+                "alignment_action",
+                "alignment_confidence",
                 "confidence",
                 "validation_action",
                 "plan_action",
@@ -116,6 +171,11 @@ def _rows_table_html(title: str, rows: list[QANoteRow]) -> str:
 
     html_rows = []
     for row in rows:
+        alignment_confidence_cell = (
+            f"<td>{row.alignment_confidence:.4f}</td>"
+            if row.alignment_confidence is not None
+            else "<td></td>"
+        )
         html_rows.append(
             "<tr>"
             f"<td>{escape(row.note_id)}</td>"
@@ -124,6 +184,9 @@ def _rows_table_html(title: str, rows: list[QANoteRow]) -> str:
             f"<td>{row.confidence:.4f}</td>"
             f"<td>{escape(row.validation_action)}</td>"
             f"<td>{escape(str(row.plan_action))}</td>"
+            f"<td>{escape(str(row.alignment_action))}</td>"
+            f"<td>{row.start_correction_ms:.2f}</td>"
+            f"{alignment_confidence_cell}"
             f"<td>{row.onset_score:.6f}</td>"
             f"<td>{row.mean_rms_during_note:.6f}</td>"
             f"<td>{row.sustained_energy_ratio:.4f}</td>"
@@ -136,7 +199,8 @@ def _rows_table_html(title: str, rows: list[QANoteRow]) -> str:
         "<table border='1' cellpadding='6' cellspacing='0'>"
         "<thead><tr>"
         "<th>note_id</th><th>pitch_midi</th><th>pitch_name</th><th>confidence</th>"
-        "<th>validation_action</th><th>plan_action</th><th>onset_score</th>"
+        "<th>validation_action</th><th>plan_action</th><th>alignment_action</th>"
+        "<th>start_correction_ms</th><th>alignment_confidence</th><th>onset_score</th>"
         "<th>mean_rms</th><th>sustained_ratio</th><th>reasons</th>"
         "</tr></thead><tbody>"
         + "".join(html_rows)
@@ -191,6 +255,13 @@ def _write_html(
       <tr><th>delete_candidate_count</th><td>{summary.delete_candidate_count}</td></tr>
       <tr><th>cleaned_note_count</th><td>{summary.cleaned_note_count}</td></tr>
       <tr><th>rejected_note_count</th><td>{summary.rejected_note_count}</td></tr>
+    <tr><th>aligned_count</th><td>{summary.aligned_count}</td></tr>
+    <tr><th>keep_original_count</th><td>{summary.keep_original_count}</td></tr>
+    <tr><th>review_timing_count</th><td>{summary.review_timing_count}</td></tr>
+    <tr><th>no_audio_evidence_count</th><td>{summary.no_audio_evidence_count}</td></tr>
+    <tr><th>median_abs_start_correction_ms</th><td>{summary.median_abs_start_correction_ms}</td></tr>
+    <tr><th>p95_abs_start_correction_ms</th><td>{summary.p95_abs_start_correction_ms}</td></tr>
+    <tr><th>max_abs_start_correction_ms</th><td>{summary.max_abs_start_correction_ms}</td></tr>
       <tr><th>mean_confidence</th><td>{summary.mean_confidence}</td></tr>
       <tr><th>min_confidence</th><td>{summary.min_confidence}</td></tr>
       <tr><th>max_confidence</th><td>{summary.max_confidence}</td></tr>
@@ -206,6 +277,12 @@ def _write_html(
 
   <h2>Counts by Action</h2>
   <p>Validation and cleanup action counts are summarized in the table above and in <code>qa_summary.json</code>.</p>
+
+    <h2>Audio Alignment</h2>
+    <p>
+        Alignment metrics are computed from <code>audio_alignment_report.json</code> and include
+        aligned, keep-original, review-timing, and correction distribution statistics.
+    </p>
 
   {_rows_table_html(f"Top {top_n} Lowest-Confidence Notes", lowest_confidence)}
   {_rows_table_html(f"Top {top_n} Weak-Onset Notes", weakest_onset)}
@@ -232,6 +309,8 @@ def generate_qa_report(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     note_validation_path = project_dir / "analysis" / "note_validation.json"
+    audio_aligned_notes_path = project_dir / "analysis" / "audio_aligned_note_events.json"
+    audio_alignment_report_path = project_dir / "analysis" / "audio_alignment_report.json"
     cleanup_plan_path = project_dir / "cleanup" / "cleanup_plan.json"
     cleaned_export_report_path = project_dir / "midi" / "cleaned" / "cleaned_export_report.json"
     review_export_report_path = project_dir / "midi" / "review" / "export_report.json"
@@ -250,6 +329,18 @@ def generate_qa_report(
         cleanup_plan = _load_cleanup_plan(cleanup_plan_path)
     else:
         warnings.append(f"Missing cleanup plan report: {cleanup_plan_path}")
+
+    aligned_notes: AudioAlignedNoteDocument | None = None
+    if audio_aligned_notes_path.exists():
+        aligned_notes = _load_audio_aligned_document(audio_aligned_notes_path)
+    else:
+        warnings.append(f"Missing audio aligned notes: {audio_aligned_notes_path}")
+
+    alignment_report: AudioAlignmentReport | None = None
+    if audio_alignment_report_path.exists():
+        alignment_report = _load_audio_alignment_report(audio_alignment_report_path)
+    else:
+        warnings.append(f"Missing audio alignment report: {audio_alignment_report_path}")
 
     if note_validation is None and cleanup_plan is None:
         raise QAReportError("Missing both required inputs: analysis/note_validation.json and cleanup/cleanup_plan.json")
@@ -272,7 +363,12 @@ def generate_qa_report(
         pipeline_report = _load_pipeline_report(pipeline_report_path)
         warnings.extend([f"pipeline: {item}" for item in pipeline_report.warnings])
 
-    rows = _build_rows(note_validation=note_validation, cleanup_plan=cleanup_plan, warnings=warnings)
+    rows = _build_rows(
+        note_validation=note_validation,
+        cleanup_plan=cleanup_plan,
+        aligned_notes=aligned_notes,
+        warnings=warnings,
+    )
 
     keep_count = 0
     review_count = 0
@@ -285,6 +381,47 @@ def generate_qa_report(
         delete_candidate_count = sum(
             1 for item in cleanup_plan.actions if item.plan_action == "DELETE_CANDIDATE"
         )
+
+    aligned_count = 0
+    keep_original_count = 0
+    review_timing_count = 0
+    no_audio_evidence_count = 0
+    median_abs_start_correction_ms: float | None = None
+    p95_abs_start_correction_ms: float | None = None
+    max_abs_start_correction_ms: float | None = None
+
+    if alignment_report is not None:
+        aligned_count = alignment_report.aligned_count
+        keep_original_count = alignment_report.keep_original_count
+        review_timing_count = alignment_report.review_timing_count
+        no_audio_evidence_count = alignment_report.no_audio_evidence_count
+        median_abs_start_correction_ms = alignment_report.median_abs_start_correction_ms
+        p95_abs_start_correction_ms = alignment_report.p95_abs_start_correction_ms
+        max_abs_start_correction_ms = alignment_report.max_abs_start_correction_ms
+    elif aligned_notes is not None:
+        aligned_count = sum(1 for item in aligned_notes.notes if item.alignment_action == "ALIGNED")
+        keep_original_count = sum(
+            1
+            for item in aligned_notes.notes
+            if item.alignment_action == "KEEP_ORIGINAL_LOW_CONFIDENCE"
+        )
+        review_timing_count = sum(
+            1 for item in aligned_notes.notes if item.alignment_action == "REVIEW_TIMING"
+        )
+        no_audio_evidence_count = sum(
+            1 for item in aligned_notes.notes if item.alignment_action == "NO_AUDIO_EVIDENCE"
+        )
+        abs_start_corrections = [
+            abs(item.start_correction_ms)
+            for item in aligned_notes.notes
+            if item.alignment_action == "ALIGNED"
+        ]
+        if abs_start_corrections:
+            sorted_corrections = sorted(abs_start_corrections)
+            median_abs_start_correction_ms = sorted_corrections[len(sorted_corrections) // 2]
+            p95_index = int((len(sorted_corrections) - 1) * 0.95)
+            p95_abs_start_correction_ms = sorted_corrections[p95_index]
+            max_abs_start_correction_ms = sorted_corrections[-1]
 
     confidences = [row.confidence for row in rows]
     mean_confidence = sum(confidences) / len(confidences) if confidences else None
@@ -326,6 +463,13 @@ def generate_qa_report(
         delete_candidate_count=delete_candidate_count,
         cleaned_note_count=cleaned_note_count,
         rejected_note_count=rejected_note_count,
+        aligned_count=aligned_count,
+        keep_original_count=keep_original_count,
+        review_timing_count=review_timing_count,
+        no_audio_evidence_count=no_audio_evidence_count,
+        median_abs_start_correction_ms=median_abs_start_correction_ms,
+        p95_abs_start_correction_ms=p95_abs_start_correction_ms,
+        max_abs_start_correction_ms=max_abs_start_correction_ms,
         mean_confidence=mean_confidence,
         min_confidence=min_confidence,
         max_confidence=max_confidence,

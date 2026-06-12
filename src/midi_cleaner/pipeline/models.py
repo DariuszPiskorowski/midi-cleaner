@@ -33,6 +33,11 @@ class QANoteRow(BaseModel):
     start_sec: float
     end_sec: float
     duration_sec: float
+    original_start_sec: float | None
+    aligned_start_sec: float | None
+    start_correction_ms: float | None
+    alignment_action: str | None
+    alignment_confidence: float | None
     confidence: float
     validation_action: str
     plan_action: str | None
@@ -53,6 +58,13 @@ class QASummary(BaseModel):
     delete_candidate_count: int
     cleaned_note_count: int
     rejected_note_count: int
+    aligned_count: int
+    keep_original_count: int
+    review_timing_count: int
+    no_audio_evidence_count: int
+    median_abs_start_correction_ms: float | None
+    p95_abs_start_correction_ms: float | None
+    max_abs_start_correction_ms: float | None
     mean_confidence: float | None
     min_confidence: float | None
     max_confidence: float | None
