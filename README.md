@@ -2,11 +2,11 @@
 
 Hermes MIDI Fidelity Engine project scaffold.
 
-This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 4**: environment guard, MIDI candidate import, lightweight WAV stem analysis, and first deterministic MIDI-vs-audio validation pass.
+This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 5**: environment guard, import/analysis/validation, and non-destructive cleanup plan generation.
 
 ## Current Milestone
 
-Milestone 4 implements:
+Milestone 5 implements:
 - Python package scaffold
 - Strict Python 3.11 guard
 - Runtime/environment report via CLI doctor command
@@ -15,9 +15,10 @@ Milestone 4 implements:
 - WAV stem feature extraction using `numpy`, `scipy`, and `soundfile`
 - Audio feature JSON export and audio analysis report JSON
 - MIDI-vs-audio heuristic validation into note validation JSON and report JSON
-- Tests for guard behavior, MIDI import, audio analysis, and validation behavior
+- Non-destructive cleanup plan generation from note validation JSON
+- Tests for guard behavior, MIDI import, audio analysis, validation, and cleanup planning
 
-MIDI cleaning, MIDI rewriting/export, rendering, UI, and ML are not implemented yet.
+MIDI rewriting/export, destructive note deletion, rendering, UI, and ML are not implemented yet.
 
 ## Requirements
 
@@ -98,6 +99,18 @@ Example:
 
 ```powershell
 uv run midi-cleaner validate midi-vs-audio --notes .\artifacts\note_events.json --audio-features .\artifacts\audio_features.json --output .\artifacts\note_validation.json --report .\artifacts\midi_audio_validation_report.json
+```
+
+## Cleanup Plan (Non-Destructive)
+
+```powershell
+uv run midi-cleaner cleanup plan --validation NOTE_VALIDATION_JSON --output OUTPUT_JSON --report REPORT_JSON
+```
+
+Example:
+
+```powershell
+uv run midi-cleaner cleanup plan --validation .\artifacts\note_validation.json --output .\artifacts\cleanup_plan.json --report .\artifacts\cleanup_plan_report.json
 ```
 
 ## Planned Pipeline

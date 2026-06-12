@@ -30,6 +30,13 @@
 - Export note validation JSON and validation report JSON.
 - Keep cleaning, rewriting, and pitch/harmonic validation out of this milestone.
 
+## Milestone 5 - Non-Destructive MIDI Cleanup Plan
+- Add CLI command `midi-cleaner cleanup plan`.
+- Convert note validation results into a machine-readable cleanup plan.
+- Keep plan non-destructive: no MIDI rewriting, no note deletion.
+- Allow optional `DELETE_CANDIDATE` planning only as metadata.
+- Export cleanup plan JSON and cleanup plan report JSON.
+
 ## Future Milestones (Planned)
 - Classify actions: KEEP, MUTE, MERGE, SHORTEN, QUANTIZE, REASSIGN, DELETE.
 - Export cleaned MIDI and machine-readable QA reports.

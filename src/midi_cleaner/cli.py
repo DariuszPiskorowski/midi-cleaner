@@ -8,6 +8,11 @@ from rich.table import Table
 
 from midi_cleaner import __version__
 from midi_cleaner.audio.analyzer import AudioAnalysisError, analyze_stem
+from midi_cleaner.cleanup.planner import (
+    CleanupPlanError,
+    CleanupPlannerParameters,
+    build_cleanup_plan,
+)
 from midi_cleaner.midi.importer import MidiImportError, import_midi_candidate
 from midi_cleaner.runtime.report import RuntimeReport, build_runtime_report
 from midi_cleaner.validation.midi_audio import (
@@ -20,11 +25,13 @@ app = typer.Typer(add_completion=False, help="Hermes MIDI Fidelity Engine CLI")
 midi_app = typer.Typer(help="MIDI candidate import tools.")
 audio_app = typer.Typer(help="Audio stem analysis tools.")
 validate_app = typer.Typer(help="MIDI-vs-audio validation tools.")
+cleanup_app = typer.Typer(help="Non-destructive MIDI cleanup planning tools.")
 console = Console()
 
 app.add_typer(midi_app, name="midi")
 app.add_typer(audio_app, name="audio")
 app.add_typer(validate_app, name="validate")
+app.add_typer(cleanup_app, name="cleanup")
 
 
 def version_callback(value: bool) -> None:
@@ -223,6 +230,49 @@ def validate_midi_vs_audio_command(
         f"review={validation_report.review_count}, "
         f"mute_candidates={validation_report.mute_candidate_count}, "
         f"warnings={validation_report.warning_count}"
+    )
+
+
+@cleanup_app.command("plan")
+def cleanup_plan_command(
+    validation: Path = typer.Option(..., "--validation", help="Path to note_validation.json."),
+    output: Path = typer.Option(..., "--output", help="Output path for cleanup plan JSON."),
+    report: Path = typer.Option(..., "--report", help="Output path for cleanup plan report JSON."),
+    mute_threshold: float = typer.Option(0.45, "--mute-threshold"),
+    review_threshold: float = typer.Option(0.70, "--review-threshold"),
+    delete_threshold: float = typer.Option(0.20, "--delete-threshold"),
+    allow_delete_candidates: bool = typer.Option(
+        False,
+        "--allow-delete-candidates/--no-allow-delete-candidates",
+    ),
+) -> None:
+    params = CleanupPlannerParameters(
+        mute_threshold=mute_threshold,
+        review_threshold=review_threshold,
+        delete_threshold=delete_threshold,
+        allow_delete_candidates=allow_delete_candidates,
+    )
+
+    try:
+        plan_document, plan_report = build_cleanup_plan(validation_file=validation, params=params)
+    except CleanupPlanError as exc:
+        typer.echo(f"Cleanup planning failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    report.parent.mkdir(parents=True, exist_ok=True)
+
+    output.write_text(plan_document.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    plan_report.output_file = str(output)
+    report.write_text(plan_report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    typer.echo(
+        "planned actions: "
+        f"keep={plan_report.keep_count}, "
+        f"review={plan_report.review_count}, "
+        f"mute={plan_report.mute_count}, "
+        f"delete_candidates={plan_report.delete_candidate_count}"
     )
 
 
