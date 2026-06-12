@@ -8,6 +8,11 @@ from rich.table import Table
 
 from midi_cleaner import __version__
 from midi_cleaner.audio.analyzer import AudioAnalysisError, analyze_stem
+from midi_cleaner.cleanup.cleaned_exporter import (
+    CleanedMidiExportError,
+    CleanedMidiExportParameters,
+    export_cleaned_midi,
+)
 from midi_cleaner.cleanup.midi_exporter import (
     ReviewMidiExportError,
     ReviewMidiExportParameters,
@@ -321,6 +326,52 @@ def cleanup_export_review_midi_command(
         f"review={counts.get('REVIEW', 0)}, "
         f"muted={counts.get('MUTE', 0)}, "
         f"delete_candidates={counts.get('DELETE_CANDIDATE', 0)}"
+    )
+
+
+@cleanup_app.command("export-cleaned-midi")
+def cleanup_export_cleaned_midi_command(
+    notes: Path = typer.Option(..., "--notes", help="Path to note_events.json."),
+    plan: Path = typer.Option(..., "--plan", help="Path to cleanup_plan.json."),
+    output_dir: Path = typer.Option(..., "--output-dir", help="Directory for exported cleaned MIDI files."),
+    report: Path = typer.Option(..., "--report", help="Output path for cleaned export report JSON."),
+    ticks_per_beat: int = typer.Option(960, "--ticks-per-beat"),
+    track_name_prefix: str = typer.Option("Hermes", "--track-name-prefix"),
+    include_review_in_cleaned: bool = typer.Option(
+        False,
+        "--include-review-in-cleaned/--no-include-review-in-cleaned",
+    ),
+    write_empty_files: bool = typer.Option(
+        True,
+        "--write-empty-files/--no-write-empty-files",
+    ),
+) -> None:
+    params = CleanedMidiExportParameters(
+        ticks_per_beat=ticks_per_beat,
+        track_name_prefix=track_name_prefix,
+        include_review_in_cleaned=include_review_in_cleaned,
+        write_empty_files=write_empty_files,
+    )
+
+    try:
+        export_report = export_cleaned_midi(
+            notes_file=notes,
+            cleanup_plan_file=plan,
+            output_dir=output_dir,
+            params=params,
+        )
+    except CleanedMidiExportError as exc:
+        typer.echo(f"Cleaned MIDI export failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(export_report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    typer.echo(
+        "exported cleaned MIDI: "
+        f"cleaned={export_report.cleaned_note_count}, "
+        f"review={export_report.review_note_count}, "
+        f"rejected={export_report.rejected_note_count}"
     )
 
 

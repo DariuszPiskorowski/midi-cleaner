@@ -52,3 +52,24 @@ class ReviewMidiExportReport(BaseModel):
     exported_files: list[ReviewMidiExportFile]
     warning_count: int
     warnings: list[str]
+
+
+class CleanedMidiExportFile(BaseModel):
+    role: str
+    path: str
+    note_count: int
+    included_plan_actions: list[str]
+
+
+class CleanedMidiExportReport(BaseModel):
+    notes_file: str
+    cleanup_plan_file: str
+    status: Literal["ok", "error"]
+    layer: str
+    ticks_per_beat: int
+    cleaned_note_count: int
+    review_note_count: int
+    rejected_note_count: int
+    exported_files: list[CleanedMidiExportFile]
+    warning_count: int
+    warnings: list[str]

@@ -44,6 +44,13 @@
 - Keep export non-destructive: no final cleaned MIDI and no note deletion.
 - Export machine-readable MIDI export report JSON.
 
+## Milestone 7 - Conservative Cleaned MIDI Export
+- Add CLI command `midi-cleaner cleanup export-cleaned-midi`.
+- Export grouped files: `cleaned.mid`, `review.mid`, `rejected.mid`.
+- Keep default conservative behavior: only KEEP goes to cleaned by default.
+- Keep export non-destructive and deterministic.
+- Export machine-readable cleaned export report JSON.
+
 ## Future Milestones (Planned)
 - Classify actions: KEEP, MUTE, MERGE, SHORTEN, QUANTIZE, REASSIGN, DELETE.
 - Export cleaned MIDI and machine-readable QA reports.

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Rules for AI coding agents in `midi-cleaner` during Milestone 6:
+Rules for AI coding agents in `midi-cleaner` during Milestone 7:
 
 - Keep the Python environment guard strict for Python 3.11.x.
 - Run all commands through `uv run` when executing project tools.
@@ -9,8 +9,8 @@ Rules for AI coding agents in `midi-cleaner` during Milestone 6:
 - Milestone 4 validates MIDI events against audio features.
 - Milestone 5 creates a non-destructive cleanup plan.
 - Milestone 6 exports non-destructive review MIDI files.
-- Do not implement final cleaned MIDI yet.
-- Do not delete notes.
+- Milestone 7 exports conservative cleaned/review/rejected MIDI files.
+- Do not implement destructive deletion.
 - Do not add dependencies.
-- Do not implement UI or DAW integration.
+- Do not implement UI, DAW integration, rendering, pitch validation, or ML.
 - Update and maintain tests with every behavior change.

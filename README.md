@@ -2,11 +2,11 @@
 
 Hermes MIDI Fidelity Engine project scaffold.
 
-This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 6**: environment guard, import/analysis/validation, cleanup planning, and review MIDI export.
+This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 7**: environment guard, import/analysis/validation, cleanup planning, review MIDI export, and conservative cleaned MIDI export.
 
 ## Current Milestone
 
-Milestone 6 implements:
+Milestone 7 implements:
 - Python package scaffold
 - Strict Python 3.11 guard
 - Runtime/environment report via CLI doctor command
@@ -17,9 +17,10 @@ Milestone 6 implements:
 - MIDI-vs-audio heuristic validation into note validation JSON and report JSON
 - Non-destructive cleanup plan generation from note validation JSON
 - Non-destructive review MIDI export grouped by cleanup action
-- Tests for guard behavior, MIDI import, audio analysis, validation, cleanup planning, and review MIDI export
+- Conservative cleaned/review/rejected MIDI export from cleanup plan
+- Tests for guard behavior, MIDI import, audio analysis, validation, cleanup planning, review MIDI export, and cleaned MIDI export
 
-Final cleaned MIDI rewriting/export, destructive note deletion, rendering, UI, and ML are not implemented yet.
+Destructive note deletion, rendering, UI, and ML are not implemented yet.
 
 ## Requirements
 
@@ -124,6 +125,18 @@ Example:
 
 ```powershell
 uv run midi-cleaner cleanup export-review-midi --notes .\artifacts\note_events.json --plan .\artifacts\cleanup_plan.json --output-dir .\artifacts\review_midi --report .\artifacts\review_midi\export_report.json
+```
+
+## Conservative Cleaned MIDI Export
+
+```powershell
+uv run midi-cleaner cleanup export-cleaned-midi --notes NOTE_EVENTS_JSON --plan CLEANUP_PLAN_JSON --output-dir OUTPUT_DIR --report REPORT_JSON
+```
+
+Example:
+
+```powershell
+uv run midi-cleaner cleanup export-cleaned-midi --notes .\artifacts\note_events.json --plan .\artifacts\cleanup_plan.json --output-dir .\artifacts\cleaned_midi --report .\artifacts\cleaned_midi\cleaned_export_report.json
 ```
 
 ## Planned Pipeline
