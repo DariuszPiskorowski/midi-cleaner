@@ -2,11 +2,11 @@
 
 Hermes MIDI Fidelity Engine project scaffold.
 
-This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 7**: environment guard, import/analysis/validation, cleanup planning, review MIDI export, and conservative cleaned MIDI export.
+This repository will eventually clean and validate MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 8**: end-to-end orchestration for one MIDI candidate and one WAV stem.
 
 ## Current Milestone
 
-Milestone 7 implements:
+Milestone 8 implements:
 - Python package scaffold
 - Strict Python 3.11 guard
 - Runtime/environment report via CLI doctor command
@@ -18,7 +18,8 @@ Milestone 7 implements:
 - Non-destructive cleanup plan generation from note validation JSON
 - Non-destructive review MIDI export grouped by cleanup action
 - Conservative cleaned/review/rejected MIDI export from cleanup plan
-- Tests for guard behavior, MIDI import, audio analysis, validation, cleanup planning, review MIDI export, and cleaned MIDI export
+- One-command process-stem pipeline that orchestrates existing stages
+- Tests for guard behavior, MIDI import, audio analysis, validation, cleanup planning, review MIDI export, cleaned MIDI export, and process-stem pipeline
 
 Destructive note deletion, rendering, UI, and ML are not implemented yet.
 
@@ -137,6 +138,18 @@ Example:
 
 ```powershell
 uv run midi-cleaner cleanup export-cleaned-midi --notes .\artifacts\note_events.json --plan .\artifacts\cleanup_plan.json --output-dir .\artifacts\cleaned_midi --report .\artifacts\cleaned_midi\cleaned_export_report.json
+```
+
+## End-to-End Process Stem Pipeline
+
+```powershell
+uv run midi-cleaner pipeline process-stem --midi INPUT_MIDI --wav INPUT_WAV --source ripx --layer bass --project-dir PROJECT_DIR
+```
+
+Example:
+
+```powershell
+uv run midi-cleaner pipeline process-stem --midi .\candidate.mid --wav .\stem.wav --source ripx --layer bass --project-dir .\artifacts\pipeline_run
 ```
 
 ## Planned Pipeline

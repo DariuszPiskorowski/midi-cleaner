@@ -51,6 +51,13 @@
 - Keep export non-destructive and deterministic.
 - Export machine-readable cleaned export report JSON.
 
+## Milestone 8 - One-Command Process Stem Pipeline
+- Add CLI command `midi-cleaner pipeline process-stem`.
+- Orchestrate import, analysis, validation, planning, and exports end-to-end.
+- Produce a structured project directory with stage outputs.
+- Aggregate stage warnings and statuses into `pipeline_report.json`.
+- Keep orchestration non-destructive and call internal functions directly.
+
 ## Future Milestones (Planned)
 - Classify actions: KEEP, MUTE, MERGE, SHORTEN, QUANTIZE, REASSIGN, DELETE.
 - Export cleaned MIDI and machine-readable QA reports.

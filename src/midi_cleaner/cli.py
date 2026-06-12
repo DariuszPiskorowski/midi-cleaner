@@ -13,6 +13,7 @@ from midi_cleaner.cleanup.cleaned_exporter import (
     CleanedMidiExportParameters,
     export_cleaned_midi,
 )
+from midi_cleaner.cleanup.models import CleanedMidiExportReport
 from midi_cleaner.cleanup.midi_exporter import (
     ReviewMidiExportError,
     ReviewMidiExportParameters,
@@ -24,7 +25,13 @@ from midi_cleaner.cleanup.planner import (
     build_cleanup_plan,
 )
 from midi_cleaner.midi.importer import MidiImportError, import_midi_candidate
+from midi_cleaner.pipeline.process_stem import (
+    PipelineProcessError,
+    PipelineProcessParameters,
+    process_stem_pipeline,
+)
 from midi_cleaner.runtime.report import RuntimeReport, build_runtime_report
+from midi_cleaner.validation.models import MidiAudioValidationReport
 from midi_cleaner.validation.midi_audio import (
     MidiAudioValidationError,
     ValidationParameters,
@@ -36,12 +43,14 @@ midi_app = typer.Typer(help="MIDI candidate import tools.")
 audio_app = typer.Typer(help="Audio stem analysis tools.")
 validate_app = typer.Typer(help="MIDI-vs-audio validation tools.")
 cleanup_app = typer.Typer(help="Non-destructive MIDI cleanup planning tools.")
+pipeline_app = typer.Typer(help="End-to-end pipeline tools.")
 console = Console()
 
 app.add_typer(midi_app, name="midi")
 app.add_typer(audio_app, name="audio")
 app.add_typer(validate_app, name="validate")
 app.add_typer(cleanup_app, name="cleanup")
+app.add_typer(pipeline_app, name="pipeline")
 
 
 def version_callback(value: bool) -> None:
@@ -372,6 +381,96 @@ def cleanup_export_cleaned_midi_command(
         f"cleaned={export_report.cleaned_note_count}, "
         f"review={export_report.review_note_count}, "
         f"rejected={export_report.rejected_note_count}"
+    )
+
+
+@pipeline_app.command("process-stem")
+def process_stem_command(
+    midi: Path = typer.Option(..., "--midi", help="Path to candidate MIDI file."),
+    wav: Path = typer.Option(..., "--wav", help="Path to stem WAV file."),
+    source: str = typer.Option(..., "--source", help="Source label, e.g. ripx."),
+    layer: str = typer.Option(..., "--layer", help="Layer label, e.g. bass."),
+    project_dir: Path = typer.Option(..., "--project-dir", help="Pipeline project output directory."),
+    onset_window_ms: float = typer.Option(50.0, "--onset-window-ms"),
+    minimum_rms: float = typer.Option(0.001, "--minimum-rms"),
+    minimum_onset_score: float = typer.Option(0.01, "--minimum-onset-score"),
+    review_threshold: float = typer.Option(0.45, "--review-threshold"),
+    keep_threshold: float = typer.Option(0.70, "--keep-threshold"),
+    mute_threshold: float = typer.Option(0.45, "--mute-threshold"),
+    cleanup_review_threshold: float = typer.Option(0.70, "--cleanup-review-threshold"),
+    delete_threshold: float = typer.Option(0.20, "--delete-threshold"),
+    allow_delete_candidates: bool = typer.Option(
+        False,
+        "--allow-delete-candidates/--no-allow-delete-candidates",
+    ),
+    ticks_per_beat: int = typer.Option(960, "--ticks-per-beat"),
+    track_name_prefix: str = typer.Option("Hermes", "--track-name-prefix"),
+    include_review_in_cleaned: bool = typer.Option(
+        False,
+        "--include-review-in-cleaned/--no-include-review-in-cleaned",
+    ),
+    write_empty_files: bool = typer.Option(True, "--write-empty-files/--no-write-empty-files"),
+    include_delete_candidates: bool = typer.Option(
+        True,
+        "--include-delete-candidates/--no-include-delete-candidates",
+    ),
+) -> None:
+    params = PipelineProcessParameters(
+        onset_window_ms=onset_window_ms,
+        minimum_rms=minimum_rms,
+        minimum_onset_score=minimum_onset_score,
+        review_threshold=review_threshold,
+        keep_threshold=keep_threshold,
+        mute_threshold=mute_threshold,
+        cleanup_review_threshold=cleanup_review_threshold,
+        delete_threshold=delete_threshold,
+        allow_delete_candidates=allow_delete_candidates,
+        ticks_per_beat=ticks_per_beat,
+        track_name_prefix=track_name_prefix,
+        include_review_in_cleaned=include_review_in_cleaned,
+        write_empty_files=write_empty_files,
+        include_delete_candidates=include_delete_candidates,
+    )
+
+    try:
+        report = process_stem_pipeline(
+            input_midi=midi,
+            input_wav=wav,
+            source=source,
+            layer=layer,
+            project_dir=project_dir,
+            params=params,
+        )
+    except PipelineProcessError as exc:
+        typer.echo(f"process-stem failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    note_count = 0
+    cleaned_count = 0
+    review_count = 0
+    rejected_count = 0
+    validation_report_path = report.output_files.get("midi_audio_validation_report")
+    if validation_report_path:
+        validation_report = MidiAudioValidationReport.model_validate_json(
+            Path(validation_report_path).read_text(encoding="utf-8")
+        )
+        note_count = validation_report.note_count
+
+    cleaned_report_path = report.output_files.get("cleaned_export_report")
+    if cleaned_report_path:
+        cleaned_report = CleanedMidiExportReport.model_validate_json(
+            Path(cleaned_report_path).read_text(encoding="utf-8")
+        )
+        cleaned_count = cleaned_report.cleaned_note_count
+        review_count = cleaned_report.review_note_count
+        rejected_count = cleaned_report.rejected_note_count
+
+    typer.echo(
+        "process-stem complete: "
+        f"notes={note_count}, "
+        f"keep={cleaned_count}, "
+        f"review={review_count}, "
+        f"rejected={rejected_count}"
     )
 
 
