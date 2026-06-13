@@ -19,11 +19,16 @@ from midi_cleaner.cleanup.cleaned_exporter import (
     CleanedMidiExportParameters,
     export_cleaned_midi,
 )
-from midi_cleaner.cleanup.models import CleanedMidiExportReport
+from midi_cleaner.cleanup.models import CleanedMidiExportReport, WorkingMidiExportReport
 from midi_cleaner.cleanup.midi_exporter import (
     ReviewMidiExportError,
     ReviewMidiExportParameters,
     export_review_midi,
+)
+from midi_cleaner.cleanup.working_exporter import (
+    WorkingMidiExportError,
+    WorkingMidiExportParameters,
+    export_working_midi,
 )
 from midi_cleaner.cleanup.planner import (
     CleanupPlanError,
@@ -41,6 +46,11 @@ from midi_cleaner.pipeline.qa_report import (
     QAReportParameters,
     generate_qa_report,
 )
+from midi_cleaner.refinement.bass import (
+    BassRefinementError,
+    BassRefinementParameters,
+    refine_bass_notes,
+)
 from midi_cleaner.runtime.report import RuntimeReport, build_runtime_report
 from midi_cleaner.validation.models import MidiAudioValidationReport
 from midi_cleaner.validation.midi_audio import (
@@ -54,6 +64,7 @@ midi_app = typer.Typer(help="MIDI candidate import tools.")
 audio_app = typer.Typer(help="Audio stem analysis tools.")
 validate_app = typer.Typer(help="MIDI-vs-audio validation tools.")
 cleanup_app = typer.Typer(help="Non-destructive MIDI cleanup planning tools.")
+refine_app = typer.Typer(help="MIDI timing quality refinement tools.")
 pipeline_app = typer.Typer(help="End-to-end pipeline tools.")
 console = Console()
 
@@ -61,6 +72,7 @@ app.add_typer(midi_app, name="midi")
 app.add_typer(audio_app, name="audio")
 app.add_typer(validate_app, name="validate")
 app.add_typer(cleanup_app, name="cleanup")
+app.add_typer(refine_app, name="refine")
 app.add_typer(pipeline_app, name="pipeline")
 
 
@@ -340,6 +352,82 @@ def align_audio_time_command(
     )
 
 
+@refine_app.command("bass")
+def refine_bass_command(
+    aligned_notes: Path = typer.Option(
+        ..., "--aligned-notes", help="Path to audio_aligned_note_events.json."
+    ),
+    audio_features: Path = typer.Option(
+        ..., "--audio-features", help="Path to audio_features.json."
+    ),
+    validation: Path = typer.Option(..., "--validation", help="Path to note_validation.json."),
+    output: Path = typer.Option(..., "--output", help="Output path for refined notes JSON."),
+    report: Path = typer.Option(..., "--report", help="Output path for refinement report JSON."),
+    attack_lookback_ms: float = typer.Option(80.0, "--attack-lookback-ms"),
+    max_attack_advance_ms: float = typer.Option(80.0, "--max-attack-advance-ms"),
+    attack_rms_ratio: float = typer.Option(0.25, "--attack-rms-ratio"),
+    min_attack_rise: float = typer.Option(0.0005, "--min-attack-rise"),
+    merge_gap_ms: float = typer.Option(160.0, "--merge-gap-ms"),
+    minimum_silence_ms: float = typer.Option(80.0, "--minimum-silence-ms"),
+    silence_rms_ratio: float = typer.Option(0.18, "--silence-rms-ratio"),
+    same_pitch_tolerance_semitones: int = typer.Option(1, "--same-pitch-tolerance-semitones"),
+    max_merge_window_ms: float = typer.Option(600.0, "--max-merge-window-ms"),
+    tail_rms_ratio: float = typer.Option(0.20, "--tail-rms-ratio"),
+    tail_silence_hold_ms: float = typer.Option(120.0, "--tail-silence-hold-ms"),
+    max_tail_extension_ms: float = typer.Option(900.0, "--max-tail-extension-ms"),
+    protect_next_onset_ms: float = typer.Option(80.0, "--protect-next-onset-ms"),
+    minimum_note_duration_ms: float = typer.Option(80.0, "--minimum-note-duration-ms"),
+    monophonic: bool = typer.Option(True, "--monophonic/--polyphonic"),
+    allow_pitch_overlap: bool = typer.Option(False, "--allow-pitch-overlap/--no-allow-pitch-overlap"),
+) -> None:
+    params = BassRefinementParameters(
+        attack_lookback_ms=attack_lookback_ms,
+        max_attack_advance_ms=max_attack_advance_ms,
+        attack_rms_ratio=attack_rms_ratio,
+        min_attack_rise=min_attack_rise,
+        merge_gap_ms=merge_gap_ms,
+        minimum_silence_ms=minimum_silence_ms,
+        silence_rms_ratio=silence_rms_ratio,
+        same_pitch_tolerance_semitones=same_pitch_tolerance_semitones,
+        max_merge_window_ms=max_merge_window_ms,
+        tail_rms_ratio=tail_rms_ratio,
+        tail_silence_hold_ms=tail_silence_hold_ms,
+        max_tail_extension_ms=max_tail_extension_ms,
+        protect_next_onset_ms=protect_next_onset_ms,
+        minimum_note_duration_ms=minimum_note_duration_ms,
+        monophonic=monophonic,
+        allow_pitch_overlap=allow_pitch_overlap,
+    )
+
+    try:
+        refined_document, refinement_report = refine_bass_notes(
+            aligned_notes_file=aligned_notes,
+            audio_features_file=audio_features,
+            validation_file=validation,
+            params=params,
+        )
+    except BassRefinementError as exc:
+        typer.echo(f"Bass refinement failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    report.parent.mkdir(parents=True, exist_ok=True)
+
+    output.write_text(refined_document.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    refinement_report.output_file = str(output)
+    report.write_text(refinement_report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    typer.echo(
+        "Refined bass notes: "
+        f"input={refinement_report.input_note_count}, "
+        f"output={refinement_report.output_note_count}, "
+        f"merged={refinement_report.false_retrigger_merge_count}, "
+        f"tail_extended={refinement_report.tail_extended_count}, "
+        f"short_extended={refinement_report.short_note_extended_count}, "
+        f"warnings={refinement_report.warning_count}"
+    )
+
+
 @cleanup_app.command("plan")
 def cleanup_plan_command(
     validation: Path = typer.Option(..., "--validation", help="Path to note_validation.json."),
@@ -492,6 +580,69 @@ def cleanup_export_cleaned_midi_command(
     )
 
 
+@cleanup_app.command("export-working-midi")
+def cleanup_export_working_midi_command(
+    notes: Path = typer.Option(..., "--notes", help="Path to note_events.json."),
+    plan: Path = typer.Option(..., "--plan", help="Path to cleanup_plan.json."),
+    refined_notes: Path | None = typer.Option(
+        None,
+        "--refined-notes",
+        help="Optional path to refined_note_events.json.",
+    ),
+    audio_aligned_notes: Path | None = typer.Option(
+        None,
+        "--audio-aligned-notes",
+        help="Optional path to audio_aligned_note_events.json when refined notes are unavailable.",
+    ),
+    output_dir: Path = typer.Option(..., "--output-dir", help="Directory for working MIDI files."),
+    report: Path = typer.Option(..., "--report", help="Output path for working export report JSON."),
+    ticks_per_beat: int | None = typer.Option(
+        None,
+        "--ticks-per-beat",
+        help="Override output ticks-per-beat (default: note_events ticks_per_beat).",
+    ),
+    track_name_prefix: str = typer.Option("Hermes", "--track-name-prefix"),
+    include_diagnostic: bool = typer.Option(
+        False,
+        "--include-diagnostic/--no-include-diagnostic",
+    ),
+    write_empty_files: bool = typer.Option(
+        True,
+        "--write-empty-files/--no-write-empty-files",
+    ),
+) -> None:
+    params = WorkingMidiExportParameters(
+        ticks_per_beat=ticks_per_beat,
+        track_name_prefix=track_name_prefix,
+        include_diagnostic=include_diagnostic,
+        write_empty_files=write_empty_files,
+        refined_notes_file=refined_notes,
+        audio_aligned_notes_file=audio_aligned_notes,
+    )
+
+    try:
+        export_report = export_working_midi(
+            notes_file=notes,
+            cleanup_plan_file=plan,
+            output_dir=output_dir,
+            params=params,
+        )
+    except WorkingMidiExportError as exc:
+        typer.echo(f"Working MIDI export failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(export_report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    typer.echo(
+        "exported working MIDI: "
+        f"working={export_report.working_note_count}, "
+        f"rejected={export_report.rejected_note_count}, "
+        f"diagnostic={export_report.diagnostic_note_count}, "
+        f"timing_source={export_report.timing_source}"
+    )
+
+
 @pipeline_app.command("process-stem")
 def process_stem_command(
     midi: Path = typer.Option(..., "--midi", help="Path to candidate MIDI file."),
@@ -543,6 +694,19 @@ def process_stem_command(
         True,
         "--include-delete-candidates/--no-include-delete-candidates",
     ),
+    enable_bass_refinement: bool = typer.Option(
+        True,
+        "--enable-bass-refinement/--no-enable-bass-refinement",
+    ),
+    attack_lookback_ms: float = typer.Option(80.0, "--attack-lookback-ms"),
+    max_attack_advance_ms: float = typer.Option(80.0, "--max-attack-advance-ms"),
+    merge_gap_ms: float = typer.Option(160.0, "--merge-gap-ms"),
+    minimum_silence_ms: float = typer.Option(80.0, "--minimum-silence-ms"),
+    tail_rms_ratio: float = typer.Option(0.20, "--tail-rms-ratio"),
+    tail_silence_hold_ms: float = typer.Option(120.0, "--tail-silence-hold-ms"),
+    max_tail_extension_ms: float = typer.Option(900.0, "--max-tail-extension-ms"),
+    minimum_note_duration_ms: float = typer.Option(80.0, "--minimum-note-duration-ms"),
+    monophonic: bool = typer.Option(True, "--monophonic/--polyphonic"),
 ) -> None:
     params = PipelineProcessParameters(
         onset_window_ms=onset_window_ms,
@@ -568,6 +732,16 @@ def process_stem_command(
         include_review_in_cleaned=include_review_in_cleaned,
         write_empty_files=write_empty_files,
         include_delete_candidates=include_delete_candidates,
+        enable_bass_refinement=enable_bass_refinement,
+        attack_lookback_ms=attack_lookback_ms,
+        max_attack_advance_ms=max_attack_advance_ms,
+        merge_gap_ms=merge_gap_ms,
+        minimum_silence_ms=minimum_silence_ms,
+        tail_rms_ratio=tail_rms_ratio,
+        tail_silence_hold_ms=tail_silence_hold_ms,
+        max_tail_extension_ms=max_tail_extension_ms,
+        minimum_note_duration_ms=minimum_note_duration_ms,
+        monophonic=monophonic,
     )
 
     try:
@@ -590,6 +764,7 @@ def process_stem_command(
     cleaned_count = 0
     review_count = 0
     rejected_count = 0
+    working_count = 0
     alignment_report_path = report.output_files.get("audio_alignment_report")
     if alignment_report_path:
         alignment_report = AudioAlignmentReport.model_validate_json(
@@ -615,6 +790,13 @@ def process_stem_command(
         review_count = cleaned_report.review_note_count
         rejected_count = cleaned_report.rejected_note_count
 
+    working_report_path = report.output_files.get("working_export_report")
+    if working_report_path:
+        working_report = WorkingMidiExportReport.model_validate_json(
+            Path(working_report_path).read_text(encoding="utf-8")
+        )
+        working_count = working_report.working_note_count
+
     typer.echo(
         "process-stem complete: "
         f"notes={note_count}, "
@@ -623,7 +805,8 @@ def process_stem_command(
         f"review_timing={review_timing_count}, "
         f"keep={cleaned_count}, "
         f"review={review_count}, "
-        f"rejected={rejected_count}"
+        f"rejected={rejected_count}, "
+        f"working={working_count}"
     )
 
 

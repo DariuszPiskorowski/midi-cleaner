@@ -80,6 +80,17 @@
 - Expand QA artifacts to show Audio-Time Alignment / Sync timing sources and precision metrics.
 - Keep generated `projects/*` outputs ignored and out of commits.
 
+## Milestone 11 - Bass MIDI Quality Refinement
+- Add `midi-cleaner refine bass` to refine note start/end timing from aligned audio seconds.
+- Implement attack-aware start adjustment so note-on can lead the local energy peak when audio attack ramps in.
+- Suppress false retriggers by merging near-pitch notes when no real silence exists between them.
+- Extend note tails through audible sustain/decay while capping maximum extension.
+- Enforce minimum note duration for short energetic notes and close tiny same-pitch gaps.
+- Apply optional monophonic overlap cleanup for bass layers.
+- Export practical `midi/working/working.mid` + `midi/working/rejected.mid` with optional `diagnostic.mid`.
+- Keep legacy cleaned/review/rejected exports for backward compatibility.
+- Expand QA artifacts with refinement and working-export summary fields and per-note refinement columns.
+
 ## Future Milestones (Planned)
 - Classify actions: KEEP, MUTE, MERGE, SHORTEN, QUANTIZE, REASSIGN, DELETE.
 - Export cleaned MIDI and machine-readable QA reports.

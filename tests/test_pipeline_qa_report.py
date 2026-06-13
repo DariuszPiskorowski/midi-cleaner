@@ -18,10 +18,13 @@ from midi_cleaner.cleanup.models import (
     CleanupPlanDocument,
     ReviewMidiExportFile,
     ReviewMidiExportReport,
+    WorkingMidiExportFile,
+    WorkingMidiExportReport,
 )
 from midi_cleaner.cli import app
 from midi_cleaner.pipeline.models import PipelineReport, PipelineStageReport
 from midi_cleaner.pipeline.qa_report import QAReportError, QAReportParameters, generate_qa_report
+from midi_cleaner.refinement.models import BassRefinementReport, RefinedNoteDocument, RefinedNoteEvent
 from midi_cleaner.validation.models import NoteValidation, NoteValidationDocument
 
 
@@ -65,6 +68,7 @@ def _write_pipeline_like_project(tmp_path: Path, include_optional: bool = True) 
     (project_dir / "cleanup").mkdir(parents=True, exist_ok=True)
     (project_dir / "midi" / "cleaned").mkdir(parents=True, exist_ok=True)
     (project_dir / "midi" / "review").mkdir(parents=True, exist_ok=True)
+    (project_dir / "midi" / "working").mkdir(parents=True, exist_ok=True)
     (project_dir / "reports").mkdir(parents=True, exist_ok=True)
 
     note_validation = NoteValidationDocument(
@@ -221,6 +225,81 @@ def _write_pipeline_like_project(tmp_path: Path, include_optional: bool = True) 
             encoding="utf-8",
         )
 
+        refined_doc = RefinedNoteDocument(
+            schema_version="0.1.0",
+            aligned_notes_file="analysis/audio_aligned_note_events.json",
+            audio_features_file="analysis/audio_features.json",
+            validation_file="analysis/note_validation.json",
+            layer="bass",
+            sample_rate=44100,
+            audio_duration_sec=1.0,
+            refinement_parameters={
+                "attack_lookback_ms": 80.0,
+                "max_attack_advance_ms": 80.0,
+                "merge_gap_ms": 160.0,
+                "minimum_silence_ms": 80.0,
+                "tail_rms_ratio": 0.2,
+                "tail_silence_hold_ms": 120.0,
+                "max_tail_extension_ms": 900.0,
+                "minimum_note_duration_ms": 80.0,
+                "monophonic": True,
+                "allow_pitch_overlap": False,
+            },
+            notes=[
+                RefinedNoteEvent(
+                    note_id="k",
+                    source="ripx",
+                    layer="bass",
+                    pitch_midi=60,
+                    pitch_name="C4",
+                    velocity=90,
+                    channel=0,
+                    original_start_sec=0.0,
+                    original_end_sec=0.5,
+                    aligned_start_sec=0.01,
+                    aligned_end_sec=0.51,
+                    refined_start_sec=0.0,
+                    refined_end_sec=0.56,
+                    refined_duration_sec=0.56,
+                    start_refinement_ms=-10.0,
+                    end_refinement_ms=50.0,
+                    merged_note_ids=["r"],
+                    refinement_actions=["ATTACK_START_ADJUSTED", "SUSTAIN_TAIL_EXTENDED"],
+                    refinement_confidence=0.9,
+                    reasons=["test"],
+                )
+            ],
+        )
+        (project_dir / "analysis" / "refined_note_events.json").write_text(
+            refined_doc.model_dump_json(indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        refinement_report = BassRefinementReport(
+            aligned_notes_file="analysis/audio_aligned_note_events.json",
+            audio_features_file="analysis/audio_features.json",
+            validation_file="analysis/note_validation.json",
+            status="ok",
+            layer="bass",
+            input_note_count=4,
+            output_note_count=3,
+            merged_count=1,
+            false_retrigger_merge_count=1,
+            tail_extended_count=1,
+            short_note_extended_count=0,
+            overlap_resolved_count=1,
+            median_start_refinement_ms=-5.0,
+            median_end_refinement_ms=25.0,
+            max_tail_extension_ms=150.0,
+            warning_count=0,
+            warnings=[],
+            output_file="analysis/refined_note_events.json",
+        )
+        (project_dir / "analysis" / "bass_refinement_report.json").write_text(
+            refinement_report.model_dump_json(indent=2) + "\n",
+            encoding="utf-8",
+        )
+
         alignment_report = AudioAlignmentReport(
             notes_file="analysis/note_events.json",
             audio_features_file="analysis/audio_features.json",
@@ -301,6 +380,46 @@ def _write_pipeline_like_project(tmp_path: Path, include_optional: bool = True) 
             encoding="utf-8",
         )
 
+        working_report = WorkingMidiExportReport(
+            notes_file="analysis/note_events.json",
+            cleanup_plan_file="cleanup/cleanup_plan.json",
+            refined_notes_file="analysis/refined_note_events.json",
+            audio_aligned_notes_file="analysis/audio_aligned_note_events.json",
+            status="ok",
+            layer="bass",
+            ticks_per_beat=960,
+            timing_source="refined_audio_seconds",
+            max_export_time_error_ms=0.4,
+            mean_export_time_error_ms=0.15,
+            source_ticks_per_beat=480,
+            exported_ticks_per_beat=960,
+            tempo_us_per_beat=500000,
+            bpm=120.0,
+            working_note_count=2,
+            rejected_note_count=1,
+            diagnostic_note_count=0,
+            exported_files=[
+                WorkingMidiExportFile(
+                    role="WORKING",
+                    path="midi/working/working.mid",
+                    note_count=2,
+                    included_plan_actions=["KEEP", "REVIEW"],
+                ),
+                WorkingMidiExportFile(
+                    role="REJECTED",
+                    path="midi/working/rejected.mid",
+                    note_count=1,
+                    included_plan_actions=["MUTE", "DELETE_CANDIDATE"],
+                ),
+            ],
+            warning_count=0,
+            warnings=[],
+        )
+        (project_dir / "midi" / "working" / "working_export_report.json").write_text(
+            working_report.model_dump_json(indent=2) + "\n",
+            encoding="utf-8",
+        )
+
         pipeline_report = PipelineReport(
             status="ok",
             input_midi="candidate.mid",
@@ -367,6 +486,12 @@ def test_csv_contains_expected_rows(tmp_path: Path) -> None:
     assert "original_start_sec" in rows[0]
     assert "aligned_start_sec" in rows[0]
     assert "start_correction_ms" in rows[0]
+    assert "refined_start_sec" in rows[0]
+    assert "refined_end_sec" in rows[0]
+    assert "start_refinement_ms" in rows[0]
+    assert "end_refinement_ms" in rows[0]
+    assert "refinement_actions" in rows[0]
+    assert "merged_note_ids" in rows[0]
     assert "alignment_action" in rows[0]
     assert "alignment_confidence" in rows[0]
     assert "validation_action" in rows[0]
@@ -386,6 +511,8 @@ def test_html_contains_sections_and_escaped_content(tmp_path: Path) -> None:
     assert "cleaned_export_timing_source" in html_text
     assert "global_offset_ms" in html_text
     assert "max_export_time_error_ms" in html_text
+    assert "working_export_time_error_ms" in html_text
+    assert "refined_note_count" in html_text
     assert "Top 25 Lowest-Confidence Notes" in html_text
     assert "&lt;unsafe&gt;" in html_text
 
@@ -403,6 +530,13 @@ def test_summary_contains_audio_sync_fields(tmp_path: Path) -> None:
     assert summary.global_offset_applied is False
     assert summary.max_export_time_error_ms == 0.6
     assert summary.mean_export_time_error_ms == 0.2
+    assert summary.refined_note_count == 3
+    assert summary.merged_count == 1
+    assert summary.false_retrigger_merge_count == 1
+    assert summary.tail_extended_count == 1
+    assert summary.overlap_resolved_count == 1
+    assert summary.working_midi_note_count == 2
+    assert summary.working_export_time_error_ms == 0.4
 
 
 def test_missing_optional_reports_warns_but_succeeds(tmp_path: Path) -> None:

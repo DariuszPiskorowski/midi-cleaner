@@ -44,6 +44,8 @@ def _expected_paths(project_dir: Path) -> list[Path]:
         project_dir / "analysis" / "audio_alignment_report.json",
         project_dir / "analysis" / "note_validation.json",
         project_dir / "analysis" / "midi_audio_validation_report.json",
+        project_dir / "analysis" / "refined_note_events.json",
+        project_dir / "analysis" / "bass_refinement_report.json",
         project_dir / "cleanup" / "cleanup_plan.json",
         project_dir / "cleanup" / "cleanup_plan_report.json",
         project_dir / "midi" / "review" / "keep.mid",
@@ -54,6 +56,9 @@ def _expected_paths(project_dir: Path) -> list[Path]:
         project_dir / "midi" / "cleaned" / "review.mid",
         project_dir / "midi" / "cleaned" / "rejected.mid",
         project_dir / "midi" / "cleaned" / "cleaned_export_report.json",
+        project_dir / "midi" / "working" / "working.mid",
+        project_dir / "midi" / "working" / "rejected.mid",
+        project_dir / "midi" / "working" / "working_export_report.json",
         project_dir / "reports" / "pipeline_report.json",
     ]
 
@@ -141,5 +146,7 @@ def test_cli_process_stem_end_to_end(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert (project_dir / "reports" / "pipeline_report.json").exists()
     assert (project_dir / "analysis" / "audio_aligned_note_events.json").exists()
+    assert (project_dir / "analysis" / "refined_note_events.json").exists()
     assert (project_dir / "midi" / "review" / "export_report.json").exists()
     assert (project_dir / "midi" / "cleaned" / "cleaned_export_report.json").exists()
+    assert (project_dir / "midi" / "working" / "working_export_report.json").exists()

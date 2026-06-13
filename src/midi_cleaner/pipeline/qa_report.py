@@ -5,14 +5,16 @@ import json
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
+from statistics import median
 
 from midi_cleaner.alignment.models import (
     AudioAlignedNoteDocument,
     AudioAlignedNoteEvent,
     AudioAlignmentReport,
 )
-from midi_cleaner.cleanup.models import CleanupPlanDocument
+from midi_cleaner.cleanup.models import CleanupPlanDocument, WorkingMidiExportReport
 from midi_cleaner.pipeline.models import PipelineReport, QANoteRow, QASummary
+from midi_cleaner.refinement.models import BassRefinementReport, RefinedNoteDocument, RefinedNoteEvent
 from midi_cleaner.validation.models import NoteValidationDocument
 
 
@@ -51,10 +53,23 @@ def _load_pipeline_report(path: Path) -> PipelineReport:
     return PipelineReport.model_validate_json(path.read_text(encoding="utf-8"))
 
 
+def _load_refined_document(path: Path) -> RefinedNoteDocument:
+    return RefinedNoteDocument.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _load_refinement_report(path: Path) -> BassRefinementReport:
+    return BassRefinementReport.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _load_working_export_report(path: Path) -> WorkingMidiExportReport:
+    return WorkingMidiExportReport.model_validate_json(path.read_text(encoding="utf-8"))
+
+
 def _build_rows(
     note_validation: NoteValidationDocument | None,
     cleanup_plan: CleanupPlanDocument | None,
     aligned_notes: AudioAlignedNoteDocument | None,
+    refined_notes: RefinedNoteDocument | None,
     warnings: list[str],
 ) -> list[QANoteRow]:
     if note_validation is None:
@@ -70,6 +85,10 @@ def _build_rows(
     if aligned_notes is not None:
         aligned_by_note_id = {item.note_id: item for item in aligned_notes.notes}
 
+    refined_by_note_id: dict[str, RefinedNoteEvent] = {}
+    if refined_notes is not None:
+        refined_by_note_id = {item.note_id: item for item in refined_notes.notes}
+
     validation_note_ids = {item.note_id for item in note_validation.validations}
     for note_id in plan_action_by_note_id:
         if note_id not in validation_note_ids:
@@ -78,6 +97,13 @@ def _build_rows(
     for note_id in aligned_by_note_id:
         if note_id not in validation_note_ids:
             warnings.append(f"audio alignment contains unknown note_id: {note_id}")
+
+    for note_id, refined in refined_by_note_id.items():
+        if note_id in validation_note_ids:
+            continue
+        if any(merged_id in validation_note_ids for merged_id in refined.merged_note_ids):
+            continue
+        warnings.append(f"refinement contains unknown note_id: {note_id}")
 
     rows: list[QANoteRow] = []
     missing_alignment_count = 0
@@ -95,6 +121,12 @@ def _build_rows(
         start_correction_ms = 0.0
         alignment_action: str | None = None
         alignment_confidence: float | None = None
+        refined_start_sec: float | None = None
+        refined_end_sec: float | None = None
+        start_refinement_ms: float | None = None
+        end_refinement_ms: float | None = None
+        refinement_actions: str | None = None
+        merged_note_ids: str | None = None
 
         if aligned is not None:
             original_start_sec = float(aligned.original_start_sec)
@@ -102,6 +134,15 @@ def _build_rows(
             start_correction_ms = float(aligned.start_correction_ms)
             alignment_action = aligned.alignment_action
             alignment_confidence = float(aligned.alignment_confidence)
+
+        refined = refined_by_note_id.get(item.note_id)
+        if refined is not None:
+            refined_start_sec = float(refined.refined_start_sec)
+            refined_end_sec = float(refined.refined_end_sec)
+            start_refinement_ms = float(refined.start_refinement_ms)
+            end_refinement_ms = float(refined.end_refinement_ms)
+            refinement_actions = "; ".join(refined.refinement_actions)
+            merged_note_ids = "; ".join(refined.merged_note_ids)
 
         rows.append(
             QANoteRow(
@@ -114,6 +155,12 @@ def _build_rows(
                 original_start_sec=original_start_sec,
                 aligned_start_sec=aligned_start_sec,
                 start_correction_ms=start_correction_ms,
+                refined_start_sec=refined_start_sec,
+                refined_end_sec=refined_end_sec,
+                start_refinement_ms=start_refinement_ms,
+                end_refinement_ms=end_refinement_ms,
+                refinement_actions=refinement_actions,
+                merged_note_ids=merged_note_ids,
                 alignment_action=alignment_action,
                 alignment_confidence=alignment_confidence,
                 confidence=item.confidence,
@@ -149,6 +196,12 @@ def _write_csv(path: Path, rows: list[QANoteRow]) -> None:
                 "original_start_sec",
                 "aligned_start_sec",
                 "start_correction_ms",
+                "refined_start_sec",
+                "refined_end_sec",
+                "start_refinement_ms",
+                "end_refinement_ms",
+                "refinement_actions",
+                "merged_note_ids",
                 "alignment_action",
                 "alignment_confidence",
                 "confidence",
@@ -176,6 +229,26 @@ def _rows_table_html(title: str, rows: list[QANoteRow]) -> str:
             if row.alignment_confidence is not None
             else "<td></td>"
         )
+        refined_start_cell = (
+            f"<td>{row.refined_start_sec:.6f}</td>"
+            if row.refined_start_sec is not None
+            else "<td></td>"
+        )
+        refined_end_cell = (
+            f"<td>{row.refined_end_sec:.6f}</td>"
+            if row.refined_end_sec is not None
+            else "<td></td>"
+        )
+        start_refinement_cell = (
+            f"<td>{row.start_refinement_ms:.2f}</td>"
+            if row.start_refinement_ms is not None
+            else "<td></td>"
+        )
+        end_refinement_cell = (
+            f"<td>{row.end_refinement_ms:.2f}</td>"
+            if row.end_refinement_ms is not None
+            else "<td></td>"
+        )
         html_rows.append(
             "<tr>"
             f"<td>{escape(row.note_id)}</td>"
@@ -187,6 +260,12 @@ def _rows_table_html(title: str, rows: list[QANoteRow]) -> str:
             f"<td>{escape(str(row.alignment_action))}</td>"
             f"<td>{row.start_correction_ms:.2f}</td>"
             f"{alignment_confidence_cell}"
+            f"{refined_start_cell}"
+            f"{refined_end_cell}"
+            f"{start_refinement_cell}"
+            f"{end_refinement_cell}"
+            f"<td>{escape(str(row.refinement_actions))}</td>"
+            f"<td>{escape(str(row.merged_note_ids))}</td>"
             f"<td>{row.onset_score:.6f}</td>"
             f"<td>{row.mean_rms_during_note:.6f}</td>"
             f"<td>{row.sustained_energy_ratio:.4f}</td>"
@@ -200,8 +279,11 @@ def _rows_table_html(title: str, rows: list[QANoteRow]) -> str:
         "<thead><tr>"
         "<th>note_id</th><th>pitch_midi</th><th>pitch_name</th><th>confidence</th>"
         "<th>validation_action</th><th>plan_action</th><th>alignment_action</th>"
-        "<th>start_correction_ms</th><th>alignment_confidence</th><th>onset_score</th>"
-        "<th>mean_rms</th><th>sustained_ratio</th><th>reasons</th>"
+        "<th>start_correction_ms</th><th>alignment_confidence</th>"
+        "<th>refined_start_sec</th><th>refined_end_sec</th>"
+        "<th>start_refinement_ms</th><th>end_refinement_ms</th>"
+        "<th>refinement_actions</th><th>merged_note_ids</th>"
+        "<th>onset_score</th><th>mean_rms</th><th>sustained_ratio</th><th>reasons</th>"
         "</tr></thead><tbody>"
         + "".join(html_rows)
         + "</tbody></table>"
@@ -241,6 +323,9 @@ def _write_html(
         ("max_abs_start_correction_ms", str(summary.max_abs_start_correction_ms)),
         ("max_export_time_error_ms", str(summary.max_export_time_error_ms)),
         ("mean_export_time_error_ms", str(summary.mean_export_time_error_ms)),
+        ("working_export_time_error_ms", str(summary.working_export_time_error_ms)),
+        ("median_start_refinement_ms", str(summary.median_start_refinement_ms)),
+        ("median_end_refinement_ms", str(summary.median_end_refinement_ms)),
     ]
     sync_rows_html = "".join(
         f"<tr><th>{escape(name)}</th><td>{escape(value)}</td></tr>" for name, value in sync_rows
@@ -276,6 +361,13 @@ def _write_html(
       <tr><th>delete_candidate_count</th><td>{summary.delete_candidate_count}</td></tr>
       <tr><th>cleaned_note_count</th><td>{summary.cleaned_note_count}</td></tr>
       <tr><th>rejected_note_count</th><td>{summary.rejected_note_count}</td></tr>
+            <tr><th>refined_note_count</th><td>{summary.refined_note_count}</td></tr>
+            <tr><th>merged_count</th><td>{summary.merged_count}</td></tr>
+            <tr><th>false_retrigger_merge_count</th><td>{summary.false_retrigger_merge_count}</td></tr>
+            <tr><th>tail_extended_count</th><td>{summary.tail_extended_count}</td></tr>
+            <tr><th>short_note_extended_count</th><td>{summary.short_note_extended_count}</td></tr>
+            <tr><th>overlap_resolved_count</th><td>{summary.overlap_resolved_count}</td></tr>
+            <tr><th>working_midi_note_count</th><td>{summary.working_midi_note_count}</td></tr>
     <tr><th>aligned_count</th><td>{summary.aligned_count}</td></tr>
     <tr><th>keep_original_count</th><td>{summary.keep_original_count}</td></tr>
     <tr><th>review_timing_count</th><td>{summary.review_timing_count}</td></tr>
@@ -337,10 +429,13 @@ def generate_qa_report(
     note_validation_path = project_dir / "analysis" / "note_validation.json"
     audio_aligned_notes_path = project_dir / "analysis" / "audio_aligned_note_events.json"
     audio_alignment_report_path = project_dir / "analysis" / "audio_alignment_report.json"
+    refined_notes_path = project_dir / "analysis" / "refined_note_events.json"
+    bass_refinement_report_path = project_dir / "analysis" / "bass_refinement_report.json"
     midi_audio_validation_report_path = project_dir / "analysis" / "midi_audio_validation_report.json"
     cleanup_plan_path = project_dir / "cleanup" / "cleanup_plan.json"
     cleaned_export_report_path = project_dir / "midi" / "cleaned" / "cleaned_export_report.json"
     review_export_report_path = project_dir / "midi" / "review" / "export_report.json"
+    working_export_report_path = project_dir / "midi" / "working" / "working_export_report.json"
     pipeline_report_path = project_dir / "reports" / "pipeline_report.json"
 
     warnings: list[str] = []
@@ -363,11 +458,23 @@ def generate_qa_report(
     else:
         warnings.append(f"Missing audio aligned notes: {audio_aligned_notes_path}")
 
+    refined_notes: RefinedNoteDocument | None = None
+    if refined_notes_path.exists():
+        refined_notes = _load_refined_document(refined_notes_path)
+    else:
+        warnings.append(f"Missing refined notes: {refined_notes_path}")
+
     alignment_report: AudioAlignmentReport | None = None
     if audio_alignment_report_path.exists():
         alignment_report = _load_audio_alignment_report(audio_alignment_report_path)
     else:
         warnings.append(f"Missing audio alignment report: {audio_alignment_report_path}")
+
+    refinement_report: BassRefinementReport | None = None
+    if bass_refinement_report_path.exists():
+        refinement_report = _load_refinement_report(bass_refinement_report_path)
+    else:
+        warnings.append(f"Missing bass refinement report: {bass_refinement_report_path}")
 
     if note_validation is None and cleanup_plan is None:
         raise QAReportError("Missing both required inputs: analysis/note_validation.json and cleanup/cleanup_plan.json")
@@ -383,8 +490,10 @@ def generate_qa_report(
 
     cleaned_note_count = 0
     rejected_note_count = 0
+    working_midi_note_count = 0
     cleaned_export_timing_source: str | None = None
     review_export_timing_source: str | None = None
+    working_export_time_error_ms: float | None = None
     export_max_errors_ms: list[float] = []
     export_mean_errors_ms: list[float] = []
 
@@ -424,6 +533,13 @@ def generate_qa_report(
     else:
         warnings.append(f"Missing review export report: {review_export_report_path}")
 
+    if working_export_report_path.exists():
+        working_export_report = _load_working_export_report(working_export_report_path)
+        working_midi_note_count = int(working_export_report.working_note_count)
+        working_export_time_error_ms = float(working_export_report.max_export_time_error_ms)
+    else:
+        warnings.append(f"Missing working export report: {working_export_report_path}")
+
     if not pipeline_report_path.exists():
         warnings.append(f"Missing pipeline report: {pipeline_report_path}")
     else:
@@ -434,6 +550,7 @@ def generate_qa_report(
         note_validation=note_validation,
         cleanup_plan=cleanup_plan,
         aligned_notes=aligned_notes,
+        refined_notes=refined_notes,
         warnings=warnings,
     )
 
@@ -496,6 +613,46 @@ def generate_qa_report(
             p95_abs_start_correction_ms = sorted_corrections[p95_index]
             max_abs_start_correction_ms = sorted_corrections[-1]
 
+    refined_note_count = 0
+    merged_count = 0
+    false_retrigger_merge_count = 0
+    tail_extended_count = 0
+    short_note_extended_count = 0
+    overlap_resolved_count = 0
+    median_start_refinement_ms: float | None = None
+    median_end_refinement_ms: float | None = None
+
+    if refinement_report is not None:
+        refined_note_count = refinement_report.output_note_count
+        merged_count = refinement_report.merged_count
+        false_retrigger_merge_count = refinement_report.false_retrigger_merge_count
+        tail_extended_count = refinement_report.tail_extended_count
+        short_note_extended_count = refinement_report.short_note_extended_count
+        overlap_resolved_count = refinement_report.overlap_resolved_count
+        median_start_refinement_ms = refinement_report.median_start_refinement_ms
+        median_end_refinement_ms = refinement_report.median_end_refinement_ms
+    elif refined_notes is not None:
+        refined_note_count = len(refined_notes.notes)
+        for item in refined_notes.notes:
+            actions = set(item.refinement_actions)
+            if "FALSE_RETRIGGER_MERGED" in actions:
+                false_retrigger_merge_count += 1
+            if "SUSTAIN_TAIL_EXTENDED" in actions:
+                tail_extended_count += 1
+            if "SHORT_NOTE_EXTENDED" in actions:
+                short_note_extended_count += 1
+            if "MONOPHONIC_OVERLAP_RESOLVED" in actions:
+                overlap_resolved_count += 1
+            merged_count += len(item.merged_note_ids)
+
+        if refined_notes.notes:
+            median_start_refinement_ms = float(
+                median(item.start_refinement_ms for item in refined_notes.notes)
+            )
+            median_end_refinement_ms = float(
+                median(item.end_refinement_ms for item in refined_notes.notes)
+            )
+
     max_export_time_error_ms = max(export_max_errors_ms) if export_max_errors_ms else None
     mean_export_time_error_ms = (
         (sum(export_mean_errors_ms) / len(export_mean_errors_ms))
@@ -543,6 +700,16 @@ def generate_qa_report(
         delete_candidate_count=delete_candidate_count,
         cleaned_note_count=cleaned_note_count,
         rejected_note_count=rejected_note_count,
+        refined_note_count=refined_note_count,
+        merged_count=merged_count,
+        false_retrigger_merge_count=false_retrigger_merge_count,
+        tail_extended_count=tail_extended_count,
+        short_note_extended_count=short_note_extended_count,
+        overlap_resolved_count=overlap_resolved_count,
+        median_start_refinement_ms=median_start_refinement_ms,
+        median_end_refinement_ms=median_end_refinement_ms,
+        working_midi_note_count=working_midi_note_count,
+        working_export_time_error_ms=working_export_time_error_ms,
         validation_timing_source=validation_timing_source,
         review_export_timing_source=review_export_timing_source,
         cleaned_export_timing_source=cleaned_export_timing_source,

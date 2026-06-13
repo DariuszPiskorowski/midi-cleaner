@@ -36,6 +36,12 @@ class QANoteRow(BaseModel):
     original_start_sec: float | None
     aligned_start_sec: float | None
     start_correction_ms: float | None
+    refined_start_sec: float | None = None
+    refined_end_sec: float | None = None
+    start_refinement_ms: float | None = None
+    end_refinement_ms: float | None = None
+    refinement_actions: str | None = None
+    merged_note_ids: str | None = None
     alignment_action: str | None
     alignment_confidence: float | None
     confidence: float
@@ -58,6 +64,16 @@ class QASummary(BaseModel):
     delete_candidate_count: int
     cleaned_note_count: int
     rejected_note_count: int
+    refined_note_count: int = 0
+    merged_count: int = 0
+    false_retrigger_merge_count: int = 0
+    tail_extended_count: int = 0
+    short_note_extended_count: int = 0
+    overlap_resolved_count: int = 0
+    median_start_refinement_ms: float | None = None
+    median_end_refinement_ms: float | None = None
+    working_midi_note_count: int = 0
+    working_export_time_error_ms: float | None = None
     validation_timing_source: str | None
     review_export_timing_source: str | None
     cleaned_export_timing_source: str | None

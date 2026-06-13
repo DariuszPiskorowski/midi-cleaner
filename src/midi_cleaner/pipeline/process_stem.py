@@ -16,9 +16,15 @@ from midi_cleaner.cleanup.cleaned_exporter import (
     export_cleaned_midi,
 )
 from midi_cleaner.cleanup.midi_exporter import ReviewMidiExportParameters, export_review_midi
+from midi_cleaner.cleanup.working_exporter import (
+    WorkingMidiExportParameters,
+    export_working_midi,
+)
 from midi_cleaner.cleanup.planner import CleanupPlannerParameters, build_cleanup_plan
 from midi_cleaner.midi.importer import import_midi_candidate
 from midi_cleaner.pipeline.models import PipelineReport, PipelineStageReport
+from midi_cleaner.refinement.bass import BassRefinementParameters, refine_bass_notes
+from midi_cleaner.refinement.models import BassRefinementReport, RefinedNoteDocument, RefinedNoteEvent
 from midi_cleaner.validation.midi_audio import ValidationParameters, validate_midi_vs_audio
 
 
@@ -51,6 +57,17 @@ class PipelineProcessParameters:
     include_review_in_cleaned: bool = False
     write_empty_files: bool = True
     include_delete_candidates: bool = True
+    enable_bass_refinement: bool = True
+    attack_lookback_ms: float = 80.0
+    max_attack_advance_ms: float = 80.0
+    merge_gap_ms: float = 160.0
+    minimum_silence_ms: float = 80.0
+    tail_rms_ratio: float = 0.20
+    tail_silence_hold_ms: float = 120.0
+    max_tail_extension_ms: float = 900.0
+    minimum_note_duration_ms: float = 80.0
+    monophonic: bool = True
+    include_diagnostic_working_midi: bool = False
 
 
 def _write_json(path: Path, payload: BaseModel | dict[str, object]) -> None:
@@ -66,6 +83,88 @@ def _write_json_dict(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def _build_passthrough_refinement(
+    aligned_document,
+    aligned_notes_file: Path,
+    audio_features_file: Path,
+    validation_file: Path,
+    reason: str,
+    params: PipelineProcessParameters,
+) -> tuple[RefinedNoteDocument, BassRefinementReport]:
+    refined_notes: list[RefinedNoteEvent] = []
+    for note in aligned_document.notes:
+        refined_notes.append(
+            RefinedNoteEvent(
+                note_id=note.note_id,
+                source=note.source,
+                layer=note.layer,
+                pitch_midi=note.pitch_midi,
+                pitch_name=note.pitch_name,
+                velocity=note.velocity,
+                channel=note.channel,
+                original_start_sec=note.original_start_sec,
+                original_end_sec=note.original_end_sec,
+                aligned_start_sec=note.aligned_start_sec,
+                aligned_end_sec=note.aligned_end_sec,
+                refined_start_sec=note.aligned_start_sec,
+                refined_end_sec=note.aligned_end_sec,
+                refined_duration_sec=note.aligned_duration_sec,
+                start_refinement_ms=0.0,
+                end_refinement_ms=0.0,
+                merged_note_ids=[],
+                refinement_actions=["UNCHANGED"],
+                refinement_confidence=note.alignment_confidence,
+                reasons=[reason],
+            )
+        )
+
+    document = RefinedNoteDocument(
+        schema_version="0.1.0",
+        aligned_notes_file=str(aligned_notes_file),
+        audio_features_file=str(audio_features_file),
+        validation_file=str(validation_file),
+        layer=aligned_document.layer,
+        sample_rate=aligned_document.sample_rate,
+        audio_duration_sec=aligned_document.audio_duration_sec,
+        timing_source="refined_audio_seconds",
+        refinement_parameters={
+            "attack_lookback_ms": params.attack_lookback_ms,
+            "max_attack_advance_ms": params.max_attack_advance_ms,
+            "merge_gap_ms": params.merge_gap_ms,
+            "minimum_silence_ms": params.minimum_silence_ms,
+            "tail_rms_ratio": params.tail_rms_ratio,
+            "tail_silence_hold_ms": params.tail_silence_hold_ms,
+            "max_tail_extension_ms": params.max_tail_extension_ms,
+            "minimum_note_duration_ms": params.minimum_note_duration_ms,
+            "monophonic": params.monophonic,
+            "allow_pitch_overlap": False,
+        },
+        notes=refined_notes,
+    )
+
+    report = BassRefinementReport(
+        aligned_notes_file=str(aligned_notes_file),
+        audio_features_file=str(audio_features_file),
+        validation_file=str(validation_file),
+        status="ok",
+        layer=aligned_document.layer,
+        input_note_count=len(aligned_document.notes),
+        output_note_count=len(refined_notes),
+        merged_count=0,
+        false_retrigger_merge_count=0,
+        tail_extended_count=0,
+        short_note_extended_count=0,
+        overlap_resolved_count=0,
+        median_start_refinement_ms=0.0,
+        median_end_refinement_ms=0.0,
+        max_tail_extension_ms=0.0,
+        warning_count=1,
+        warnings=[reason],
+        output_file=None,
+    )
+    return document, report
+
+
 def process_stem_pipeline(
     input_midi: Path,
     input_wav: Path,
@@ -79,6 +178,7 @@ def process_stem_pipeline(
     cleanup_dir = project_dir / "cleanup"
     review_midi_dir = project_dir / "midi" / "review"
     cleaned_midi_dir = project_dir / "midi" / "cleaned"
+    working_midi_dir = project_dir / "midi" / "working"
     reports_dir = project_dir / "reports"
     pipeline_report_path = reports_dir / "pipeline_report.json"
 
@@ -88,6 +188,7 @@ def process_stem_pipeline(
         cleanup_dir,
         review_midi_dir,
         cleaned_midi_dir,
+        working_midi_dir,
         reports_dir,
     ]:
         directory.mkdir(parents=True, exist_ok=True)
@@ -127,12 +228,25 @@ def process_stem_pipeline(
                     "max_end_correction_ms": params.max_end_correction_ms,
                     "low_confidence_action": params.low_confidence_action,
                 },
+                "refinement": {
+                    "enable_bass_refinement": params.enable_bass_refinement,
+                    "attack_lookback_ms": params.attack_lookback_ms,
+                    "max_attack_advance_ms": params.max_attack_advance_ms,
+                    "merge_gap_ms": params.merge_gap_ms,
+                    "minimum_silence_ms": params.minimum_silence_ms,
+                    "tail_rms_ratio": params.tail_rms_ratio,
+                    "tail_silence_hold_ms": params.tail_silence_hold_ms,
+                    "max_tail_extension_ms": params.max_tail_extension_ms,
+                    "minimum_note_duration_ms": params.minimum_note_duration_ms,
+                    "monophonic": params.monophonic,
+                },
                 "midi_export": {
                     "ticks_per_beat": params.ticks_per_beat,
                     "track_name_prefix": params.track_name_prefix,
                     "include_review_in_cleaned": params.include_review_in_cleaned,
                     "write_empty_files": params.write_empty_files,
                     "include_delete_candidates": params.include_delete_candidates,
+                    "include_diagnostic_working_midi": params.include_diagnostic_working_midi,
                 },
             },
         },
@@ -261,7 +375,62 @@ def process_stem_pipeline(
         )
         warnings.extend([f"midi_audio_validation: {item}" for item in validation_report.warnings])
 
-        # Stage 5: Cleanup planning
+        # Stage 5: Bass refinement (or passthrough for non-bass/disabled)
+        current_stage = "bass_refinement"
+        refined_note_events_path = analysis_dir / "refined_note_events.json"
+        bass_refinement_report_path = analysis_dir / "bass_refinement_report.json"
+        refinement_enabled = params.enable_bass_refinement and layer.lower() == "bass"
+
+        if refinement_enabled:
+            refined_document, refinement_report = refine_bass_notes(
+                aligned_notes_file=audio_aligned_note_events_path,
+                audio_features_file=audio_features_path,
+                validation_file=note_validation_path,
+                params=BassRefinementParameters(
+                    attack_lookback_ms=params.attack_lookback_ms,
+                    max_attack_advance_ms=params.max_attack_advance_ms,
+                    merge_gap_ms=params.merge_gap_ms,
+                    minimum_silence_ms=params.minimum_silence_ms,
+                    tail_rms_ratio=params.tail_rms_ratio,
+                    tail_silence_hold_ms=params.tail_silence_hold_ms,
+                    max_tail_extension_ms=params.max_tail_extension_ms,
+                    minimum_note_duration_ms=params.minimum_note_duration_ms,
+                    monophonic=params.monophonic,
+                    allow_pitch_overlap=False,
+                ),
+            )
+        else:
+            reason = (
+                "bass refinement disabled by option"
+                if not params.enable_bass_refinement
+                else f"refinement not applied for non-bass layer: {layer}"
+            )
+            refined_document, refinement_report = _build_passthrough_refinement(
+                aligned_document=aligned_document,
+                aligned_notes_file=audio_aligned_note_events_path,
+                audio_features_file=audio_features_path,
+                validation_file=note_validation_path,
+                reason=reason,
+                params=params,
+            )
+
+        refinement_report.output_file = str(refined_note_events_path)
+        _write_json(refined_note_events_path, refined_document)
+        _write_json(bass_refinement_report_path, refinement_report)
+        output_files["refined_note_events"] = str(refined_note_events_path)
+        output_files["bass_refinement_report"] = str(bass_refinement_report_path)
+        stages.append(
+            PipelineStageReport(
+                name="bass_refinement",
+                status="ok",
+                output_files=[str(refined_note_events_path), str(bass_refinement_report_path)],
+                warning_count=refinement_report.warning_count,
+                warnings=refinement_report.warnings,
+            )
+        )
+        warnings.extend([f"bass_refinement: {item}" for item in refinement_report.warnings])
+
+        # Stage 6: Cleanup planning
         current_stage = "cleanup_plan"
         cleanup_plan_path = cleanup_dir / "cleanup_plan.json"
         cleanup_plan_report_path = cleanup_dir / "cleanup_plan_report.json"
@@ -290,7 +459,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"cleanup_plan: {item}" for item in cleanup_report.warnings])
 
-        # Stage 6: Review MIDI export
+        # Stage 7: Review MIDI export (backward compatible)
         current_stage = "review_midi_export"
         review_export_report_path = review_midi_dir / "export_report.json"
         review_export_report = export_review_midi(
@@ -320,7 +489,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"review_midi_export: {item}" for item in review_export_report.warnings])
 
-        # Stage 7: Cleaned MIDI export
+        # Stage 8: Cleaned MIDI export (backward compatible)
         current_stage = "cleaned_midi_export"
         cleaned_export_report_path = cleaned_midi_dir / "cleaned_export_report.json"
         cleaned_export_report = export_cleaned_midi(
@@ -350,6 +519,38 @@ def process_stem_pipeline(
             )
         )
         warnings.extend([f"cleaned_midi_export: {item}" for item in cleaned_export_report.warnings])
+
+        # Stage 9: Working MIDI export
+        current_stage = "working_midi_export"
+        working_export_report_path = working_midi_dir / "working_export_report.json"
+        working_export_report = export_working_midi(
+            notes_file=note_events_path,
+            cleanup_plan_file=cleanup_plan_path,
+            output_dir=working_midi_dir,
+            params=WorkingMidiExportParameters(
+                ticks_per_beat=params.ticks_per_beat,
+                track_name_prefix=params.track_name_prefix,
+                include_diagnostic=params.include_diagnostic_working_midi,
+                write_empty_files=params.write_empty_files,
+                refined_notes_file=refined_note_events_path,
+                audio_aligned_notes_file=audio_aligned_note_events_path,
+            ),
+        )
+        _write_json(working_export_report_path, working_export_report)
+        output_files["working_export_report"] = str(working_export_report_path)
+        working_outputs = [item.path for item in working_export_report.exported_files] + [
+            str(working_export_report_path)
+        ]
+        stages.append(
+            PipelineStageReport(
+                name="working_midi_export",
+                status="ok",
+                output_files=working_outputs,
+                warning_count=working_export_report.warning_count,
+                warnings=working_export_report.warnings,
+            )
+        )
+        warnings.extend([f"working_midi_export: {item}" for item in working_export_report.warnings])
 
         pipeline_report = PipelineReport(
             status="ok",

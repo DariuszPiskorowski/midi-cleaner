@@ -53,7 +53,11 @@ class ReviewMidiExportReport(BaseModel):
     ticks_per_beat_source: Literal["auto_from_note_events", "user_override"] = (
         "auto_from_note_events"
     )
-    timing_source: Literal["audio_aligned_seconds", "original_midi_ticks"]
+    timing_source: Literal[
+        "refined_audio_seconds",
+        "audio_aligned_seconds",
+        "original_midi_ticks",
+    ]
     max_export_time_error_ms: float
     mean_export_time_error_ms: float
     source_ticks_per_beat: int
@@ -82,7 +86,11 @@ class CleanedMidiExportReport(BaseModel):
     ticks_per_beat_source: Literal["auto_from_note_events", "user_override"] = (
         "auto_from_note_events"
     )
-    timing_source: Literal["audio_aligned_seconds", "original_midi_ticks"]
+    timing_source: Literal[
+        "refined_audio_seconds",
+        "audio_aligned_seconds",
+        "original_midi_ticks",
+    ]
     max_export_time_error_ms: float
     mean_export_time_error_ms: float
     source_ticks_per_beat: int
@@ -93,5 +101,42 @@ class CleanedMidiExportReport(BaseModel):
     review_note_count: int
     rejected_note_count: int
     exported_files: list[CleanedMidiExportFile]
+    warning_count: int
+    warnings: list[str]
+
+
+class WorkingMidiExportFile(BaseModel):
+    role: str
+    path: str
+    note_count: int
+    included_plan_actions: list[str]
+
+
+class WorkingMidiExportReport(BaseModel):
+    notes_file: str
+    cleanup_plan_file: str
+    refined_notes_file: str | None
+    audio_aligned_notes_file: str | None
+    status: Literal["ok", "error"]
+    layer: str
+    ticks_per_beat: int
+    ticks_per_beat_source: Literal["auto_from_note_events", "user_override"] = (
+        "auto_from_note_events"
+    )
+    timing_source: Literal[
+        "refined_audio_seconds",
+        "audio_aligned_seconds",
+        "original_midi_ticks",
+    ]
+    max_export_time_error_ms: float
+    mean_export_time_error_ms: float
+    source_ticks_per_beat: int
+    exported_ticks_per_beat: int
+    tempo_us_per_beat: int
+    bpm: float
+    working_note_count: int
+    rejected_note_count: int
+    diagnostic_note_count: int
+    exported_files: list[WorkingMidiExportFile]
     warning_count: int
     warnings: list[str]
