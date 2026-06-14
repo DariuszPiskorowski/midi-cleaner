@@ -24,7 +24,7 @@ midi-cleaner = "midi_cleaner.cli:app"
 
 [dependency-groups]
 dev = [
-  "pytest>=8.2,<9.0",
+  "pytest>=9.0.3,<10.0",
   "ruff>=0.5,<1.0",
 ]
 
