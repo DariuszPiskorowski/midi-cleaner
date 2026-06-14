@@ -535,8 +535,57 @@ def test_extend_split_same_note_conflict_prefers_extend_for_bass(tmp_path: Path)
         audio_doc,
         [_cleanup_action("n1", "KEEP")],
     )
+    pitch_path = _write_pitch_contour(
+        tmp_path,
+        duration_sec=2.0,
+        frame_step_sec=0.01,
+        pitch_fn=lambda t: (55.0 if t < 0.62 else 110.0) if 0.2 <= t <= 1.2 else None,
+        confidence_fn=lambda t: 0.95 if 0.2 <= t <= 1.2 else 0.0,
+    )
 
     repaired, plan, report = repair_activity(
+        refined_notes_file=refined_path,
+        audio_features_file=audio_path,
+        cleanup_plan_file=cleanup_path,
+        params=ActivityRepairParameters(audio_silence_hold_ms=0.0),
+        pitch_contour_file=pitch_path,
+    )
+
+    by_target: dict[str, set[str]] = {}
+    for action in plan.actions:
+        if action.target_note_id is None:
+            continue
+        if action.action_type in {"KEEP", "REVIEW_MANUAL"}:
+            continue
+        by_target.setdefault(action.target_note_id, set()).add(action.action_type)
+
+    assert "EXTEND_NOTE" in by_target.get("n1", set())
+    assert "SPLIT_NOTE" not in by_target.get("n1", set())
+    assert report.extend_count >= 1
+    assert report.split_count == 0
+    assert any(
+        "reason=extend_split_conflict" in warning and "detail=bass_same_pass_extend" in warning
+        for warning in report.warnings
+    )
+    assert repaired.notes[0].refined_end_sec > 1.0
+
+
+def test_undo_extension_split_is_suppressed_with_tolerance(tmp_path: Path) -> None:
+    audio_doc = _build_audio_document(
+        duration_sec=2.0,
+        frame_step_sec=0.01,
+        rms_fn=lambda t: 0.08 if 0.2 <= t <= 1.2 else 0.0,
+        onset_fn=lambda t: (0.0 if 0.88 <= t <= 0.98 else (1.0 if abs(t - 1.0) < 1e-6 else 0.02)),
+    )
+    notes = [_refined_note("n1", 45, 0.2, 1.0)]
+    refined_path, audio_path, cleanup_path = _write_inputs(
+        tmp_path,
+        notes,
+        audio_doc,
+        [_cleanup_action("n1", "KEEP")],
+    )
+
+    _repaired, plan, report = repair_activity(
         refined_notes_file=refined_path,
         audio_features_file=audio_path,
         cleanup_plan_file=cleanup_path,
@@ -553,10 +602,52 @@ def test_extend_split_same_note_conflict_prefers_extend_for_bass(tmp_path: Path)
 
     assert "EXTEND_NOTE" in by_target.get("n1", set())
     assert "SPLIT_NOTE" not in by_target.get("n1", set())
-    assert report.extend_count >= 1
-    assert report.split_count == 0
-    assert any("conflict-suppressed action" in warning for warning in report.warnings)
-    assert repaired.notes[0].refined_end_sec > 1.0
+    assert any("undoes_extension" in warning for warning in report.warnings)
+
+
+def test_sustain_protected_split_is_suppressed_for_bass(tmp_path: Path) -> None:
+    audio_doc = _build_audio_document(
+        duration_sec=1.5,
+        frame_step_sec=0.01,
+        rms_fn=lambda t: 0.08 if 0.2 <= t <= 0.42 else 0.0,
+        onset_fn=lambda t: 0.0,
+    )
+    dsp_path = _write_dsp_features(
+        tmp_path,
+        duration_sec=1.5,
+        frame_step_sec=0.01,
+        low_band_fn=lambda t: 0.06 if 0.2 <= t <= 0.42 else 0.0,
+        harmonic_fn=lambda t: (0.05 if 0.2 <= t <= 0.42 else (0.01 if 0.42 < t <= 0.72 else 0.0)),
+        onset_fn=lambda t: (0.0 if 0.52 <= t <= 0.60 else (1.0 if abs(t - 0.62) < 1e-6 else 0.02)),
+    )
+    notes = [_refined_note("n1", 45, 0.2, 1.0)]
+    refined_path, audio_path, cleanup_path = _write_inputs(
+        tmp_path,
+        notes,
+        audio_doc,
+        [_cleanup_action("n1", "KEEP")],
+    )
+
+    _repaired, plan, report = repair_activity(
+        refined_notes_file=refined_path,
+        audio_features_file=audio_path,
+        cleanup_plan_file=cleanup_path,
+        params=ActivityRepairParameters(audio_silence_hold_ms=0.0),
+        dsp_features_file=dsp_path,
+    )
+
+    assert report.sustain_protected_count >= 1
+    assert any(
+        action.action_type == "REVIEW_MANUAL"
+        and action.target_note_id == "n1"
+        and "SUSTAIN_PROTECTED_FROM_SHORTEN" in action.reasons
+        for action in plan.actions
+    )
+    assert all(
+        not (action.action_type == "SPLIT_NOTE" and action.target_note_id == "n1")
+        for action in plan.actions
+    )
+    assert any("sustain_protected" in warning for warning in report.warnings)
 
 
 def test_insert_split_same_pass_conflict_suppresses_split_on_inserted_note(

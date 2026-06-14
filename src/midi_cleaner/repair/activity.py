@@ -745,8 +745,11 @@ def repair_activity(
     max_extend_sec = params.max_extend_for_gap_ms / 1000.0
     max_insert_sec = params.max_insert_missing_ms / 1000.0
     context_sec = params.context_pitch_search_ms / 1000.0
+    undo_extension_split_tolerance_sec = 0.015
     extended_note_ids_this_pass: set[str] = set()
+    extended_old_end_by_note: dict[str, list[float]] = {}
     inserted_note_ids_this_pass: set[str] = set()
+    sustain_protected_note_ids_this_pass: set[str] = set()
 
     for region in audio_regions:
         overlap = 0.0
@@ -808,6 +811,7 @@ def repair_activity(
                 action_counter += 1
                 extend_count += 1
                 extended_note_ids_this_pass.add(prev_note.note_id)
+                extended_old_end_by_note.setdefault(prev_note.note_id, []).append(old_end)
                 continue
 
         if next_note is not None and region.start_sec < next_note.refined_start_sec:
@@ -1130,6 +1134,7 @@ def repair_activity(
                     )
                 )
                 action_counter += 1
+                sustain_protected_note_ids_this_pass.add(note.note_id)
                 continue
 
             if pitch_protect:
@@ -1345,11 +1350,24 @@ def repair_activity(
             suppressed_conflict_action_count += 1
             continue
 
-        if note.note_id in extended_note_ids_this_pass and (is_bass_layer and not strong_pitch):
+        suppression_details: list[str] = []
+        if is_bass_layer and note.note_id in extended_note_ids_this_pass:
+            suppression_details.append("bass_same_pass_extend")
+
+        old_ends = extended_old_end_by_note.get(note.note_id, [])
+        if any(abs(split_sec - old_end) <= undo_extension_split_tolerance_sec for old_end in old_ends):
+            suppression_details.append("undoes_extension")
+
+        if is_bass_layer and note.note_id in sustain_protected_note_ids_this_pass:
+            suppression_details.append("sustain_protected")
+
+        if suppression_details:
+            detail = ",".join(dict.fromkeys(suppression_details))
             warnings.append(
                 "conflict-suppressed action: "
                 f"SPLIT_NOTE target={note.note_id} reason=extend_split_conflict "
-                f"pitch_change={pitch_change:.3f}"
+                f"detail={detail} split_sec={split_sec:.6f} pitch_change={pitch_change:.3f} "
+                f"strong_independent_pitch_change={strong_pitch}"
             )
             conflict_resolved_count += 1
             suppressed_conflict_action_count += 1
