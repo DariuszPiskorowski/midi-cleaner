@@ -119,6 +119,22 @@
 - Keep Milestone 11/12 behavior intact when repair is disabled or not applicable.
 - Expand QA artifacts with activity-repair summary metrics and per-note repair columns.
 
+## Milestone 13B - Bass Pitch Contour and Sustain-Aware Repair Guards
+- Add `midi-cleaner pitch bass-contour` to compute bass pitch contour evidence from WAV audio.
+- Support pitch backend selection `auto|librosa|basic` with deterministic fallback behavior.
+- Integrate optional pitch contour stage into `pipeline process-stem` after DSP stage.
+- Add permissive and strict pitch contour behavior in process-stem (`--require-pitch-contour`).
+- Export contour artifacts:
+	- `analysis/bass_pitch_contour.json`
+	- `analysis/bass_pitch_contour_report.json`
+- Update activity repair shortening logic to protect sustained/legato bass:
+	- low-band/harmonic sustain guard
+	- pitch contour voiced continuation guard
+	- legato neighbor continuity guard
+- Keep overhang shortening conservative and route uncertain cases to `REVIEW_MANUAL`.
+- Add pitch contour evidence for split/insert confidence (without treating contour as final truth).
+- Keep Milestone 11, 12, and 13A behavior intact when pitch contour is disabled or unavailable.
+- Expand QA artifacts with sustain/pitch/legato protection counters and shorten decision metrics.
+
 ## Future Milestones (Planned)
-- Milestone 13B: add f0/pitch tracking-assisted repair decisions.
 - Milestone 13C: add render-back audio comparison for post-export verification.

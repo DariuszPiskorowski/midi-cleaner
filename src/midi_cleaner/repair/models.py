@@ -35,6 +35,7 @@ class ActivityRepairPlan(BaseModel):
     refined_notes_file: str
     audio_features_file: str
     dsp_features_file: str | None
+    pitch_contour_file: str | None
     cleanup_plan_file: str
     layer: str
     actions: list[RepairAction]
@@ -44,6 +45,7 @@ class ActivityRepairReport(BaseModel):
     refined_notes_file: str
     audio_features_file: str
     dsp_features_file: str | None
+    pitch_contour_file: str | None
     cleanup_plan_file: str
     status: Literal["ok", "error"]
     layer: str
@@ -56,6 +58,12 @@ class ActivityRepairReport(BaseModel):
     close_gap_count: int
     review_manual_count: int
     keep_count: int
+    sustain_protected_count: int
+    pitch_protected_count: int
+    legato_protected_count: int
+    shorten_candidate_count: int
+    shorten_applied_count: int
+    shorten_rejected_count: int
     audio_active_region_count: int
     midi_active_region_count: int
     audio_gap_count: int

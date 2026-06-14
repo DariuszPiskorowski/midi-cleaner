@@ -431,6 +431,12 @@ def _write_html(
             <tr><th>repair_split_count</th><td>{summary.repair_split_count}</td></tr>
             <tr><th>repair_close_gap_count</th><td>{summary.repair_close_gap_count}</td></tr>
             <tr><th>repair_review_manual_count</th><td>{summary.repair_review_manual_count}</td></tr>
+            <tr><th>repair_sustain_protected_count</th><td>{summary.repair_sustain_protected_count}</td></tr>
+            <tr><th>repair_pitch_protected_count</th><td>{summary.repair_pitch_protected_count}</td></tr>
+            <tr><th>repair_legato_protected_count</th><td>{summary.repair_legato_protected_count}</td></tr>
+            <tr><th>repair_shorten_candidate_count</th><td>{summary.repair_shorten_candidate_count}</td></tr>
+            <tr><th>repair_shorten_applied_count</th><td>{summary.repair_shorten_applied_count}</td></tr>
+            <tr><th>repair_shorten_rejected_count</th><td>{summary.repair_shorten_rejected_count}</td></tr>
             <tr><th>audio_active_region_count</th><td>{summary.audio_active_region_count}</td></tr>
             <tr><th>midi_active_region_count</th><td>{summary.midi_active_region_count}</td></tr>
             <tr><th>audio_gap_count</th><td>{summary.audio_gap_count}</td></tr>
@@ -574,6 +580,12 @@ def generate_qa_report(
     repair_split_count = 0
     repair_close_gap_count = 0
     repair_review_manual_count = 0
+    repair_sustain_protected_count = 0
+    repair_pitch_protected_count = 0
+    repair_legato_protected_count = 0
+    repair_shorten_candidate_count = 0
+    repair_shorten_applied_count = 0
+    repair_shorten_rejected_count = 0
     audio_active_region_count = 0
     midi_active_region_count = 0
     audio_gap_count = 0
@@ -645,6 +657,12 @@ def generate_qa_report(
         repair_split_count = int(activity_repair_report.split_count)
         repair_close_gap_count = int(activity_repair_report.close_gap_count)
         repair_review_manual_count = int(activity_repair_report.review_manual_count)
+        repair_sustain_protected_count = int(activity_repair_report.sustain_protected_count)
+        repair_pitch_protected_count = int(activity_repair_report.pitch_protected_count)
+        repair_legato_protected_count = int(activity_repair_report.legato_protected_count)
+        repair_shorten_candidate_count = int(activity_repair_report.shorten_candidate_count)
+        repair_shorten_applied_count = int(activity_repair_report.shorten_applied_count)
+        repair_shorten_rejected_count = int(activity_repair_report.shorten_rejected_count)
         audio_active_region_count = int(activity_repair_report.audio_active_region_count)
         midi_active_region_count = int(activity_repair_report.midi_active_region_count)
         audio_gap_count = int(activity_repair_report.audio_gap_count)
@@ -866,6 +884,12 @@ def generate_qa_report(
         repair_split_count=repair_split_count,
         repair_close_gap_count=repair_close_gap_count,
         repair_review_manual_count=repair_review_manual_count,
+        repair_sustain_protected_count=repair_sustain_protected_count,
+        repair_pitch_protected_count=repair_pitch_protected_count,
+        repair_legato_protected_count=repair_legato_protected_count,
+        repair_shorten_candidate_count=repair_shorten_candidate_count,
+        repair_shorten_applied_count=repair_shorten_applied_count,
+        repair_shorten_rejected_count=repair_shorten_rejected_count,
         audio_active_region_count=audio_active_region_count,
         midi_active_region_count=midi_active_region_count,
         audio_gap_count=audio_gap_count,

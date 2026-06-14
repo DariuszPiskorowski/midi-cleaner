@@ -94,6 +94,12 @@ class QASummary(BaseModel):
     repair_split_count: int = 0
     repair_close_gap_count: int = 0
     repair_review_manual_count: int = 0
+    repair_sustain_protected_count: int = 0
+    repair_pitch_protected_count: int = 0
+    repair_legato_protected_count: int = 0
+    repair_shorten_candidate_count: int = 0
+    repair_shorten_applied_count: int = 0
+    repair_shorten_rejected_count: int = 0
     audio_active_region_count: int = 0
     midi_active_region_count: int = 0
     audio_gap_count: int = 0

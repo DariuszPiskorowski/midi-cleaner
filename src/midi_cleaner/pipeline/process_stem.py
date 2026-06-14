@@ -24,6 +24,11 @@ from midi_cleaner.cleanup.planner import CleanupPlannerParameters, build_cleanup
 from midi_cleaner.dsp.analyzer import DspAnalysisError, analyze_dsp_stem
 from midi_cleaner.midi.importer import import_midi_candidate
 from midi_cleaner.pipeline.models import PipelineReport, PipelineStageReport
+from midi_cleaner.pitch.bass_contour import (
+    PitchContourError,
+    PitchContourParameters,
+    analyze_bass_pitch_contour,
+)
 from midi_cleaner.repair.activity import (
     ActivityRepairParameters,
     repair_activity,
@@ -77,6 +82,12 @@ class PipelineProcessParameters:
     require_dsp_analysis: bool = False
     dsp_backend: str = "auto"
     dsp_debug_csv: bool = True
+    enable_pitch_contour: bool = True
+    require_pitch_contour: bool = False
+    pitch_backend: str = "auto"
+    pitch_min_hz: float = 35.0
+    pitch_max_hz: float = 400.0
+    pitch_confidence_threshold: float = 0.60
     enable_activity_repair: bool = True
     audio_active_threshold_ratio: float = 0.18
     audio_silence_hold_ms: float = 120.0
@@ -86,6 +97,8 @@ class PipelineProcessParameters:
     close_gap_ms: float = 50.0
     insert_auto_confidence: float = 0.80
     split_auto_confidence: float = 0.75
+    split_pitch_change_semitones: float = 0.75
+    insert_from_pitch_contour_confidence: float = 0.75
 
 
 def _write_json(path: Path, payload: BaseModel | dict[str, object]) -> None:
@@ -253,6 +266,16 @@ def process_stem_pipeline(
                     "dsp_debug_csv": params.dsp_debug_csv,
                     "dsp_features_file": str(analysis_dir / "audio_features_dsp.json"),
                 },
+                "pitch_contour": {
+                    "enable_pitch_contour": params.enable_pitch_contour,
+                    "require_pitch_contour": params.require_pitch_contour,
+                    "pitch_backend": params.pitch_backend,
+                    "pitch_min_hz": params.pitch_min_hz,
+                    "pitch_max_hz": params.pitch_max_hz,
+                    "pitch_confidence_threshold": params.pitch_confidence_threshold,
+                    "pitch_contour_file": str(analysis_dir / "bass_pitch_contour.json"),
+                    "pitch_contour_report_file": str(analysis_dir / "bass_pitch_contour_report.json"),
+                },
                 "refinement": {
                     "enable_bass_refinement": params.enable_bass_refinement,
                     "attack_lookback_ms": params.attack_lookback_ms,
@@ -271,10 +294,21 @@ def process_stem_pipeline(
                     "audio_silence_hold_ms": params.audio_silence_hold_ms,
                     "missing_gap_min_ms": params.missing_gap_min_ms,
                     "overhang_min_ms": params.overhang_min_ms,
+                    "tail_padding_ms": 90.0,
+                    "minimum_repaired_note_duration_ms": 100.0,
+                    "sustain_protect_ratio": 0.16,
+                    "sustain_protect_hold_ms": 180.0,
+                    "pitch_sustain_hold_ms": 160.0,
+                    "legato_neighbor_window_ms": 220.0,
+                    "legato_min_silence_ms": 100.0,
+                    "split_pitch_change_semitones": 0.75,
+                    "insert_from_pitch_contour_confidence": 0.75,
                     "split_min_note_duration_ms": params.split_min_note_duration_ms,
                     "close_gap_ms": params.close_gap_ms,
                     "insert_auto_confidence": params.insert_auto_confidence,
                     "split_auto_confidence": params.split_auto_confidence,
+                    "split_pitch_change_semitones": params.split_pitch_change_semitones,
+                    "insert_from_pitch_contour_confidence": params.insert_from_pitch_contour_confidence,
                     "repaired_refined_notes_file": str(
                         analysis_dir / "repaired_refined_note_events.json"
                     ),
@@ -303,6 +337,7 @@ def process_stem_pipeline(
     warnings: list[str] = []
     current_stage = "initialization"
     dsp_features_path: Path | None = None
+    pitch_contour_path: Path | None = None
     repaired_refined_note_events_path: Path | None = None
     activity_repair_plan_path: Path | None = None
     activity_repair_report_path: Path | None = None
@@ -313,6 +348,12 @@ def process_stem_pipeline(
         "split_count": 0,
         "close_gap_count": 0,
         "review_manual_count": 0,
+        "sustain_protected_count": 0,
+        "pitch_protected_count": 0,
+        "legato_protected_count": 0,
+        "shorten_candidate_count": 0,
+        "shorten_applied_count": 0,
+        "shorten_rejected_count": 0,
     }
 
     try:
@@ -425,7 +466,68 @@ def process_stem_pipeline(
                 )
             )
 
-        # Stage 4: Audio-time note alignment
+        # Stage 4: Bass pitch contour analysis (optional, with graceful fallback)
+        current_stage = "pitch_contour"
+        pitch_contour_file = analysis_dir / "bass_pitch_contour.json"
+        pitch_contour_report_file = analysis_dir / "bass_pitch_contour_report.json"
+        pitch_enabled = params.enable_pitch_contour and layer.lower() == "bass"
+
+        if pitch_enabled:
+            try:
+                pitch_document, pitch_report = analyze_bass_pitch_contour(
+                    wav_file=input_wav,
+                    layer=layer,
+                    params=PitchContourParameters(
+                        backend=params.pitch_backend,
+                        min_hz=params.pitch_min_hz,
+                        max_hz=params.pitch_max_hz,
+                        confidence_threshold=params.pitch_confidence_threshold,
+                    ),
+                )
+            except PitchContourError as exc:
+                if params.require_pitch_contour:
+                    raise
+                pitch_contour_path = None
+                warnings.append(f"pitch_contour: {exc}")
+                stages.append(
+                    PipelineStageReport(
+                        name="pitch_contour",
+                        status="ok",
+                        output_files=[],
+                        warning_count=1,
+                        warnings=[str(exc)],
+                    )
+                )
+            else:
+                pitch_report.output_file = str(pitch_contour_file)
+                _write_json(pitch_contour_file, pitch_document)
+                _write_json(pitch_contour_report_file, pitch_report)
+                pitch_contour_path = pitch_contour_file
+                output_files["bass_pitch_contour"] = str(pitch_contour_file)
+                output_files["bass_pitch_contour_report"] = str(pitch_contour_report_file)
+                stages.append(
+                    PipelineStageReport(
+                        name="pitch_contour",
+                        status="ok",
+                        output_files=[str(pitch_contour_file), str(pitch_contour_report_file)],
+                        warning_count=pitch_report.warning_count,
+                        warnings=pitch_report.warnings,
+                    )
+                )
+                warnings.extend([f"pitch_contour: {item}" for item in pitch_report.warnings])
+        else:
+            pitch_contour_path = None
+            stages.append(
+                PipelineStageReport(
+                    name="pitch_contour",
+                    status="ok",
+                    output_files=[],
+                    warning_count=0,
+                    warnings=[],
+                )
+            )
+
+        # Stage 5: Audio-time note alignment
         current_stage = "audio_time_alignment"
         audio_aligned_note_events_path = analysis_dir / "audio_aligned_note_events.json"
         audio_alignment_report_path = analysis_dir / "audio_alignment_report.json"
@@ -460,7 +562,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"audio_time_alignment: {item}" for item in alignment_report.warnings])
 
-        # Stage 5: MIDI-vs-audio validation
+        # Stage 6: MIDI-vs-audio validation
         current_stage = "midi_audio_validation"
         note_validation_path = analysis_dir / "note_validation.json"
         midi_audio_validation_report_path = analysis_dir / "midi_audio_validation_report.json"
@@ -497,7 +599,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"midi_audio_validation: {item}" for item in validation_report.warnings])
 
-        # Stage 6: Bass refinement (or passthrough for non-bass/disabled)
+        # Stage 7: Bass refinement (or passthrough for non-bass/disabled)
         current_stage = "bass_refinement"
         refined_note_events_path = analysis_dir / "refined_note_events.json"
         bass_refinement_report_path = analysis_dir / "bass_refinement_report.json"
@@ -569,7 +671,7 @@ def process_stem_pipeline(
         _write_json(cleanup_plan_path, cleanup_document)
         _write_json(cleanup_plan_report_path, cleanup_report)
 
-        # Stage 7: Activity repair
+        # Stage 8: Activity repair
         current_stage = "activity_repair"
         repaired_refined_note_events_path = analysis_dir / "repaired_refined_note_events.json"
         activity_repair_plan_path = analysis_dir / "activity_repair_plan.json"
@@ -590,8 +692,11 @@ def process_stem_pipeline(
                     close_gap_ms=params.close_gap_ms,
                     insert_auto_confidence=params.insert_auto_confidence,
                     split_auto_confidence=params.split_auto_confidence,
+                    split_pitch_change_semitones=params.split_pitch_change_semitones,
+                    insert_from_pitch_contour_confidence=params.insert_from_pitch_contour_confidence,
                 ),
                 dsp_features_file=dsp_features_path,
+                pitch_contour_file=pitch_contour_path,
             )
             repair_report.output_file = str(repaired_refined_note_events_path)
             repair_report.plan_file = str(activity_repair_plan_path)
@@ -610,6 +715,12 @@ def process_stem_pipeline(
                 "split_count": repair_report.split_count,
                 "close_gap_count": repair_report.close_gap_count,
                 "review_manual_count": repair_report.review_manual_count,
+                "sustain_protected_count": repair_report.sustain_protected_count,
+                "pitch_protected_count": repair_report.pitch_protected_count,
+                "legato_protected_count": repair_report.legato_protected_count,
+                "shorten_candidate_count": repair_report.shorten_candidate_count,
+                "shorten_applied_count": repair_report.shorten_applied_count,
+                "shorten_rejected_count": repair_report.shorten_rejected_count,
             }
 
             stages.append(
@@ -640,7 +751,7 @@ def process_stem_pipeline(
                 )
             )
 
-        # Stage 8: Cleanup planning
+        # Stage 9: Cleanup planning
         current_stage = "cleanup_plan"
         output_files["cleanup_plan"] = str(cleanup_plan_path)
         output_files["cleanup_plan_report"] = str(cleanup_plan_report_path)
@@ -655,7 +766,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"cleanup_plan: {item}" for item in cleanup_report.warnings])
 
-        # Stage 9: Review MIDI export (backward compatible)
+        # Stage 10: Review MIDI export (backward compatible)
         current_stage = "review_midi_export"
         review_export_report_path = review_midi_dir / "export_report.json"
         review_export_report = export_review_midi(
@@ -685,7 +796,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"review_midi_export: {item}" for item in review_export_report.warnings])
 
-        # Stage 9: Cleaned MIDI export (backward compatible)
+        # Stage 11: Cleaned MIDI export (backward compatible)
         current_stage = "cleaned_midi_export"
         cleaned_export_report_path = cleaned_midi_dir / "cleaned_export_report.json"
         cleaned_export_report = export_cleaned_midi(
@@ -716,7 +827,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"cleaned_midi_export: {item}" for item in cleaned_export_report.warnings])
 
-        # Stage 10: Working MIDI export
+        # Stage 12: Working MIDI export
         current_stage = "working_midi_export"
         working_export_report_path = working_midi_dir / "working_export_report.json"
         working_refined_notes_file = (

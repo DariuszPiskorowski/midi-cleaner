@@ -47,6 +47,11 @@ from midi_cleaner.pipeline.qa_report import (
     QAReportParameters,
     generate_qa_report,
 )
+from midi_cleaner.pitch.bass_contour import (
+    PitchContourError,
+    PitchContourParameters,
+    analyze_bass_pitch_contour,
+)
 from midi_cleaner.repair.activity import (
     ActivityRepairError,
     ActivityRepairParameters,
@@ -72,6 +77,7 @@ validate_app = typer.Typer(help="MIDI-vs-audio validation tools.")
 cleanup_app = typer.Typer(help="Non-destructive MIDI cleanup planning tools.")
 refine_app = typer.Typer(help="MIDI timing quality refinement tools.")
 repair_app = typer.Typer(help="Audio/MIDI activity repair tools.")
+pitch_app = typer.Typer(help="Bass pitch contour analysis tools.")
 pipeline_app = typer.Typer(help="End-to-end pipeline tools.")
 console = Console()
 
@@ -81,6 +87,7 @@ app.add_typer(validate_app, name="validate")
 app.add_typer(cleanup_app, name="cleanup")
 app.add_typer(refine_app, name="refine")
 app.add_typer(repair_app, name="repair")
+app.add_typer(pitch_app, name="pitch")
 app.add_typer(pipeline_app, name="pipeline")
 
 
@@ -740,16 +747,26 @@ def repair_activity_command(
         "--dsp-features",
         help="Optional path to audio_features_dsp.json.",
     ),
+    pitch_contour: Path | None = typer.Option(
+        None,
+        "--pitch-contour",
+        help="Optional path to bass_pitch_contour.json.",
+    ),
     audio_active_threshold_ratio: float = typer.Option(
         0.18, "--audio-active-threshold-ratio"
     ),
     audio_silence_hold_ms: float = typer.Option(120.0, "--audio-silence-hold-ms"),
     missing_gap_min_ms: float = typer.Option(80.0, "--missing-gap-min-ms"),
-    overhang_min_ms: float = typer.Option(120.0, "--overhang-min-ms"),
+    overhang_min_ms: float = typer.Option(220.0, "--overhang-min-ms"),
     split_min_note_duration_ms: float = typer.Option(500.0, "--split-min-note-duration-ms"),
     close_gap_ms: float = typer.Option(50.0, "--close-gap-ms"),
     insert_auto_confidence: float = typer.Option(0.80, "--insert-auto-confidence"),
     split_auto_confidence: float = typer.Option(0.75, "--split-auto-confidence"),
+    split_pitch_change_semitones: float = typer.Option(0.75, "--split-pitch-change-semitones"),
+    insert_from_pitch_contour_confidence: float = typer.Option(
+        0.75,
+        "--insert-from-pitch-contour-confidence",
+    ),
 ) -> None:
     params = ActivityRepairParameters(
         audio_active_threshold_ratio=audio_active_threshold_ratio,
@@ -760,6 +777,8 @@ def repair_activity_command(
         close_gap_ms=close_gap_ms,
         insert_auto_confidence=insert_auto_confidence,
         split_auto_confidence=split_auto_confidence,
+        split_pitch_change_semitones=split_pitch_change_semitones,
+        insert_from_pitch_contour_confidence=insert_from_pitch_contour_confidence,
     )
 
     try:
@@ -769,6 +788,7 @@ def repair_activity_command(
             cleanup_plan_file=cleanup_plan,
             params=params,
             dsp_features_file=dsp_features,
+            pitch_contour_file=pitch_contour,
         )
     except ActivityRepairError as exc:
         typer.echo(f"Activity repair failed: {exc}", err=True)
@@ -795,6 +815,50 @@ def repair_activity_command(
         f"split={repair_report.split_count}, "
         f"review={repair_report.review_manual_count}, "
         f"warnings={repair_report.warning_count}"
+    )
+
+
+@pitch_app.command("bass-contour")
+def pitch_bass_contour_command(
+    wav: Path = typer.Option(..., "--wav", help="Path to input WAV stem file."),
+    layer: str = typer.Option(..., "--layer", help="Logical instrument layer, e.g. bass."),
+    output: Path = typer.Option(..., "--output", help="Output path for bass contour JSON."),
+    report: Path = typer.Option(..., "--report", help="Output path for bass contour report JSON."),
+    backend: str = typer.Option("auto", "--pitch-backend", help="Pitch backend: auto|librosa|basic."),
+    pitch_min_hz: float = typer.Option(35.0, "--pitch-min-hz"),
+    pitch_max_hz: float = typer.Option(400.0, "--pitch-max-hz"),
+    pitch_confidence_threshold: float = typer.Option(0.60, "--pitch-confidence-threshold"),
+) -> None:
+    params = PitchContourParameters(
+        backend=backend,
+        min_hz=pitch_min_hz,
+        max_hz=pitch_max_hz,
+        confidence_threshold=pitch_confidence_threshold,
+    )
+
+    try:
+        document, contour_report = analyze_bass_pitch_contour(
+            wav_file=wav,
+            layer=layer,
+            params=params,
+        )
+    except PitchContourError as exc:
+        typer.echo(f"Bass contour analysis failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    report.parent.mkdir(parents=True, exist_ok=True)
+
+    output.write_text(document.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    contour_report.output_file = str(output)
+    report.write_text(contour_report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    typer.echo(
+        "Bass pitch contour complete: "
+        f"backend={contour_report.backend_name}, "
+        f"frames={contour_report.frame_count}, "
+        f"voiced={contour_report.voiced_frame_count}, "
+        f"warnings={contour_report.warning_count}"
     )
 
 
@@ -879,6 +943,22 @@ def process_stem_command(
         True,
         "--dsp-debug-csv/--no-dsp-debug-csv",
     ),
+    enable_pitch_contour: bool = typer.Option(
+        True,
+        "--enable-pitch-contour/--no-enable-pitch-contour",
+    ),
+    require_pitch_contour: bool = typer.Option(
+        False,
+        "--require-pitch-contour/--no-require-pitch-contour",
+    ),
+    pitch_backend: str = typer.Option(
+        "auto",
+        "--pitch-backend",
+        help="Pitch backend: auto|librosa|basic.",
+    ),
+    pitch_min_hz: float = typer.Option(35.0, "--pitch-min-hz"),
+    pitch_max_hz: float = typer.Option(400.0, "--pitch-max-hz"),
+    pitch_confidence_threshold: float = typer.Option(0.60, "--pitch-confidence-threshold"),
     enable_activity_repair: bool = typer.Option(
         True,
         "--enable-activity-repair/--no-enable-activity-repair",
@@ -889,11 +969,16 @@ def process_stem_command(
     ),
     audio_silence_hold_ms: float = typer.Option(120.0, "--audio-silence-hold-ms"),
     missing_gap_min_ms: float = typer.Option(80.0, "--missing-gap-min-ms"),
-    overhang_min_ms: float = typer.Option(120.0, "--overhang-min-ms"),
+    overhang_min_ms: float = typer.Option(220.0, "--overhang-min-ms"),
     split_min_note_duration_ms: float = typer.Option(500.0, "--split-min-note-duration-ms"),
     close_gap_ms: float = typer.Option(50.0, "--close-gap-ms"),
     insert_auto_confidence: float = typer.Option(0.80, "--insert-auto-confidence"),
     split_auto_confidence: float = typer.Option(0.75, "--split-auto-confidence"),
+    split_pitch_change_semitones: float = typer.Option(0.75, "--split-pitch-change-semitones"),
+    insert_from_pitch_contour_confidence: float = typer.Option(
+        0.75,
+        "--insert-from-pitch-contour-confidence",
+    ),
 ) -> None:
     params = PipelineProcessParameters(
         onset_window_ms=onset_window_ms,
@@ -933,6 +1018,12 @@ def process_stem_command(
         require_dsp_analysis=require_dsp_analysis,
         dsp_backend=dsp_backend,
         dsp_debug_csv=dsp_debug_csv,
+        enable_pitch_contour=enable_pitch_contour,
+        require_pitch_contour=require_pitch_contour,
+        pitch_backend=pitch_backend,
+        pitch_min_hz=pitch_min_hz,
+        pitch_max_hz=pitch_max_hz,
+        pitch_confidence_threshold=pitch_confidence_threshold,
         enable_activity_repair=enable_activity_repair,
         audio_active_threshold_ratio=audio_active_threshold_ratio,
         audio_silence_hold_ms=audio_silence_hold_ms,
@@ -942,6 +1033,8 @@ def process_stem_command(
         close_gap_ms=close_gap_ms,
         insert_auto_confidence=insert_auto_confidence,
         split_auto_confidence=split_auto_confidence,
+        split_pitch_change_semitones=split_pitch_change_semitones,
+        insert_from_pitch_contour_confidence=insert_from_pitch_contour_confidence,
     )
 
     try:

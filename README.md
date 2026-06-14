@@ -2,7 +2,7 @@
 
 Hermes MIDI Fidelity Engine project scaffold.
 
-This repository cleans and validates MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 13A**: audio/MIDI activity repair on top of canonical audio-time alignment, Milestone 11 refinement, and Milestone 12 DSP analysis.
+This repository cleans and validates MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 13B**: bass pitch contour analysis and sustain-aware repair guards on top of Milestones 11/12/13A.
 
 Milestone 10.1 integration and reporting hardening is now in place:
 - Validation consumes audio-aligned timing when alignment data exists.
@@ -37,13 +37,19 @@ Milestone 13A activity repair is now in place:
 - Working export prefers repaired refined notes when activity repair is enabled.
 - QA summary/CSV/HTML include activity-repair counts and per-note repair flags.
 
+Milestone 13B sustain-aware repair guards are now in place:
+- New additive pitch analysis command: `pitch bass-contour`.
+- Process-stem can run pitch contour stage after DSP and before refinement/repair.
+- Activity repair now applies conservative shorten guards for sustained low-band/harmonic energy, voiced pitch continuation, and legato transitions.
+- Pitch contour is used as repair evidence, not treated as final truth.
+- Overhang shortening is conservative and uncertainty is routed to `REVIEW_MANUAL`.
+
 Future Milestone 13 work remains planned:
-- Milestone 13B: f0/pitch tracking-assisted repair.
 - Milestone 13C: render-back audio comparison.
 
 ## Current Milestone
 
-Milestone 13A currently implements:
+Milestone 13B currently implements:
 - Python package scaffold
 - Strict Python 3.11 guard
 - Runtime/environment report via CLI doctor command
@@ -59,9 +65,12 @@ Milestone 13A currently implements:
 - Conservative cleaned/review/rejected MIDI export from cleanup plan
 - One-command process-stem pipeline that orchestrates existing stages
 - Optional DSP stage in process-stem with fallback/strict controls
+- Optional pitch contour stage in process-stem with fallback/strict controls
 - Activity-repair stage between bass refinement and working export
 - Repair plan/report artifacts and repaired refined note output
 - Activity-repair CLI command and process-stem repair controls
+- Bass pitch contour CLI command and contour/report artifacts
+- Sustain-aware repair guards to protect long sustained/legato bass from aggressive shortening
 - Working export preference for repaired refined notes
 - Static QA artifacts: qa_summary.json, qa_notes.csv, qa_report.html
 - Audio-time canonical note alignment into analysis/audio_aligned_note_events.json
@@ -79,6 +88,7 @@ Milestone 13A currently implements:
 - QA report includes refinement summary metrics and per-note refinement columns
 - QA report includes DSP backend/frame classification summary metrics
 - QA report includes activity-repair summary fields and per-note repair columns
+- QA report includes sustain/pitch/legato protection and shorten decision counters
 - Tests for guard behavior, MIDI import, audio analysis, validation, cleanup planning, review MIDI export, cleaned MIDI export, process-stem pipeline, and QA reports
 
 Destructive note deletion, rendering, UI, and ML are not implemented yet.
@@ -164,6 +174,18 @@ Example:
 uv run midi-cleaner audio analyze-dsp --wav .\stem.wav --layer bass --output .\artifacts\audio_features_dsp.json --report .\artifacts\audio_analysis_dsp_report.json --backend auto --debug-csv .\artifacts\audio_features_dsp_debug.csv
 ```
 
+## Bass Pitch Contour Analysis
+
+```powershell
+uv run midi-cleaner pitch bass-contour --wav INPUT_WAV --layer bass --output BASS_PITCH_CONTOUR_JSON --report BASS_PITCH_CONTOUR_REPORT_JSON --pitch-backend auto
+```
+
+Example:
+
+```powershell
+uv run midi-cleaner pitch bass-contour --wav .\stem.wav --layer bass --output .\artifacts\bass_pitch_contour.json --report .\artifacts\bass_pitch_contour_report.json --pitch-backend auto --pitch-min-hz 35 --pitch-max-hz 400 --pitch-confidence-threshold 0.60
+```
+
 ## MIDI-vs-Audio Validation
 
 ```powershell
@@ -216,6 +238,12 @@ Optional DSP feature input:
 
 ```powershell
 uv run midi-cleaner repair activity --refined-notes REFINED_NOTE_EVENTS_JSON --audio-features AUDIO_FEATURES_JSON --dsp-features AUDIO_FEATURES_DSP_JSON --cleanup-plan CLEANUP_PLAN_JSON --output REPAIRED_REFINED_NOTE_EVENTS_JSON --plan ACTIVITY_REPAIR_PLAN_JSON --report ACTIVITY_REPAIR_REPORT_JSON
+```
+
+Optional pitch contour input:
+
+```powershell
+uv run midi-cleaner repair activity --refined-notes REFINED_NOTE_EVENTS_JSON --audio-features AUDIO_FEATURES_JSON --pitch-contour BASS_PITCH_CONTOUR_JSON --cleanup-plan CLEANUP_PLAN_JSON --output REPAIRED_REFINED_NOTE_EVENTS_JSON --plan ACTIVITY_REPAIR_PLAN_JSON --report ACTIVITY_REPAIR_REPORT_JSON
 ```
 
 Example:
@@ -302,16 +330,26 @@ DSP controls (defaults shown):
 - `--dsp-backend auto|librosa|scipy|basic` (default `auto`)
 - `--dsp-debug-csv/--no-dsp-debug-csv` (default enabled)
 
+Pitch contour controls (defaults shown):
+- `--enable-pitch-contour/--no-enable-pitch-contour` (default enabled for bass)
+- `--require-pitch-contour/--no-require-pitch-contour` (default permissive)
+- `--pitch-backend auto|librosa|basic` (default `auto`)
+- `--pitch-min-hz` (default `35`)
+- `--pitch-max-hz` (default `400`)
+- `--pitch-confidence-threshold` (default `0.60`)
+
 Activity repair controls (defaults shown):
 - `--enable-activity-repair/--no-enable-activity-repair` (default enabled for bass)
 - `--audio-active-threshold-ratio` (default `0.18`)
 - `--audio-silence-hold-ms` (default `120`)
 - `--missing-gap-min-ms` (default `80`)
-- `--overhang-min-ms` (default `120`)
+- `--overhang-min-ms` (default `220`)
 - `--split-min-note-duration-ms` (default `500`)
 - `--close-gap-ms` (default `50`)
 - `--insert-auto-confidence` (default `0.80`)
 - `--split-auto-confidence` (default `0.75`)
+- `--split-pitch-change-semitones` (default `0.75`)
+- `--insert-from-pitch-contour-confidence` (default `0.75`)
 
 Example:
 
@@ -333,4 +371,4 @@ uv run midi-cleaner pipeline qa-report --project-dir .\artifacts\pipeline_run
 
 ## Planned Pipeline
 
-Suno/RipX stem WAV -> RipX MIDI candidate -> Hermes note-event JSON -> WAV comparison -> DSP analysis (additive) -> audio-time alignment -> validation -> bass refinement -> activity repair -> cleanup planning/exports -> working/rejected (prefers repaired refined notes) -> QA artifacts
+Suno/RipX stem WAV -> RipX MIDI candidate -> Hermes note-event JSON -> WAV comparison -> DSP analysis (additive) -> bass pitch contour (additive) -> audio-time alignment -> validation -> bass refinement -> activity repair (sustain-aware guards) -> cleanup planning/exports -> working/rejected (prefers repaired refined notes) -> QA artifacts

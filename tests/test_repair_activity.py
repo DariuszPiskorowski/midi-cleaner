@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+
 from midi_cleaner.audio.models import AudioFeatureDocument, AudioFrameFeature, AudioGlobalFeatures
 from midi_cleaner.cleanup.models import CleanupAction, CleanupPlanDocument
+from midi_cleaner.dsp.models import DspAudioFeatureDocument, DspAudioFrame
+from midi_cleaner.pitch.models import BassPitchContourDocument, BassPitchContourReport, BassPitchFrame
 from midi_cleaner.repair.activity import (
     ActivityRepairParameters,
     _ActivityFrame,
@@ -152,6 +156,149 @@ def _write_inputs(
     cleanup_path.write_text(cleanup_doc.model_dump_json(indent=2) + "\n", encoding="utf-8")
 
     return refined_path, audio_path, cleanup_path
+
+
+def _write_dsp_features(
+    tmp_path: Path,
+    duration_sec: float,
+    frame_step_sec: float,
+    low_band_fn,
+    harmonic_fn,
+    onset_fn,
+) -> Path:
+    frames: list[DspAudioFrame] = []
+    frame_count = int(duration_sec / frame_step_sec)
+    for idx in range(frame_count):
+        start = idx * frame_step_sec
+        end = start + frame_step_sec
+        low_band = float(low_band_fn(start))
+        harmonic = float(harmonic_fn(start))
+        onset = float(onset_fn(start))
+        rms = max(1e-6, low_band * 0.8)
+        frames.append(
+            DspAudioFrame(
+                frame_index=idx,
+                start_sec=start,
+                end_sec=end,
+                rms=rms,
+                rms_smooth=rms,
+                rms_delta=0.0,
+                envelope=rms,
+                envelope_smooth=rms,
+                envelope_delta=0.0,
+                low_band_rms=low_band,
+                low_band_envelope=low_band,
+                low_band_envelope_smooth=low_band,
+                low_band_delta=0.0,
+                spectral_flux=onset,
+                onset_strength=onset,
+                harmonic_rms=harmonic,
+                percussive_rms=0.0,
+                is_attack_rise=onset > 0.0,
+                is_sustain=(low_band > 0.0),
+                is_tail=False,
+                is_silence=(low_band <= 0.0),
+            )
+        )
+
+    doc = DspAudioFeatureDocument(
+        schema_version="0.1.0",
+        wav_file="stem.wav",
+        layer="bass",
+        sample_rate=44100,
+        duration_sec=duration_sec,
+        backend_name="basic",
+        backend_available=True,
+        hop_length=512,
+        frame_length=2048,
+        low_band_hz=[40.0, 500.0],
+        frames=frames,
+    )
+    path = tmp_path / "audio_features_dsp.json"
+    path.write_text(doc.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def _write_pitch_contour(
+    tmp_path: Path,
+    duration_sec: float,
+    frame_step_sec: float,
+    pitch_fn,
+    confidence_fn,
+) -> Path:
+    frames: list[BassPitchFrame] = []
+    frame_count = int(duration_sec / frame_step_sec)
+    for idx in range(frame_count):
+        start = idx * frame_step_sec
+        end = start + frame_step_sec
+        pitch = pitch_fn(start)
+        confidence = float(confidence_fn(start))
+        if pitch is None:
+            frames.append(
+                BassPitchFrame(
+                    frame_index=idx,
+                    start_sec=start,
+                    end_sec=end,
+                    f0_hz=None,
+                    pitch_midi_float=None,
+                    pitch_midi_rounded=None,
+                    pitch_confidence=confidence,
+                    voiced=False,
+                    low_band_energy=0.0,
+                    harmonic_energy=0.0,
+                )
+            )
+            continue
+
+        midi_float = 69.0 + 12.0 * np.log2(float(pitch) / 440.0)
+        frames.append(
+            BassPitchFrame(
+                frame_index=idx,
+                start_sec=start,
+                end_sec=end,
+                f0_hz=float(pitch),
+                pitch_midi_float=float(midi_float),
+                pitch_midi_rounded=int(round(midi_float)),
+                pitch_confidence=confidence,
+                voiced=confidence >= 0.6,
+                low_band_energy=0.01,
+                harmonic_energy=0.01,
+            )
+        )
+
+    doc = BassPitchContourDocument(
+        schema_version="0.1.0",
+        wav_file="stem.wav",
+        layer="bass",
+        backend_name="basic",
+        backend_available=True,
+        sample_rate=44100,
+        duration_sec=duration_sec,
+        hop_length=512,
+        frame_length=2048,
+        min_hz=35.0,
+        max_hz=400.0,
+        frames=frames,
+    )
+    _ = BassPitchContourReport(
+        wav_file="stem.wav",
+        status="ok",
+        layer="bass",
+        backend_name="basic",
+        backend_available=True,
+        frame_count=frame_count,
+        voiced_frame_count=sum(1 for f in frames if f.voiced),
+        voiced_ratio=sum(1 for f in frames if f.voiced) / max(1, frame_count),
+        mean_pitch_confidence=sum(f.pitch_confidence for f in frames) / max(1, frame_count),
+        min_detected_hz=min((f.f0_hz for f in frames if f.f0_hz is not None), default=None),
+        max_detected_hz=max((f.f0_hz for f in frames if f.f0_hz is not None), default=None),
+        warning_count=0,
+        warnings=[],
+        output_file=None,
+    )
+    path = tmp_path / "bass_pitch_contour.json"
+    path.write_text(doc.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    return path
 
 
 def test_audio_activity_regions_merge_tiny_gap() -> None:
@@ -316,7 +463,7 @@ def test_overhang_shortening_shortens_note(tmp_path: Path) -> None:
     )
 
     assert report.shorten_count >= 1
-    assert repaired.notes[0].refined_end_sec <= 0.5
+    assert repaired.notes[0].refined_end_sec <= 0.56
 
 
 def test_split_note_on_strong_internal_onset(tmp_path: Path) -> None:
@@ -402,3 +549,249 @@ def test_close_tiny_gap_for_same_pitch_notes(tmp_path: Path) -> None:
     assert report.close_gap_count >= 1
     repaired_by_id = {note.note_id: note for note in repaired.notes}
     assert repaired_by_id["n1"].refined_end_sec >= 0.43
+
+
+def test_do_not_shorten_sustained_low_band_note(tmp_path: Path) -> None:
+    audio_doc = _build_audio_document(
+        duration_sec=1.5,
+        frame_step_sec=0.01,
+        rms_fn=lambda t: 0.08 if 0.2 <= t <= 0.42 else 0.0,
+        onset_fn=lambda t: 0.0,
+    )
+    dsp_path = _write_dsp_features(
+        tmp_path,
+        duration_sec=1.5,
+        frame_step_sec=0.01,
+        low_band_fn=lambda t: 0.06 if 0.2 <= t <= 0.45 else 0.0,
+        harmonic_fn=lambda t: (0.05 if 0.2 <= t <= 0.45 else (0.03 if 0.45 < t <= 0.72 else 0.0)),
+        onset_fn=lambda t: 0.0,
+    )
+    notes = [_refined_note("n1", 45, 0.2, 0.8)]
+    refined_path, audio_path, cleanup_path = _write_inputs(
+        tmp_path,
+        notes,
+        audio_doc,
+        [_cleanup_action("n1", "KEEP")],
+    )
+
+    repaired, _plan, report = repair_activity(
+        refined_notes_file=refined_path,
+        audio_features_file=audio_path,
+        cleanup_plan_file=cleanup_path,
+        params=ActivityRepairParameters(audio_silence_hold_ms=0.0),
+        dsp_features_file=dsp_path,
+    )
+
+    assert report.shorten_count == 0
+    assert report.sustain_protected_count >= 1
+    assert repaired.notes[0].refined_end_sec >= 0.75
+
+
+def test_do_not_shorten_voiced_pitch_contour(tmp_path: Path) -> None:
+    audio_doc = _build_audio_document(
+        duration_sec=1.5,
+        frame_step_sec=0.01,
+        rms_fn=lambda t: 0.08 if 0.2 <= t <= 0.42 else 0.0,
+        onset_fn=lambda t: 0.0,
+    )
+    pitch_path = _write_pitch_contour(
+        tmp_path,
+        duration_sec=1.5,
+        frame_step_sec=0.01,
+        pitch_fn=lambda t: 55.0 if 0.2 <= t <= 0.76 else None,
+        confidence_fn=lambda t: 0.9 if 0.2 <= t <= 0.76 else 0.0,
+    )
+    notes = [_refined_note("n1", 45, 0.2, 0.8)]
+    refined_path, audio_path, cleanup_path = _write_inputs(
+        tmp_path,
+        notes,
+        audio_doc,
+        [_cleanup_action("n1", "KEEP")],
+    )
+
+    repaired, _plan, report = repair_activity(
+        refined_notes_file=refined_path,
+        audio_features_file=audio_path,
+        cleanup_plan_file=cleanup_path,
+        params=ActivityRepairParameters(audio_silence_hold_ms=0.0),
+        pitch_contour_file=pitch_path,
+    )
+
+    assert report.shorten_count == 0
+    assert report.pitch_protected_count >= 1
+    assert repaired.notes[0].refined_end_sec >= 0.75
+
+
+def test_shorten_true_overhang_when_unvoiced_and_no_sustain(tmp_path: Path) -> None:
+    audio_doc = _build_audio_document(
+        duration_sec=1.5,
+        frame_step_sec=0.01,
+        rms_fn=lambda t: 0.08 if 0.2 <= t <= 0.42 else 0.0,
+        onset_fn=lambda t: 0.0,
+    )
+    dsp_path = _write_dsp_features(
+        tmp_path,
+        duration_sec=1.5,
+        frame_step_sec=0.01,
+        low_band_fn=lambda t: 0.06 if 0.2 <= t <= 0.42 else 0.0,
+        harmonic_fn=lambda t: 0.04 if 0.2 <= t <= 0.42 else 0.0,
+        onset_fn=lambda t: 0.0,
+    )
+    pitch_path = _write_pitch_contour(
+        tmp_path,
+        duration_sec=1.5,
+        frame_step_sec=0.01,
+        pitch_fn=lambda t: 55.0 if 0.2 <= t <= 0.42 else None,
+        confidence_fn=lambda t: 0.9 if 0.2 <= t <= 0.42 else 0.0,
+    )
+    notes = [_refined_note("n1", 45, 0.2, 0.82)]
+    refined_path, audio_path, cleanup_path = _write_inputs(
+        tmp_path,
+        notes,
+        audio_doc,
+        [_cleanup_action("n1", "KEEP")],
+    )
+
+    repaired, _plan, report = repair_activity(
+        refined_notes_file=refined_path,
+        audio_features_file=audio_path,
+        cleanup_plan_file=cleanup_path,
+        params=ActivityRepairParameters(audio_silence_hold_ms=0.0),
+        dsp_features_file=dsp_path,
+        pitch_contour_file=pitch_path,
+    )
+
+    assert report.shorten_count >= 1
+    assert report.shorten_applied_count >= 1
+    assert repaired.notes[0].refined_end_sec < 0.7
+
+
+def test_legato_protection_blocks_aggressive_shorten(tmp_path: Path) -> None:
+    audio_doc = _build_audio_document(
+        duration_sec=1.8,
+        frame_step_sec=0.01,
+        rms_fn=lambda t: 0.08 if (0.2 <= t <= 0.86 or 0.88 <= t <= 1.2) else 0.0,
+        onset_fn=lambda t: 0.0,
+    )
+    notes = [
+        _refined_note("n1", 45, 0.2, 1.00),
+        _refined_note("n2", 45, 1.05, 1.2),
+    ]
+    refined_path, audio_path, cleanup_path = _write_inputs(
+        tmp_path,
+        notes,
+        audio_doc,
+        [_cleanup_action("n1", "KEEP"), _cleanup_action("n2", "KEEP")],
+    )
+
+    repaired, _plan, report = repair_activity(
+        refined_notes_file=refined_path,
+        audio_features_file=audio_path,
+        cleanup_plan_file=cleanup_path,
+        params=ActivityRepairParameters(
+            audio_silence_hold_ms=0.0,
+            merge_audio_region_gap_ms=5.0,
+            overhang_min_ms=100.0,
+        ),
+    )
+
+    assert report.legato_protected_count >= 1
+    assert report.shorten_count == 0
+    repaired_by_id = {note.note_id: note for note in repaired.notes}
+    assert repaired_by_id["n1"].refined_end_sec >= 0.95
+
+
+def test_pitch_aware_split_requires_pitch_change_evidence(tmp_path: Path) -> None:
+    audio_doc = _build_audio_document(
+        duration_sec=2.0,
+        frame_step_sec=0.01,
+        rms_fn=lambda t: 0.08 if 0.2 <= t <= 1.0 else 0.0,
+        onset_fn=lambda t: (1.0 if abs(t - 0.6) < 1e-6 else 0.02),
+    )
+    notes = [_refined_note("n1", 45, 0.2, 1.0)]
+    refined_path, audio_path, cleanup_path = _write_inputs(
+        tmp_path,
+        notes,
+        audio_doc,
+        [_cleanup_action("n1", "KEEP")],
+    )
+
+    no_change_pitch = _write_pitch_contour(
+        tmp_path,
+        duration_sec=2.0,
+        frame_step_sec=0.01,
+        pitch_fn=lambda t: 55.0 if 0.2 <= t <= 1.0 else None,
+        confidence_fn=lambda t: 0.9 if 0.2 <= t <= 1.0 else 0.0,
+    )
+    repaired_a, _plan_a, report_a = repair_activity(
+        refined_notes_file=refined_path,
+        audio_features_file=audio_path,
+        cleanup_plan_file=cleanup_path,
+        params=ActivityRepairParameters(audio_silence_hold_ms=0.0),
+        pitch_contour_file=no_change_pitch,
+    )
+    assert report_a.split_count == 0
+    assert len(repaired_a.notes) == 1
+
+    change_pitch = _write_pitch_contour(
+        tmp_path,
+        duration_sec=2.0,
+        frame_step_sec=0.01,
+        pitch_fn=lambda t: (55.0 if t < 0.6 else (62.0 if 0.6 <= t <= 1.0 else None)),
+        confidence_fn=lambda t: 0.9 if 0.2 <= t <= 1.0 else 0.0,
+    )
+    repaired_b, _plan_b, report_b = repair_activity(
+        refined_notes_file=refined_path,
+        audio_features_file=audio_path,
+        cleanup_plan_file=cleanup_path,
+        params=ActivityRepairParameters(audio_silence_hold_ms=0.0),
+        pitch_contour_file=change_pitch,
+    )
+    assert report_b.split_count >= 1
+    assert len(repaired_b.notes) >= 2
+
+
+def test_insert_missing_note_uses_pitch_contour_when_no_context(tmp_path: Path) -> None:
+    audio_doc = _build_audio_document(
+        duration_sec=2.0,
+        frame_step_sec=0.01,
+        rms_fn=lambda t: 0.08 if 0.9 <= t <= 1.0 else 0.0,
+        onset_fn=lambda t: 0.0,
+    )
+    pitch_path = _write_pitch_contour(
+        tmp_path,
+        duration_sec=2.0,
+        frame_step_sec=0.01,
+        pitch_fn=lambda t: 65.4 if 0.9 <= t <= 1.0 else None,
+        confidence_fn=lambda t: 0.95 if 0.9 <= t <= 1.0 else 0.0,
+    )
+
+    notes: list[RefinedNoteEvent] = []
+    refined_path, audio_path, cleanup_path = _write_inputs(
+        tmp_path,
+        notes,
+        audio_doc,
+        [],
+    )
+
+    # Keep one distant note in plan context so repair stage can run.
+    distant_note = _refined_note("n1", 45, 0.2, 0.3)
+    refined_path, audio_path, cleanup_path = _write_inputs(
+        tmp_path,
+        [distant_note],
+        audio_doc,
+        [_cleanup_action("n1", "KEEP")],
+    )
+
+    repaired, _plan, report = repair_activity(
+        refined_notes_file=refined_path,
+        audio_features_file=audio_path,
+        cleanup_plan_file=cleanup_path,
+        params=ActivityRepairParameters(audio_silence_hold_ms=0.0),
+        pitch_contour_file=pitch_path,
+    )
+
+    inserted = [note for note in repaired.notes if note.note_id.startswith("repair_missing_")]
+    assert report.insert_missing_count >= 1
+    assert inserted
+    assert inserted[0].pitch_midi == 36

@@ -49,6 +49,8 @@ def _expected_paths(project_dir: Path) -> list[Path]:
         project_dir / "analysis" / "audio_features_dsp.json",
         project_dir / "analysis" / "audio_analysis_dsp_report.json",
         project_dir / "analysis" / "audio_features_dsp_debug.csv",
+        project_dir / "analysis" / "bass_pitch_contour.json",
+        project_dir / "analysis" / "bass_pitch_contour_report.json",
         project_dir / "analysis" / "audio_aligned_note_events.json",
         project_dir / "analysis" / "audio_alignment_report.json",
         project_dir / "analysis" / "note_validation.json",
@@ -166,6 +168,7 @@ def test_cli_process_stem_end_to_end(tmp_path: Path) -> None:
     assert (project_dir / "reports" / "pipeline_report.json").exists()
     assert (project_dir / "analysis" / "audio_aligned_note_events.json").exists()
     assert (project_dir / "analysis" / "audio_features_dsp.json").exists()
+    assert (project_dir / "analysis" / "bass_pitch_contour.json").exists()
     assert (project_dir / "analysis" / "refined_note_events.json").exists()
     assert (project_dir / "analysis" / "repaired_refined_note_events.json").exists()
     assert (project_dir / "midi" / "review" / "export_report.json").exists()
@@ -251,3 +254,26 @@ def test_pipeline_can_disable_activity_repair(tmp_path: Path) -> None:
         (project_dir / "midi" / "working" / "working_export_report.json").read_text(encoding="utf-8")
     )
     assert working_export_report["refined_notes_file"].endswith("refined_note_events.json")
+
+
+def test_pipeline_can_disable_pitch_contour(tmp_path: Path) -> None:
+    midi_path = tmp_path / "candidate_no_pitch.mid"
+    wav_path = tmp_path / "stem_no_pitch.wav"
+    project_dir = tmp_path / "pipeline_no_pitch"
+
+    _write_candidate_midi(midi_path)
+    _write_stem_wav(wav_path)
+
+    report = process_stem_pipeline(
+        input_midi=midi_path,
+        input_wav=wav_path,
+        source="ripx",
+        layer="bass",
+        project_dir=project_dir,
+        params=PipelineProcessParameters(enable_pitch_contour=False),
+    )
+
+    assert report.status == "ok"
+    assert not (project_dir / "analysis" / "bass_pitch_contour.json").exists()
+    assert not (project_dir / "analysis" / "bass_pitch_contour_report.json").exists()
+    assert (project_dir / "analysis" / "repaired_refined_note_events.json").exists()

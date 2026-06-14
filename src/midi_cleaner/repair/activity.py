@@ -6,6 +6,7 @@ from pathlib import Path
 from midi_cleaner.audio.models import AudioFeatureDocument, AudioFrameFeature
 from midi_cleaner.cleanup.models import CleanupPlanDocument
 from midi_cleaner.dsp.models import DspAudioFeatureDocument, DspAudioFrame
+from midi_cleaner.pitch.models import BassPitchContourDocument, BassPitchFrame
 from midi_cleaner.refinement.models import RefinedNoteDocument, RefinedNoteEvent
 from midi_cleaner.repair.models import ActivityRepairPlan, ActivityRepairReport, RepairAction
 
@@ -31,9 +32,15 @@ class ActivityRepairParameters:
     max_insert_missing_ms: float = 700.0
     context_pitch_search_ms: float = 800.0
 
-    overhang_min_ms: float = 120.0
-    tail_padding_ms: float = 40.0
-    minimum_repaired_note_duration_ms: float = 70.0
+    overhang_min_ms: float = 220.0
+    tail_padding_ms: float = 90.0
+    minimum_repaired_note_duration_ms: float = 100.0
+
+    sustain_protect_ratio: float = 0.16
+    sustain_protect_hold_ms: float = 180.0
+    pitch_sustain_hold_ms: float = 160.0
+    legato_neighbor_window_ms: float = 220.0
+    legato_min_silence_ms: float = 100.0
 
     split_min_note_duration_ms: float = 500.0
     split_min_distance_from_edges_ms: float = 120.0
@@ -45,6 +52,8 @@ class ActivityRepairParameters:
 
     insert_auto_confidence: float = 0.80
     split_auto_confidence: float = 0.75
+    split_pitch_change_semitones: float = 0.75
+    insert_from_pitch_contour_confidence: float = 0.75
 
 
 @dataclass(frozen=True)
@@ -71,6 +80,13 @@ class _MidiRegion:
     start_sec: float
     end_sec: float
     note_ids: list[str]
+
+
+@dataclass(frozen=True)
+class _PitchWindowSummary:
+    voiced_ratio: float
+    mean_confidence: float
+    dominant_pitch_midi: int | None
 
 
 @dataclass
@@ -109,6 +125,13 @@ def _load_dsp_document(path: Path) -> DspAudioFeatureDocument:
         return DspAudioFeatureDocument.model_validate_json(path.read_text(encoding="utf-8"))
     except Exception as exc:  # pragma: no cover - pydantic internals vary
         raise ActivityRepairError(f"Invalid DSP features JSON: {path}") from exc
+
+
+def _load_pitch_document(path: Path) -> BassPitchContourDocument:
+    try:
+        return BassPitchContourDocument.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # pragma: no cover - pydantic internals vary
+        raise ActivityRepairError(f"Invalid bass pitch contour JSON: {path}") from exc
 
 
 def _load_refined_document(path: Path) -> RefinedNoteDocument:
@@ -413,6 +436,148 @@ def _closest_note(notes: list[_MutableNote], anchor_sec: float, search_sec: floa
     return min(candidates, key=lambda note: min(abs(note.refined_start_sec - anchor_sec), abs(note.refined_end_sec - anchor_sec)))
 
 
+def _window_signal_values(
+    signal: list[tuple[float, float]],
+    start_sec: float,
+    end_sec: float,
+) -> list[float]:
+    return [value for sec, value in signal if start_sec <= sec <= end_sec]
+
+
+def _pitch_frames_in_window(
+    pitch_frames: list[BassPitchFrame],
+    start_sec: float,
+    end_sec: float,
+) -> list[BassPitchFrame]:
+    return [frame for frame in pitch_frames if frame.start_sec <= end_sec and frame.end_sec >= start_sec]
+
+
+def _pitch_window_summary(
+    pitch_frames: list[BassPitchFrame],
+    start_sec: float,
+    end_sec: float,
+) -> _PitchWindowSummary:
+    frames = _pitch_frames_in_window(pitch_frames, start_sec, end_sec)
+    if not frames:
+        return _PitchWindowSummary(voiced_ratio=0.0, mean_confidence=0.0, dominant_pitch_midi=None)
+
+    voiced = [frame for frame in frames if frame.voiced]
+    voiced_ratio = len(voiced) / float(len(frames))
+    mean_conf = sum(frame.pitch_confidence for frame in frames) / float(len(frames))
+    pitch_counts: dict[int, int] = {}
+    for frame in voiced:
+        if frame.pitch_midi_rounded is None:
+            continue
+        pitch_counts[frame.pitch_midi_rounded] = pitch_counts.get(frame.pitch_midi_rounded, 0) + 1
+    dominant_pitch = None
+    if pitch_counts:
+        dominant_pitch = max(pitch_counts.items(), key=lambda item: item[1])[0]
+    return _PitchWindowSummary(
+        voiced_ratio=voiced_ratio,
+        mean_confidence=mean_conf,
+        dominant_pitch_midi=dominant_pitch,
+    )
+
+
+def _find_pitch_note_for_insert(
+    pitch_frames: list[BassPitchFrame],
+    start_sec: float,
+    end_sec: float,
+    min_confidence: float,
+) -> int | None:
+    candidates = _pitch_frames_in_window(pitch_frames, start_sec, end_sec)
+    if not candidates:
+        return None
+    ranked = sorted(
+        (
+            frame
+            for frame in candidates
+            if frame.voiced
+            and frame.pitch_midi_rounded is not None
+            and frame.pitch_confidence >= min_confidence
+        ),
+        key=lambda frame: frame.pitch_confidence,
+        reverse=True,
+    )
+    if not ranked:
+        return None
+    return ranked[0].pitch_midi_rounded
+
+
+def _is_legato_transition(
+    note: _MutableNote,
+    notes: list[_MutableNote],
+    audio_regions: list[_ActivityRegion],
+    params: ActivityRepairParameters,
+) -> tuple[bool, dict[str, float]]:
+    window_sec = params.legato_neighbor_window_ms / 1000.0
+    silence_need_sec = params.legato_min_silence_ms / 1000.0
+
+    next_notes = [candidate for candidate in notes if candidate.refined_start_sec >= note.refined_end_sec and candidate.note_id != note.note_id]
+    if not next_notes:
+        return False, {}
+
+    next_note = min(next_notes, key=lambda candidate: candidate.refined_start_sec)
+    gap_sec = max(0.0, next_note.refined_start_sec - note.refined_end_sec)
+    if gap_sec > window_sec:
+        return False, {"next_gap_sec": gap_sec}
+
+    overlap = any(
+        _region_overlap(note.refined_end_sec, next_note.refined_start_sec, region.start_sec, region.end_sec) > 0.0
+        for region in audio_regions
+    )
+    if overlap:
+        return True, {
+            "next_note_start_sec": next_note.refined_start_sec,
+            "next_gap_sec": gap_sec,
+            "required_silence_sec": silence_need_sec,
+        }
+
+    return gap_sec < silence_need_sec, {
+        "next_note_start_sec": next_note.refined_start_sec,
+        "next_gap_sec": gap_sec,
+        "required_silence_sec": silence_need_sec,
+    }
+
+
+def _sustain_signal_guard(
+    note: _MutableNote,
+    candidate_end: float,
+    signal: list[tuple[float, float]],
+    params: ActivityRepairParameters,
+) -> tuple[bool, float]:
+    hold_sec = params.sustain_protect_hold_ms / 1000.0
+    start = max(candidate_end, note.refined_start_sec)
+    end = max(start, min(note.refined_end_sec, candidate_end + hold_sec))
+    values = _window_signal_values(signal, start, end)
+    if not values:
+        return False, 0.0
+
+    note_values = _window_signal_values(signal, note.refined_start_sec, note.refined_end_sec)
+    if not note_values:
+        note_values = values
+    baseline = max(1e-6, max(note_values))
+    mean_after = sum(values) / float(len(values))
+    ratio = mean_after / baseline
+    return ratio >= params.sustain_protect_ratio, ratio
+
+
+def _pitch_sustain_guard(
+    note: _MutableNote,
+    candidate_end: float,
+    pitch_frames: list[BassPitchFrame] | None,
+    params: ActivityRepairParameters,
+) -> tuple[bool, _PitchWindowSummary]:
+    if not pitch_frames:
+        return False, _PitchWindowSummary(voiced_ratio=0.0, mean_confidence=0.0, dominant_pitch_midi=None)
+
+    hold_sec = params.pitch_sustain_hold_ms / 1000.0
+    start = max(candidate_end, note.refined_start_sec)
+    end = max(start, min(note.refined_end_sec, candidate_end + hold_sec))
+    summary = _pitch_window_summary(pitch_frames, start, end)
+    return summary.voiced_ratio > 0.0 and summary.mean_confidence >= 0.6, summary
+
+
 def _to_mutable_note(note: RefinedNoteEvent) -> _MutableNote:
     return _MutableNote(
         note_id=note.note_id,
@@ -486,6 +651,7 @@ def repair_activity(
     cleanup_plan_file: Path,
     params: ActivityRepairParameters,
     dsp_features_file: Path | None = None,
+    pitch_contour_file: Path | None = None,
 ) -> tuple[RefinedNoteDocument, ActivityRepairPlan, ActivityRepairReport]:
     if not refined_notes_file.exists() or not refined_notes_file.is_file():
         raise ActivityRepairError(f"Refined notes file does not exist: {refined_notes_file}")
@@ -495,11 +661,16 @@ def repair_activity(
         raise ActivityRepairError(f"Cleanup plan file does not exist: {cleanup_plan_file}")
     if dsp_features_file is not None and (not dsp_features_file.exists() or not dsp_features_file.is_file()):
         raise ActivityRepairError(f"DSP features file does not exist: {dsp_features_file}")
+    if pitch_contour_file is not None and (
+        not pitch_contour_file.exists() or not pitch_contour_file.is_file()
+    ):
+        raise ActivityRepairError(f"Pitch contour file does not exist: {pitch_contour_file}")
 
     refined_document = _load_refined_document(refined_notes_file)
     audio_document = _load_audio_document(audio_features_file)
     cleanup_plan = _load_cleanup_plan(cleanup_plan_file)
     dsp_document = _load_dsp_document(dsp_features_file) if dsp_features_file is not None else None
+    pitch_document = _load_pitch_document(pitch_contour_file) if pitch_contour_file is not None else None
 
     warnings: list[str] = []
     if refined_document.layer != audio_document.layer:
@@ -517,6 +688,11 @@ def repair_activity(
             "Layer mismatch between DSP features and refined notes: "
             f"{dsp_document.layer} vs {refined_document.layer}."
         )
+    if pitch_document is not None and pitch_document.layer != refined_document.layer:
+        warnings.append(
+            "Layer mismatch between pitch contour and refined notes: "
+            f"{pitch_document.layer} vs {refined_document.layer}."
+        )
 
     selected_ids = _selected_note_ids_from_plan(cleanup_plan)
     selected_notes = [_to_mutable_note(note) for note in refined_document.notes if note.note_id in selected_ids]
@@ -528,9 +704,16 @@ def repair_activity(
     if dsp_document is not None:
         activity_frames = _frames_from_dsp(dsp_document=dsp_document, audio_document=audio_document, params=params)
         onset_signal = _build_onset_signal_from_dsp(dsp_document.frames)
+        sustain_signal = [
+            (float(frame.start_sec), float(max(frame.low_band_envelope_smooth, frame.harmonic_rms)))
+            for frame in dsp_document.frames
+        ]
     else:
         activity_frames = _frames_from_audio(audio_document)
         onset_signal = _build_onset_signal_from_audio(audio_document.frames)
+        sustain_signal = [(float(frame.start_sec), float(frame.rms)) for frame in audio_document.frames]
+
+    pitch_frames = pitch_document.frames if pitch_document is not None else None
 
     audio_regions = _build_audio_activity_regions(activity_frames, params)
     midi_regions = _build_midi_regions(selected_notes, params)
@@ -547,6 +730,12 @@ def repair_activity(
     close_gap_count = 0
     review_manual_count = 0
     keep_count = 0
+    sustain_protected_count = 0
+    pitch_protected_count = 0
+    legato_protected_count = 0
+    shorten_candidate_count = 0
+    shorten_applied_count = 0
+    shorten_rejected_count = 0
     audio_gap_count = 0
     midi_overhang_count = 0
 
@@ -652,16 +841,27 @@ def repair_activity(
 
         region_len = region.end_sec - region.start_sec
         nearest = _closest_note(selected_notes, (region.start_sec + region.end_sec) * 0.5, context_sec)
+        contour_pitch = (
+            _find_pitch_note_for_insert(
+                pitch_frames=pitch_frames if pitch_frames is not None else [],
+                start_sec=region.start_sec,
+                end_sec=region.end_sec,
+                min_confidence=params.insert_from_pitch_contour_confidence,
+            )
+            if pitch_frames is not None
+            else None
+        )
         if nearest is not None and region_len <= max_insert_sec:
             confidence = min(1.0, max(0.0, 0.55 + (region.confidence * 0.4)))
             if confidence >= params.insert_auto_confidence:
                 new_note_id = _next_missing_note_id(missing_counter)
                 missing_counter += 1
+                selected_pitch = contour_pitch if contour_pitch is not None else nearest.pitch_midi
                 new_note = _MutableNote(
                     note_id=new_note_id,
                     source=nearest.source if nearest.source else "hermes_repair",
                     layer=refined_document.layer,
-                    pitch_midi=nearest.pitch_midi,
+                    pitch_midi=selected_pitch,
                     pitch_name=nearest.pitch_name,
                     velocity=nearest.velocity if nearest.velocity > 0 else 80,
                     channel=nearest.channel,
@@ -694,6 +894,7 @@ def repair_activity(
                         reasons=["audio-only region with nearby pitch context"],
                         evidence={
                             "context_note_id": nearest.note_id,
+                            "pitch_from_contour": contour_pitch,
                             "audio_region_start_sec": region.start_sec,
                             "audio_region_end_sec": region.end_sec,
                             "region_confidence": region.confidence,
@@ -722,6 +923,81 @@ def repair_activity(
                             "context_note_id": nearest.note_id,
                             "audio_region_start_sec": region.start_sec,
                             "audio_region_end_sec": region.end_sec,
+                        },
+                    )
+                )
+                action_counter += 1
+                review_manual_count += 1
+        elif contour_pitch is not None and region_len <= max_insert_sec:
+            confidence = min(1.0, max(0.0, 0.50 + (region.confidence * 0.35)))
+            if confidence >= params.insert_auto_confidence:
+                new_note_id = _next_missing_note_id(missing_counter)
+                missing_counter += 1
+                new_note = _MutableNote(
+                    note_id=new_note_id,
+                    source="hermes_repair",
+                    layer=refined_document.layer,
+                    pitch_midi=contour_pitch,
+                    pitch_name=f"MIDI_{contour_pitch}",
+                    velocity=80,
+                    channel=0,
+                    original_start_sec=region.start_sec,
+                    original_end_sec=region.end_sec,
+                    aligned_start_sec=region.start_sec,
+                    aligned_end_sec=region.end_sec,
+                    refined_start_sec=region.start_sec,
+                    refined_end_sec=region.end_sec,
+                    merged_note_ids=[],
+                    refinement_actions=["ACTIVITY_REPAIR_INSERTED"],
+                    refinement_confidence=confidence,
+                    reasons=["inserted missing note from pitch contour"],
+                )
+                selected_notes.append(new_note)
+                actions.append(
+                    RepairAction(
+                        action_id=_next_action_id(action_counter),
+                        action_type="INSERT_MISSING_NOTE",
+                        target_note_id=None,
+                        new_note_id=new_note_id,
+                        start_sec=region.start_sec,
+                        end_sec=region.end_sec,
+                        old_start_sec=None,
+                        old_end_sec=None,
+                        new_start_sec=region.start_sec,
+                        new_end_sec=region.end_sec,
+                        pitch_midi=contour_pitch,
+                        confidence=confidence,
+                        reasons=["audio-only region with pitch contour evidence"],
+                        evidence={
+                            "audio_region_start_sec": region.start_sec,
+                            "audio_region_end_sec": region.end_sec,
+                            "pitch_from_contour": contour_pitch,
+                            "region_confidence": region.confidence,
+                        },
+                    )
+                )
+                action_counter += 1
+                insert_missing_count += 1
+            else:
+                actions.append(
+                    RepairAction(
+                        action_id=_next_action_id(action_counter),
+                        action_type="REVIEW_MANUAL",
+                        target_note_id=None,
+                        new_note_id=None,
+                        start_sec=region.start_sec,
+                        end_sec=region.end_sec,
+                        old_start_sec=None,
+                        old_end_sec=None,
+                        new_start_sec=None,
+                        new_end_sec=None,
+                        pitch_midi=contour_pitch,
+                        confidence=confidence,
+                        reasons=["insufficient confidence for contour-driven insert"],
+                        evidence={
+                            "audio_region_start_sec": region.start_sec,
+                            "audio_region_end_sec": region.end_sec,
+                            "pitch_from_contour": contour_pitch,
                         },
                     )
                 )
@@ -766,8 +1042,121 @@ def repair_activity(
         overhang = note.refined_end_sec - region.end_sec
         if overhang >= overhang_min_sec:
             midi_overhang_count += 1
+            shorten_candidate_count += 1
             old_end = note.refined_end_sec
             candidate_end = min(note.refined_end_sec, region.end_sec + tail_padding_sec)
+
+            is_legato, legato_evidence = _is_legato_transition(
+                note=note,
+                notes=selected_notes,
+                audio_regions=audio_regions,
+                params=params,
+            )
+            sustain_protect, sustain_ratio = _sustain_signal_guard(
+                note=note,
+                candidate_end=candidate_end,
+                signal=sustain_signal,
+                params=params,
+            )
+            pitch_protect, pitch_summary = _pitch_sustain_guard(
+                note=note,
+                candidate_end=candidate_end,
+                pitch_frames=pitch_frames,
+                params=params,
+            )
+
+            if is_legato:
+                if "ACTIVITY_REPAIR_LEGATO_PROTECTED" not in note.refinement_actions:
+                    note.refinement_actions.append("ACTIVITY_REPAIR_LEGATO_PROTECTED")
+                note.reasons.append("legato transition protection prevented shorten")
+                legato_protected_count += 1
+                shorten_rejected_count += 1
+                actions.append(
+                    RepairAction(
+                        action_id=_next_action_id(action_counter),
+                        action_type="REVIEW_MANUAL",
+                        target_note_id=note.note_id,
+                        new_note_id=None,
+                        start_sec=candidate_end,
+                        end_sec=old_end,
+                        old_start_sec=note.refined_start_sec,
+                        old_end_sec=old_end,
+                        new_start_sec=note.refined_start_sec,
+                        new_end_sec=None,
+                        pitch_midi=note.pitch_midi,
+                        confidence=0.55,
+                        reasons=["LEGATO_PROTECTED_FROM_SHORTEN"],
+                        evidence={
+                            "audio_region_end_sec": region.end_sec,
+                            **legato_evidence,
+                        },
+                    )
+                )
+                action_counter += 1
+                continue
+
+            if sustain_protect:
+                if "ACTIVITY_REPAIR_SUSTAIN_PROTECTED" not in note.refinement_actions:
+                    note.refinement_actions.append("ACTIVITY_REPAIR_SUSTAIN_PROTECTED")
+                note.reasons.append("sustain energy protection prevented shorten")
+                sustain_protected_count += 1
+                shorten_rejected_count += 1
+                actions.append(
+                    RepairAction(
+                        action_id=_next_action_id(action_counter),
+                        action_type="REVIEW_MANUAL",
+                        target_note_id=note.note_id,
+                        new_note_id=None,
+                        start_sec=candidate_end,
+                        end_sec=old_end,
+                        old_start_sec=note.refined_start_sec,
+                        old_end_sec=old_end,
+                        new_start_sec=note.refined_start_sec,
+                        new_end_sec=None,
+                        pitch_midi=note.pitch_midi,
+                        confidence=0.6,
+                        reasons=["SUSTAIN_PROTECTED_FROM_SHORTEN"],
+                        evidence={
+                            "audio_region_end_sec": region.end_sec,
+                            "sustain_ratio": sustain_ratio,
+                        },
+                    )
+                )
+                action_counter += 1
+                continue
+
+            if pitch_protect:
+                if "ACTIVITY_REPAIR_PITCH_PROTECTED" not in note.refinement_actions:
+                    note.refinement_actions.append("ACTIVITY_REPAIR_PITCH_PROTECTED")
+                note.reasons.append("pitch contour protection prevented shorten")
+                pitch_protected_count += 1
+                shorten_rejected_count += 1
+                actions.append(
+                    RepairAction(
+                        action_id=_next_action_id(action_counter),
+                        action_type="REVIEW_MANUAL",
+                        target_note_id=note.note_id,
+                        new_note_id=None,
+                        start_sec=candidate_end,
+                        end_sec=old_end,
+                        old_start_sec=note.refined_start_sec,
+                        old_end_sec=old_end,
+                        new_start_sec=note.refined_start_sec,
+                        new_end_sec=None,
+                        pitch_midi=note.pitch_midi,
+                        confidence=0.62,
+                        reasons=["PITCH_CONTOUR_PROTECTED_FROM_SHORTEN"],
+                        evidence={
+                            "audio_region_end_sec": region.end_sec,
+                            "pitch_voiced_ratio": pitch_summary.voiced_ratio,
+                            "pitch_mean_confidence": pitch_summary.mean_confidence,
+                            "dominant_pitch_midi": pitch_summary.dominant_pitch_midi,
+                        },
+                    )
+                )
+                action_counter += 1
+                continue
+
             if candidate_end - note.refined_start_sec >= min_repaired_sec:
                 note.refined_end_sec = candidate_end
                 if "ACTIVITY_REPAIR_SHORTENED" not in note.refinement_actions:
@@ -792,11 +1181,39 @@ def repair_activity(
                             "audio_region_end_sec": region.end_sec,
                             "old_end_sec": old_end,
                             "new_end_sec": candidate_end,
+                            "shorten_candidate": True,
                         },
                     )
                 )
                 action_counter += 1
                 shorten_count += 1
+                shorten_applied_count += 1
+            else:
+                shorten_rejected_count += 1
+                actions.append(
+                    RepairAction(
+                        action_id=_next_action_id(action_counter),
+                        action_type="REVIEW_MANUAL",
+                        target_note_id=note.note_id,
+                        new_note_id=None,
+                        start_sec=candidate_end,
+                        end_sec=old_end,
+                        old_start_sec=note.refined_start_sec,
+                        old_end_sec=old_end,
+                        new_start_sec=note.refined_start_sec,
+                        new_end_sec=None,
+                        pitch_midi=note.pitch_midi,
+                        confidence=0.5,
+                        reasons=["minimum_repaired_note_duration guard"],
+                        evidence={
+                            "audio_region_end_sec": region.end_sec,
+                            "old_end_sec": old_end,
+                            "proposed_end_sec": candidate_end,
+                            "minimum_repaired_note_duration_ms": params.minimum_repaired_note_duration_ms,
+                        },
+                    )
+                )
+                action_counter += 1
 
     if dsp_document is not None:
         split_signal = _build_onset_signal_from_dsp(dsp_document.frames)
@@ -831,7 +1248,42 @@ def repair_activity(
         if valley_mean > max(1e-6, onset_value * params.split_valley_ratio):
             continue
 
+        pitch_change = 0.0
+        if pitch_frames is not None:
+            before = _pitch_window_summary(pitch_frames, inner_start, max(inner_start, onset_sec - 0.04))
+            after = _pitch_window_summary(pitch_frames, min(inner_end, onset_sec + 0.04), inner_end)
+            if before.dominant_pitch_midi is not None and after.dominant_pitch_midi is not None:
+                pitch_change = abs(float(after.dominant_pitch_midi - before.dominant_pitch_midi))
+            if pitch_change < params.split_pitch_change_semitones and valley_mean >= max(1e-6, onset_value * 0.02):
+                actions.append(
+                    RepairAction(
+                        action_id=_next_action_id(action_counter),
+                        action_type="REVIEW_MANUAL",
+                        target_note_id=note.note_id,
+                        new_note_id=None,
+                        start_sec=note.refined_start_sec,
+                        end_sec=note.refined_end_sec,
+                        old_start_sec=note.refined_start_sec,
+                        old_end_sec=note.refined_end_sec,
+                        new_start_sec=None,
+                        new_end_sec=None,
+                        pitch_midi=note.pitch_midi,
+                        confidence=0.5,
+                        reasons=["split candidate has no meaningful pitch contour change"],
+                        evidence={
+                            "split_onset_sec": onset_sec,
+                            "pitch_change_semitones": pitch_change,
+                            "required_pitch_change_semitones": params.split_pitch_change_semitones,
+                        },
+                    )
+                )
+                action_counter += 1
+                review_manual_count += 1
+                continue
+
         split_confidence = min(1.0, max(0.0, 0.65 + (onset_value / max(1e-6, local_mean)) * 0.1))
+        if pitch_change >= params.split_pitch_change_semitones:
+            split_confidence = min(1.0, split_confidence + 0.12)
         if split_confidence < params.split_auto_confidence:
             actions.append(
                 RepairAction(
@@ -852,6 +1304,7 @@ def repair_activity(
                         "split_onset_sec": onset_sec,
                         "split_onset_value": onset_value,
                         "local_mean": local_mean,
+                        "pitch_change_semitones": pitch_change,
                     },
                 )
             )
@@ -1018,6 +1471,7 @@ def repair_activity(
         refined_notes_file=str(refined_notes_file),
         audio_features_file=str(audio_features_file),
         dsp_features_file=str(dsp_features_file) if dsp_features_file is not None else None,
+        pitch_contour_file=str(pitch_contour_file) if pitch_contour_file is not None else None,
         cleanup_plan_file=str(cleanup_plan_file),
         layer=refined_document.layer,
         actions=actions,
@@ -1027,6 +1481,7 @@ def repair_activity(
         refined_notes_file=str(refined_notes_file),
         audio_features_file=str(audio_features_file),
         dsp_features_file=str(dsp_features_file) if dsp_features_file is not None else None,
+        pitch_contour_file=str(pitch_contour_file) if pitch_contour_file is not None else None,
         cleanup_plan_file=str(cleanup_plan_file),
         status="ok",
         layer=refined_document.layer,
@@ -1039,6 +1494,12 @@ def repair_activity(
         close_gap_count=close_gap_count,
         review_manual_count=review_manual_count,
         keep_count=keep_count,
+        sustain_protected_count=sustain_protected_count,
+        pitch_protected_count=pitch_protected_count,
+        legato_protected_count=legato_protected_count,
+        shorten_candidate_count=shorten_candidate_count,
+        shorten_applied_count=shorten_applied_count,
+        shorten_rejected_count=shorten_rejected_count,
         audio_active_region_count=len(audio_regions),
         midi_active_region_count=len(midi_regions),
         audio_gap_count=audio_gap_count,

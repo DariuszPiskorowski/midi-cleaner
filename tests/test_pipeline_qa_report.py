@@ -401,6 +401,7 @@ def _write_pipeline_like_project(tmp_path: Path, include_optional: bool = True) 
                     "refined_notes_file": "analysis/refined_note_events.json",
                     "audio_features_file": "analysis/audio_features.json",
                     "dsp_features_file": "analysis/audio_features_dsp.json",
+                    "pitch_contour_file": "analysis/bass_pitch_contour.json",
                     "cleanup_plan_file": "cleanup/cleanup_plan.json",
                     "status": "ok",
                     "layer": "bass",
@@ -413,6 +414,12 @@ def _write_pipeline_like_project(tmp_path: Path, include_optional: bool = True) 
                     "close_gap_count": 0,
                     "review_manual_count": 0,
                     "keep_count": 1,
+                    "sustain_protected_count": 1,
+                    "pitch_protected_count": 1,
+                    "legato_protected_count": 0,
+                    "shorten_candidate_count": 1,
+                    "shorten_applied_count": 0,
+                    "shorten_rejected_count": 1,
                     "audio_active_region_count": 4,
                     "midi_active_region_count": 3,
                     "audio_gap_count": 1,
@@ -658,6 +665,9 @@ def test_html_contains_sections_and_escaped_content(tmp_path: Path) -> None:
     assert "dsp_frame_count" in html_text
     assert "activity_repair_enabled" in html_text
     assert "repaired_note_count" in html_text
+    assert "repair_sustain_protected_count" in html_text
+    assert "repair_pitch_protected_count" in html_text
+    assert "repair_shorten_rejected_count" in html_text
     assert "Top 25 Lowest-Confidence Notes" in html_text
     assert "&lt;unsafe&gt;" in html_text
 
@@ -692,6 +702,11 @@ def test_summary_contains_audio_sync_fields(tmp_path: Path) -> None:
     assert summary.repaired_note_count == 2
     assert summary.repair_extend_count == 1
     assert summary.repair_insert_missing_count == 1
+    assert summary.repair_sustain_protected_count == 1
+    assert summary.repair_pitch_protected_count == 1
+    assert summary.repair_shorten_candidate_count == 1
+    assert summary.repair_shorten_applied_count == 0
+    assert summary.repair_shorten_rejected_count == 1
     assert summary.audio_active_region_count == 4
     assert summary.audio_gap_count == 1
     assert summary.working_midi_note_count == 2

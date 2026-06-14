@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Rules for AI coding agents in `midi-cleaner` during Milestone 13A:
+Rules for AI coding agents in `midi-cleaner` during Milestone 13B:
 
 - Keep the Python environment guard strict for Python 3.11.x.
 - Run all commands through `uv run` when executing project tools.
@@ -27,6 +27,12 @@ Rules for AI coding agents in `midi-cleaner` during Milestone 13A:
 - Milestone 13A may use DSP evidence when available but must fall back deterministically to lightweight audio features.
 - Milestone 13A must support confidence-gated repair actions and route low-confidence insert/split cases to review-manual.
 - Milestone 13A outputs must include repaired refined notes, activity repair plan/report, and QA repair summary metrics.
+- Milestone 13B adds bass pitch contour analysis as an additional optional stage after DSP analysis.
+- Milestone 13B must support pitch backend selection (`auto|librosa|basic`) with deterministic fallback behavior.
+- Milestone 13B must allow strict mode (`require_pitch_contour`) and permissive mode (warning + continue when contour extraction fails).
+- Milestone 13B activity repair must protect sustained/legato bass from over-shortening using low-band/harmonic, pitch contour, and legato continuity guards.
+- Milestone 13B may use pitch contour evidence for split/insert confidence but must not treat pitch contour as final truth.
+- Milestone 13B QA outputs must include sustain/pitch/legato protection counts and shorten decision metrics.
 - Synchronization is critical.
 - Global offset search must run before local per-note alignment.
 - Do not rely on BPM/bar calculations for timing alignment.
