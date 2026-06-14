@@ -1,0 +1,198 @@
+name: Dependabot Auto-merge
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  dependabot-automerge:
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_URL: ${{ github.event.pull_request.html_url }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v3
+
+      - name: Add baseline labels
+        run: |
+          gh api \
+            --method POST \
+            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels" \
+            -f labels[]=dependencies \
+            -f labels[]=dependabot
+
+      - name: Add semver-major label
+        if: steps.metadata.outputs.update-type == 'version-update:semver-major'
+        run: |
+          gh api \
+            --method POST \
+            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels" \
+            -f labels[]=semver-major
+
+      - name: Add development dependency label
+        if: steps.metadata.outputs.dependency-type == 'direct:development'
+        run: |
+          gh api \
+            --method POST \
+            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels" \
+            -f labels[]=dev-dependency
+
+      - name: Add production dependency label
+        if: steps.metadata.outputs.dependency-type == 'direct:production'
+        run: |
+          gh api \
+            --method POST \
+            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels" \
+            -f labels[]=production-dependency
+
+      - name: Evaluate safe auto-merge policy
+        id: policy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dependency_names_raw="${{ steps.metadata.outputs.dependency-names }}"
+          dependency_type="${{ steps.metadata.outputs.dependency-type }}"
+          update_type="${{ steps.metadata.outputs.update-type }}"
+          package_ecosystem="${{ steps.metadata.outputs.package-ecosystem }}"
+          directory="${{ steps.metadata.outputs.directory }}"
+          dependency_group="${{ steps.metadata.outputs.dependency-group }}"
+          maintainer_changes_output="${{ steps.metadata.outputs.maintainer-changes }}"
+
+          has_pytest=false
+          unknown_names=false
+          saw_any_name=false
+
+          IFS=',' read -r -a names <<< "${dependency_names_raw}"
+          for raw_name in "${names[@]}"; do
+            name="$(echo "${raw_name}" | xargs)"
+            if [[ -z "${name}" ]]; then
+              continue
+            fi
+
+            saw_any_name=true
+            if [[ "${name}" == "pytest" ]]; then
+              has_pytest=true
+            else
+              unknown_names=true
+            fi
+          done
+
+          if [[ "${saw_any_name}" == "false" ]]; then
+            unknown_names=true
+          fi
+
+          allowed_update_type=false
+          case "${update_type}" in
+            version-update:semver-patch|version-update:semver-minor)
+              allowed_update_type=true
+              ;;
+            version-update:semver-major)
+              if [[ "${has_pytest}" == "true" ]]; then
+                allowed_update_type=true
+              fi
+              ;;
+          esac
+
+          ecosystem_scope_ok=false
+          if [[ "${package_ecosystem}" == "uv" && "${directory}" == "/" ]]; then
+            ecosystem_scope_ok=true
+          fi
+
+          group_ok=true
+          if [[ -n "${dependency_group}" && "${dependency_group}" != "uv" ]]; then
+            group_ok=false
+          fi
+
+          maintainer_changes=false
+          if [[ "${maintainer_changes_output}" == "true" ]]; then
+            maintainer_changes=true
+          fi
+
+          allow_automerge=false
+          if [[ "${dependency_type}" == "direct:development" \
+                && "${has_pytest}" == "true" \
+                && "${unknown_names}" == "false" \
+                && "${allowed_update_type}" == "true" \
+                && "${ecosystem_scope_ok}" == "true" \
+                && "${group_ok}" == "true" \
+                && "${maintainer_changes}" == "false" ]]; then
+            allow_automerge=true
+          fi
+
+          {
+            echo "allow_automerge=${allow_automerge}"
+            echo "dependency_names=${dependency_names_raw}"
+            echo "dependency_type=${dependency_type}"
+            echo "update_type=${update_type}"
+            echo "package_ecosystem=${package_ecosystem}"
+            echo "directory=${directory}"
+            echo "dependency_group=${dependency_group}"
+            echo "maintainer_changes=${maintainer_changes}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Enable auto-merge
+        id: merge
+        if: steps.policy.outputs.allow_automerge == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          merge_method="squash"
+          if gh pr merge --auto --squash "${PR_URL}"; then
+            merge_method="squash"
+          else
+            gh pr merge --auto --merge "${PR_URL}"
+            merge_method="merge"
+          fi
+
+          echo "merge_method=${merge_method}" >> "${GITHUB_OUTPUT}"
+
+      - name: Comment when auto-merge is enabled
+        if: steps.policy.outputs.allow_automerge == 'true'
+        shell: bash
+        run: |
+          gh pr comment "${PR_URL}" --body "Auto-merge has been enabled for this Dependabot PR.
+
+This PR will be merged only after all required CI checks and branch protection rules pass.
+
+Metadata:
+- dependency names: ${{ steps.policy.outputs.dependency_names }}
+- dependency type: ${{ steps.policy.outputs.dependency_type }}
+- update type: ${{ steps.policy.outputs.update_type }}
+- dependency group: ${{ steps.policy.outputs.dependency_group }}
+- package ecosystem: ${{ steps.policy.outputs.package_ecosystem }}
+- directory: ${{ steps.policy.outputs.directory }}
+- merge method preference: ${{ steps.merge.outputs.merge_method }}"
+
+      - name: Comment when auto-merge is not enabled
+        if: steps.policy.outputs.allow_automerge != 'true'
+        shell: bash
+        run: |
+          gh pr comment "${PR_URL}" --body "Auto-merge was not enabled because this PR did not match the safe allowlist policy.
+
+Metadata:
+- dependency names: ${{ steps.policy.outputs.dependency_names }}
+- dependency type: ${{ steps.policy.outputs.dependency_type }}
+- update type: ${{ steps.policy.outputs.update_type }}
+- dependency group: ${{ steps.policy.outputs.dependency_group }}
+- package ecosystem: ${{ steps.policy.outputs.package_ecosystem }}
+- directory: ${{ steps.policy.outputs.directory }}
+- maintainer changes: ${{ steps.policy.outputs.maintainer_changes }}"
