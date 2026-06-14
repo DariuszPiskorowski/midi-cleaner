@@ -242,3 +242,45 @@ def test_cli_export_working_midi_writes_outputs_and_report(tmp_path: Path) -> No
     assert payload["timing_source"] == "refined_audio_seconds"
     assert payload["working_note_count"] == 2
     assert payload["rejected_note_count"] == 2
+
+
+def test_working_export_supports_custom_variant_filenames(tmp_path: Path) -> None:
+    notes_path, plan_path, refined_path = _write_inputs(tmp_path)
+
+    report = export_working_midi(
+        notes_file=notes_path,
+        cleanup_plan_file=plan_path,
+        output_dir=tmp_path / "out",
+        params=WorkingMidiExportParameters(
+            refined_notes_file=refined_path,
+            working_filename="working_iter2.mid",
+            rejected_filename="rejected_iter2.mid",
+            diagnostic_filename="diagnostic_iter2.mid",
+            include_diagnostic=True,
+        ),
+    )
+
+    assert (tmp_path / "out" / "working_iter2.mid").exists()
+    assert (tmp_path / "out" / "rejected_iter2.mid").exists()
+    assert (tmp_path / "out" / "diagnostic_iter2.mid").exists()
+    exported_paths = {item.path for item in report.exported_files}
+    assert str(tmp_path / "out" / "working_iter2.mid") in exported_paths
+
+
+def test_working_export_keeps_repair_generated_notes_without_plan_action(tmp_path: Path) -> None:
+    notes_path, plan_path, refined_path = _write_inputs(tmp_path)
+    refined_doc = RefinedNoteDocument.model_validate_json(refined_path.read_text(encoding="utf-8"))
+    generated = _refined_note("repair_missing_000001", 60, 90, 0.700, 0.820)
+    generated = generated.model_copy(update={"refinement_actions": ["ACTIVITY_REPAIR_INSERTED"]})
+    refined_doc = refined_doc.model_copy(update={"notes": [*refined_doc.notes, generated]})
+    refined_path.write_text(refined_doc.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    report = export_working_midi(
+        notes_file=notes_path,
+        cleanup_plan_file=plan_path,
+        output_dir=tmp_path / "out_generated",
+        params=WorkingMidiExportParameters(refined_notes_file=refined_path),
+    )
+
+    assert report.working_note_count == 3
+    assert any("defaulted to KEEP" in warning for warning in report.warnings)

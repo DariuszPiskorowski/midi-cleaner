@@ -136,5 +136,35 @@
 - Keep Milestone 11, 12, and 13A behavior intact when pitch contour is disabled or unavailable.
 - Expand QA artifacts with sustain/pitch/legato protection counters and shorten decision metrics.
 
+## Milestone 14 - Iterative MIDI Self-Repair Loop
+- Add `midi-cleaner repair iterative` command to run bounded multi-pass repair/score cycles.
+- Keep WAV/audio seconds canonical and independent from BPM/bar timing assumptions.
+- Re-score each candidate pass using deterministic metrics:
+	- coverage score
+	- overhang score
+	- continuity score
+	- pitch consistency score
+- Produce deterministic error-region summaries (audio gaps, MIDI overhang, micro-gaps, split/missing-split signals, pitch mismatch, review-manual).
+- Support pass profiles (`balanced`, `sustain_legato`, `aggressive`, `conservative`) and final-pass conservative safeguards.
+- Support stable note/region freezing and protection of previously good regions.
+- Enforce bounded stopping with convergence and regression guards; prevent infinite repair loops.
+- Integrate iterative repair into `pipeline process-stem` after activity repair and before final working export.
+- Keep Milestone 13A artifacts for compatibility while adding final iterative artifacts:
+	- `analysis/iterative_repair_report.json`
+	- `analysis/iterative_repair_iteration_1_plan.json`
+	- `analysis/iterative_repair_iteration_1_notes.json`
+	- `analysis/iterative_repair_iteration_2_plan.json`
+	- `analysis/iterative_repair_iteration_2_notes.json`
+	- `analysis/iterative_repair_iteration_3_plan.json`
+	- `analysis/iterative_repair_iteration_3_notes.json`
+	- `analysis/final_repaired_note_events.json`
+- Make `midi/working/working.mid` consume final repaired notes.
+- Optionally export iterative comparison variants for REAPER:
+	- `midi/working/working_iter1.mid`
+	- `midi/working/working_iter2.mid`
+	- `midi/working/working_iter3.mid`
+	- `midi/working/working_best.mid`
+- Expand QA summary/HTML/CSV with iterative repair metrics and per-iteration table.
+
 ## Future Milestones (Planned)
-- Milestone 13C: add render-back audio comparison for post-export verification.
+- Milestone 15 (13C): add render-back audio comparison for post-export verification.

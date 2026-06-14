@@ -14,7 +14,7 @@ from midi_cleaner.alignment.models import (
 )
 from midi_cleaner.cleanup.models import CleanupPlanDocument, WorkingMidiExportReport
 from midi_cleaner.pipeline.models import PipelineReport, QANoteRow, QASummary
-from midi_cleaner.repair.models import ActivityRepairReport
+from midi_cleaner.repair.models import ActivityRepairReport, IterativeRepairReport
 from midi_cleaner.refinement.models import BassRefinementReport, RefinedNoteDocument, RefinedNoteEvent
 from midi_cleaner.validation.models import NoteValidationDocument
 
@@ -68,6 +68,10 @@ def _load_working_export_report(path: Path) -> WorkingMidiExportReport:
 
 def _load_activity_repair_report(path: Path) -> ActivityRepairReport:
     return ActivityRepairReport.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _load_iterative_repair_report(path: Path) -> IterativeRepairReport:
+    return IterativeRepairReport.model_validate_json(path.read_text(encoding="utf-8"))
 
 
 def _build_rows(
@@ -140,6 +144,9 @@ def _build_rows(
         was_split_by_repair = False
         was_extended_by_repair = False
         was_shortened_by_repair = False
+        final_iteration_changed = False
+        stable_region = False
+        iterative_repair_actions: str | None = None
 
         if aligned is not None:
             original_start_sec = float(aligned.original_start_sec)
@@ -171,6 +178,17 @@ def _build_rows(
             was_extended_by_repair = "ACTIVITY_REPAIR_EXTENDED" in token_set
             was_shortened_by_repair = "ACTIVITY_REPAIR_SHORTENED" in token_set
 
+            iterative_tokens = [
+                action
+                for action in refined.refinement_actions
+                if action.startswith("ITERATIVE_REPAIR_")
+            ]
+            if iterative_tokens:
+                iterative_repair_actions = "; ".join(iterative_tokens)
+            iterative_set = set(iterative_tokens)
+            final_iteration_changed = "ITERATIVE_REPAIR_CHANGED" in iterative_set
+            stable_region = "ITERATIVE_REPAIR_STABLE" in iterative_set
+
         rows.append(
             QANoteRow(
                 note_id=item.note_id,
@@ -194,6 +212,9 @@ def _build_rows(
                 was_split_by_repair=was_split_by_repair,
                 was_extended_by_repair=was_extended_by_repair,
                 was_shortened_by_repair=was_shortened_by_repair,
+                final_iteration_changed=final_iteration_changed,
+                stable_region=stable_region,
+                iterative_repair_actions=iterative_repair_actions,
                 alignment_action=alignment_action,
                 alignment_confidence=alignment_confidence,
                 confidence=item.confidence,
@@ -241,6 +262,9 @@ def _write_csv(path: Path, rows: list[QANoteRow]) -> None:
                 "was_split_by_repair",
                 "was_extended_by_repair",
                 "was_shortened_by_repair",
+                "final_iteration_changed",
+                "stable_region",
+                "iterative_repair_actions",
                 "alignment_action",
                 "alignment_confidence",
                 "confidence",
@@ -311,6 +335,9 @@ def _rows_table_html(title: str, rows: list[QANoteRow]) -> str:
             f"<td>{str(row.was_split_by_repair)}</td>"
             f"<td>{str(row.was_extended_by_repair)}</td>"
             f"<td>{str(row.was_shortened_by_repair)}</td>"
+            f"<td>{str(row.final_iteration_changed)}</td>"
+            f"<td>{str(row.stable_region)}</td>"
+            f"<td>{escape(str(row.iterative_repair_actions))}</td>"
             f"<td>{row.onset_score:.6f}</td>"
             f"<td>{row.mean_rms_during_note:.6f}</td>"
             f"<td>{row.sustained_energy_ratio:.4f}</td>"
@@ -331,9 +358,52 @@ def _rows_table_html(title: str, rows: list[QANoteRow]) -> str:
         "<th>repair_actions</th><th>repair_reason_summary</th>"
         "<th>repair_inserted</th><th>repair_split</th>"
         "<th>repair_extended</th><th>repair_shortened</th>"
+        "<th>iter_changed</th><th>iter_stable</th><th>iterative_actions</th>"
         "<th>onset_score</th><th>mean_rms</th><th>sustained_ratio</th><th>reasons</th>"
         "</tr></thead><tbody>"
         + "".join(html_rows)
+        + "</tbody></table>"
+    )
+
+
+def _iteration_table_html(iterations: list[dict[str, object]]) -> str:
+    if not iterations:
+        return "<h2>Iterative Repair</h2><p>No iterative repair iterations.</p>"
+
+    body_rows: list[str] = []
+    for item in iterations:
+        body_rows.append(
+            "<tr>"
+            f"<td>{escape(str(item.get('iteration_index', '')))}</td>"
+            f"<td>{escape(str(item.get('input_note_count', '')))}</td>"
+            f"<td>{escape(str(item.get('output_note_count', '')))}</td>"
+            f"<td>{escape(str(item.get('applied_action_count', '')))}</td>"
+            f"<td>{escape(str(item.get('extend_count', '')))}</td>"
+            f"<td>{escape(str(item.get('shorten_count', '')))}</td>"
+            f"<td>{escape(str(item.get('insert_count', '')))}</td>"
+            f"<td>{escape(str(item.get('split_count', '')))}</td>"
+            f"<td>{escape(str(item.get('close_gap_count', '')))}</td>"
+            f"<td>{escape(str(item.get('coverage_score', '')))}</td>"
+            f"<td>{escape(str(item.get('overhang_score', '')))}</td>"
+            f"<td>{escape(str(item.get('continuity_score', '')))}</td>"
+            f"<td>{escape(str(item.get('pitch_consistency_score', '')))}</td>"
+            f"<td>{escape(str(item.get('total_score', '')))}</td>"
+            f"<td>{escape(str(item.get('improvement_from_previous', '')))}</td>"
+            f"<td>{escape(str(item.get('stopped_reason', '')))}</td>"
+            "</tr>"
+        )
+
+    return (
+        "<h2>Iterative Repair</h2>"
+        "<table border='1' cellpadding='6' cellspacing='0'>"
+        "<thead><tr>"
+        "<th>iteration</th><th>input_notes</th><th>output_notes</th><th>actions</th>"
+        "<th>extend</th><th>shorten</th><th>insert</th><th>split</th><th>close_gap</th>"
+        "<th>coverage_score</th><th>overhang_score</th><th>continuity_score</th>"
+        "<th>pitch_consistency_score</th><th>total_score</th>"
+        "<th>improvement_from_previous</th><th>stopped_reason</th>"
+        "</tr></thead><tbody>"
+        + "".join(body_rows)
         + "</tbody></table>"
     )
 
@@ -343,6 +413,7 @@ def _write_html(
     summary: QASummary,
     rows: list[QANoteRow],
     top_n: int,
+    iterative_iterations: list[dict[str, object]],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -441,6 +512,14 @@ def _write_html(
             <tr><th>midi_active_region_count</th><td>{summary.midi_active_region_count}</td></tr>
             <tr><th>audio_gap_count</th><td>{summary.audio_gap_count}</td></tr>
             <tr><th>midi_overhang_count</th><td>{summary.midi_overhang_count}</td></tr>
+            <tr><th>iterative_repair_enabled</th><td>{summary.iterative_repair_enabled}</td></tr>
+            <tr><th>repair_iterations_completed</th><td>{summary.repair_iterations_completed}</td></tr>
+            <tr><th>repair_initial_score</th><td>{summary.repair_initial_score}</td></tr>
+            <tr><th>repair_final_score</th><td>{summary.repair_final_score}</td></tr>
+            <tr><th>repair_total_improvement</th><td>{summary.repair_total_improvement}</td></tr>
+            <tr><th>repair_best_iteration_index</th><td>{summary.repair_best_iteration_index}</td></tr>
+            <tr><th>repair_convergence_reached</th><td>{summary.repair_convergence_reached}</td></tr>
+            <tr><th>repair_stopped_reason</th><td>{summary.repair_stopped_reason}</td></tr>
             <tr><th>working_midi_note_count</th><td>{summary.working_midi_note_count}</td></tr>
     <tr><th>aligned_count</th><td>{summary.aligned_count}</td></tr>
     <tr><th>keep_original_count</th><td>{summary.keep_original_count}</td></tr>
@@ -476,6 +555,8 @@ def _write_html(
         </tbody>
     </table>
 
+    {_iteration_table_html(iterative_iterations)}
+
   {_rows_table_html(f"Top {top_n} Lowest-Confidence Notes", lowest_confidence)}
   {_rows_table_html(f"Top {top_n} Weak-Onset Notes", weakest_onset)}
   {_rows_table_html(f"Top {top_n} Low-RMS Notes", lowest_rms)}
@@ -505,9 +586,11 @@ def generate_qa_report(
     audio_alignment_report_path = project_dir / "analysis" / "audio_alignment_report.json"
     refined_notes_path = project_dir / "analysis" / "refined_note_events.json"
     repaired_refined_notes_path = project_dir / "analysis" / "repaired_refined_note_events.json"
+    final_repaired_notes_path = project_dir / "analysis" / "final_repaired_note_events.json"
     bass_refinement_report_path = project_dir / "analysis" / "bass_refinement_report.json"
     dsp_analysis_report_path = project_dir / "analysis" / "audio_analysis_dsp_report.json"
     activity_repair_report_path = project_dir / "analysis" / "activity_repair_report.json"
+    iterative_repair_report_path = project_dir / "analysis" / "iterative_repair_report.json"
     midi_audio_validation_report_path = project_dir / "analysis" / "midi_audio_validation_report.json"
     cleanup_plan_path = project_dir / "cleanup" / "cleanup_plan.json"
     cleaned_export_report_path = project_dir / "midi" / "cleaned" / "cleaned_export_report.json"
@@ -544,6 +627,10 @@ def generate_qa_report(
     repaired_notes: RefinedNoteDocument | None = None
     if repaired_refined_notes_path.exists():
         repaired_notes = _load_refined_document(repaired_refined_notes_path)
+
+    final_repaired_notes: RefinedNoteDocument | None = None
+    if final_repaired_notes_path.exists():
+        final_repaired_notes = _load_refined_document(final_repaired_notes_path)
 
     alignment_report: AudioAlignmentReport | None = None
     if audio_alignment_report_path.exists():
@@ -590,6 +677,15 @@ def generate_qa_report(
     midi_active_region_count = 0
     audio_gap_count = 0
     midi_overhang_count = 0
+    iterative_repair_enabled = False
+    repair_iterations_completed = 0
+    repair_initial_score: float | None = None
+    repair_final_score: float | None = None
+    repair_total_improvement: float | None = None
+    repair_best_iteration_index = 0
+    repair_convergence_reached = False
+    repair_stopped_reason: str | None = None
+    iterative_iterations: list[dict[str, object]] = []
     dsp_backend_name: str | None = None
     dsp_backend_available: bool | None = None
     dsp_frame_count = 0
@@ -668,6 +764,19 @@ def generate_qa_report(
         audio_gap_count = int(activity_repair_report.audio_gap_count)
         midi_overhang_count = int(activity_repair_report.midi_overhang_count)
 
+    if iterative_repair_report_path.exists():
+        iterative_report = _load_iterative_repair_report(iterative_repair_report_path)
+        iterative_repair_enabled = True
+        repair_iterations_completed = int(iterative_report.iterations_completed)
+        repair_initial_score = float(iterative_report.initial_score)
+        repair_final_score = float(iterative_report.final_score)
+        repair_total_improvement = float(iterative_report.total_improvement)
+        repair_best_iteration_index = int(iterative_report.best_iteration_index)
+        repair_convergence_reached = bool(iterative_report.convergence_reached)
+        iterative_iterations = [item.model_dump() for item in iterative_report.iterations]
+        if iterative_report.iterations:
+            repair_stopped_reason = iterative_report.iterations[-1].stopped_reason
+
     if dsp_analysis_report_path.exists():
         dsp_report_payload = _read_json(dsp_analysis_report_path)
         raw_backend_name = dsp_report_payload.get("backend_name")
@@ -706,7 +815,11 @@ def generate_qa_report(
         note_validation=note_validation,
         cleanup_plan=cleanup_plan,
         aligned_notes=aligned_notes,
-        refined_notes=(repaired_notes if repaired_notes is not None else refined_notes),
+        refined_notes=(
+            final_repaired_notes
+            if final_repaired_notes is not None
+            else (repaired_notes if repaired_notes is not None else refined_notes)
+        ),
         warnings=warnings,
     )
 
@@ -809,7 +922,10 @@ def generate_qa_report(
                 median(item.end_refinement_ms for item in refined_notes.notes)
             )
 
-    if repaired_notes is not None and repaired_note_count == 0:
+    if final_repaired_notes is not None:
+        repaired_note_count = len(final_repaired_notes.notes)
+        activity_repair_enabled = True
+    elif repaired_notes is not None and repaired_note_count == 0:
         repaired_note_count = len(repaired_notes.notes)
         activity_repair_enabled = True
 
@@ -894,6 +1010,14 @@ def generate_qa_report(
         midi_active_region_count=midi_active_region_count,
         audio_gap_count=audio_gap_count,
         midi_overhang_count=midi_overhang_count,
+        iterative_repair_enabled=iterative_repair_enabled,
+        repair_iterations_completed=repair_iterations_completed,
+        repair_initial_score=repair_initial_score,
+        repair_final_score=repair_final_score,
+        repair_total_improvement=repair_total_improvement,
+        repair_best_iteration_index=repair_best_iteration_index,
+        repair_convergence_reached=repair_convergence_reached,
+        repair_stopped_reason=repair_stopped_reason,
         working_midi_note_count=working_midi_note_count,
         working_export_time_error_ms=working_export_time_error_ms,
         validation_timing_source=validation_timing_source,
@@ -930,7 +1054,13 @@ def generate_qa_report(
         output_files["qa_notes_csv"] = str(qa_csv_path)
 
     if params.include_html:
-        _write_html(qa_html_path, summary=summary, rows=rows, top_n=params.top_n)
+        _write_html(
+            qa_html_path,
+            summary=summary,
+            rows=rows,
+            top_n=params.top_n,
+            iterative_iterations=iterative_iterations,
+        )
         output_files["qa_report_html"] = str(qa_html_path)
 
     summary.output_files = output_files

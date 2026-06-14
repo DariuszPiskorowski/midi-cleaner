@@ -33,6 +33,10 @@ from midi_cleaner.repair.activity import (
     ActivityRepairParameters,
     repair_activity,
 )
+from midi_cleaner.repair.iterative import (
+    IterativeRepairParameters,
+    run_iterative_activity_repair,
+)
 from midi_cleaner.refinement.bass import BassRefinementParameters, refine_bass_notes
 from midi_cleaner.refinement.models import BassRefinementReport, RefinedNoteDocument, RefinedNoteEvent
 from midi_cleaner.validation.midi_audio import ValidationParameters, validate_midi_vs_audio
@@ -99,6 +103,12 @@ class PipelineProcessParameters:
     split_auto_confidence: float = 0.75
     split_pitch_change_semitones: float = 0.75
     insert_from_pitch_contour_confidence: float = 0.75
+    enable_iterative_repair: bool = True
+    repair_iterations: int = 3
+    repair_min_improvement: float = 0.005
+    freeze_stable_notes: bool = True
+    conservative_final_pass: bool = True
+    export_iteration_variants: bool = True
 
 
 def _write_json(path: Path, payload: BaseModel | dict[str, object]) -> None:
@@ -317,6 +327,20 @@ def process_stem_pipeline(
                         analysis_dir / "activity_repair_report.json"
                     ),
                 },
+                "iterative_repair": {
+                    "enable_iterative_repair": params.enable_iterative_repair,
+                    "repair_iterations": params.repair_iterations,
+                    "repair_min_improvement": params.repair_min_improvement,
+                    "freeze_stable_notes": params.freeze_stable_notes,
+                    "conservative_final_pass": params.conservative_final_pass,
+                    "export_iteration_variants": params.export_iteration_variants,
+                    "iterative_repair_report_file": str(
+                        analysis_dir / "iterative_repair_report.json"
+                    ),
+                    "final_repaired_note_events_file": str(
+                        analysis_dir / "final_repaired_note_events.json"
+                    ),
+                },
                 "midi_export": {
                     "ticks_per_beat": params.ticks_per_beat,
                     "track_name_prefix": params.track_name_prefix,
@@ -341,6 +365,10 @@ def process_stem_pipeline(
     repaired_refined_note_events_path: Path | None = None
     activity_repair_plan_path: Path | None = None
     activity_repair_report_path: Path | None = None
+    final_repaired_note_events_path: Path | None = None
+    iterative_repair_report_path: Path | None = None
+    iterative_best_plan_path: Path | None = None
+    iterative_best_iteration_index = 0
     activity_repair_summary: dict[str, int] = {
         "extend_count": 0,
         "shorten_count": 0,
@@ -751,7 +779,209 @@ def process_stem_pipeline(
                 )
             )
 
-        # Stage 9: Cleanup planning
+        # Stage 9: Iterative activity repair (Milestone 14)
+        current_stage = "iterative_repair"
+        final_repaired_note_events_path = analysis_dir / "final_repaired_note_events.json"
+        iterative_repair_report_path = analysis_dir / "iterative_repair_report.json"
+        iterative_repair_enabled = (
+            params.enable_iterative_repair
+            and params.enable_activity_repair
+            and layer.lower() == "bass"
+        )
+
+        if iterative_repair_enabled:
+            iterative_input_path = (
+                repaired_refined_note_events_path
+                if repaired_refined_note_events_path is not None
+                else refined_note_events_path
+            )
+            final_document, iterative_report, iterative_artifacts = run_iterative_activity_repair(
+                refined_notes_file=iterative_input_path,
+                audio_features_file=audio_features_path,
+                cleanup_plan_file=cleanup_plan_path,
+                params=IterativeRepairParameters(
+                    max_iterations=params.repair_iterations,
+                    min_improvement=params.repair_min_improvement,
+                    conservative_final_pass=params.conservative_final_pass,
+                    freeze_stable_notes=params.freeze_stable_notes,
+                ),
+                activity_params=ActivityRepairParameters(
+                    audio_active_threshold_ratio=params.audio_active_threshold_ratio,
+                    audio_silence_hold_ms=params.audio_silence_hold_ms,
+                    missing_gap_min_ms=params.missing_gap_min_ms,
+                    overhang_min_ms=params.overhang_min_ms,
+                    split_min_note_duration_ms=params.split_min_note_duration_ms,
+                    close_gap_ms=params.close_gap_ms,
+                    insert_auto_confidence=params.insert_auto_confidence,
+                    split_auto_confidence=params.split_auto_confidence,
+                    split_pitch_change_semitones=params.split_pitch_change_semitones,
+                    insert_from_pitch_contour_confidence=params.insert_from_pitch_contour_confidence,
+                ),
+                dsp_features_file=dsp_features_path,
+                pitch_contour_file=pitch_contour_path,
+            )
+
+            iterative_stage_outputs = [
+                str(final_repaired_note_events_path),
+                str(iterative_repair_report_path),
+            ]
+
+            _write_json(final_repaired_note_events_path, final_document)
+            iterative_report.final_repaired_notes_file = str(final_repaired_note_events_path)
+            iterative_report.output_file = str(iterative_repair_report_path)
+            _write_json(iterative_repair_report_path, iterative_report)
+
+            output_files["final_repaired_note_events"] = str(final_repaired_note_events_path)
+            output_files["iterative_repair_report"] = str(iterative_repair_report_path)
+
+            iterative_best_iteration_index = int(iterative_report.best_iteration_index)
+            for artifact in iterative_artifacts:
+                iteration_index = artifact.iteration_index
+                iteration_plan_path = analysis_dir / f"iterative_repair_iteration_{iteration_index}_plan.json"
+                iteration_notes_path = analysis_dir / f"iterative_repair_iteration_{iteration_index}_notes.json"
+                _write_json(iteration_plan_path, artifact.repair_plan)
+                _write_json(iteration_notes_path, artifact.repaired_document)
+                iterative_stage_outputs.extend([str(iteration_plan_path), str(iteration_notes_path)])
+                output_files[f"iterative_repair_iteration_{iteration_index}_plan"] = str(
+                    iteration_plan_path
+                )
+                output_files[f"iterative_repair_iteration_{iteration_index}_notes"] = str(
+                    iteration_notes_path
+                )
+
+                if iteration_index == iterative_best_iteration_index:
+                    iterative_best_plan_path = iteration_plan_path
+                    activity_repair_summary["extend_count"] = artifact.summary.extend_count
+                    activity_repair_summary["shorten_count"] = artifact.summary.shorten_count
+                    activity_repair_summary["insert_missing_count"] = artifact.summary.insert_count
+                    activity_repair_summary["split_count"] = artifact.summary.split_count
+                    activity_repair_summary["close_gap_count"] = artifact.summary.close_gap_count
+                    activity_repair_summary["review_manual_count"] = artifact.summary.review_manual_count
+
+            # Keep deterministic file contract for expected iteration artifacts.
+            if iterative_artifacts:
+                fallback_plan = iterative_artifacts[-1].repair_plan
+                for iteration_index in range(1, params.repair_iterations + 1):
+                    iteration_plan_path = analysis_dir / f"iterative_repair_iteration_{iteration_index}_plan.json"
+                    iteration_notes_path = analysis_dir / f"iterative_repair_iteration_{iteration_index}_notes.json"
+                    if not iteration_plan_path.exists():
+                        _write_json(iteration_plan_path, fallback_plan)
+                    if not iteration_notes_path.exists():
+                        _write_json(iteration_notes_path, final_document)
+                    if str(iteration_plan_path) not in iterative_stage_outputs:
+                        iterative_stage_outputs.append(str(iteration_plan_path))
+                    if str(iteration_notes_path) not in iterative_stage_outputs:
+                        iterative_stage_outputs.append(str(iteration_notes_path))
+                    output_files[f"iterative_repair_iteration_{iteration_index}_plan"] = str(
+                        iteration_plan_path
+                    )
+                    output_files[f"iterative_repair_iteration_{iteration_index}_notes"] = str(
+                        iteration_notes_path
+                    )
+
+            if params.export_iteration_variants and iterative_artifacts:
+                artifact_by_index = {
+                    artifact.iteration_index: artifact for artifact in iterative_artifacts
+                }
+                fallback_summary = iterative_artifacts[-1].summary
+                for iteration_index in range(1, params.repair_iterations + 1):
+                    artifact = artifact_by_index.get(iteration_index)
+                    summary = artifact.summary if artifact is not None else fallback_summary
+                    iteration_notes_path = analysis_dir / f"iterative_repair_iteration_{iteration_index}_notes.json"
+                    iteration_plan_path = analysis_dir / f"iterative_repair_iteration_{iteration_index}_plan.json"
+                    iteration_variant_report = export_working_midi(
+                        notes_file=note_events_path,
+                        cleanup_plan_file=cleanup_plan_path,
+                        output_dir=working_midi_dir,
+                        params=WorkingMidiExportParameters(
+                            ticks_per_beat=params.ticks_per_beat,
+                            track_name_prefix=params.track_name_prefix,
+                            include_diagnostic=False,
+                            write_empty_files=params.write_empty_files,
+                            refined_notes_file=iteration_notes_path,
+                            repair_plan_file=iteration_plan_path,
+                            audio_aligned_notes_file=audio_aligned_note_events_path,
+                            repair_extend_count=summary.extend_count,
+                            repair_shorten_count=summary.shorten_count,
+                            repair_insert_missing_count=summary.insert_count,
+                            repair_split_count=summary.split_count,
+                            repair_close_gap_count=summary.close_gap_count,
+                            repair_review_manual_count=summary.review_manual_count,
+                            working_filename=f"working_iter{iteration_index}.mid",
+                            rejected_filename=f"rejected_iter{iteration_index}.mid",
+                            diagnostic_filename=f"diagnostic_iter{iteration_index}.mid",
+                        ),
+                    )
+                    for exported in iteration_variant_report.exported_files:
+                        if exported.role == "WORKING":
+                            output_files[f"working_iter{iteration_index}_midi"] = exported.path
+
+                if iterative_best_iteration_index > 0:
+                    best_notes_path = (
+                        analysis_dir
+                        / f"iterative_repair_iteration_{iterative_best_iteration_index}_notes.json"
+                    )
+                    best_plan_path = (
+                        analysis_dir
+                        / f"iterative_repair_iteration_{iterative_best_iteration_index}_plan.json"
+                    )
+                    best_variant_report = export_working_midi(
+                        notes_file=note_events_path,
+                        cleanup_plan_file=cleanup_plan_path,
+                        output_dir=working_midi_dir,
+                        params=WorkingMidiExportParameters(
+                            ticks_per_beat=params.ticks_per_beat,
+                            track_name_prefix=params.track_name_prefix,
+                            include_diagnostic=False,
+                            write_empty_files=params.write_empty_files,
+                            refined_notes_file=best_notes_path,
+                            repair_plan_file=best_plan_path,
+                            audio_aligned_notes_file=audio_aligned_note_events_path,
+                            repair_extend_count=activity_repair_summary["extend_count"],
+                            repair_shorten_count=activity_repair_summary["shorten_count"],
+                            repair_insert_missing_count=activity_repair_summary[
+                                "insert_missing_count"
+                            ],
+                            repair_split_count=activity_repair_summary["split_count"],
+                            repair_close_gap_count=activity_repair_summary["close_gap_count"],
+                            repair_review_manual_count=activity_repair_summary[
+                                "review_manual_count"
+                            ],
+                            working_filename="working_best.mid",
+                            rejected_filename="rejected_best.mid",
+                            diagnostic_filename="diagnostic_best.mid",
+                        ),
+                    )
+                    for exported in best_variant_report.exported_files:
+                        if exported.role == "WORKING":
+                            output_files["working_best_midi"] = exported.path
+
+            stages.append(
+                PipelineStageReport(
+                    name="iterative_repair",
+                    status="ok",
+                    output_files=iterative_stage_outputs,
+                    warning_count=iterative_report.warning_count,
+                    warnings=iterative_report.warnings,
+                )
+            )
+            warnings.extend([f"iterative_repair: {item}" for item in iterative_report.warnings])
+        else:
+            final_repaired_note_events_path = None
+            iterative_repair_report_path = None
+            iterative_best_plan_path = None
+            iterative_best_iteration_index = 0
+            stages.append(
+                PipelineStageReport(
+                    name="iterative_repair",
+                    status="ok",
+                    output_files=[],
+                    warning_count=0,
+                    warnings=[],
+                )
+            )
+
+        # Stage 10: Cleanup planning
         current_stage = "cleanup_plan"
         output_files["cleanup_plan"] = str(cleanup_plan_path)
         output_files["cleanup_plan_report"] = str(cleanup_plan_report_path)
@@ -766,7 +996,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"cleanup_plan: {item}" for item in cleanup_report.warnings])
 
-        # Stage 10: Review MIDI export (backward compatible)
+        # Stage 11: Review MIDI export (backward compatible)
         current_stage = "review_midi_export"
         review_export_report_path = review_midi_dir / "export_report.json"
         review_export_report = export_review_midi(
@@ -796,7 +1026,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"review_midi_export: {item}" for item in review_export_report.warnings])
 
-        # Stage 11: Cleaned MIDI export (backward compatible)
+        # Stage 12: Cleaned MIDI export (backward compatible)
         current_stage = "cleaned_midi_export"
         cleaned_export_report_path = cleaned_midi_dir / "cleaned_export_report.json"
         cleaned_export_report = export_cleaned_midi(
@@ -827,13 +1057,22 @@ def process_stem_pipeline(
         )
         warnings.extend([f"cleaned_midi_export: {item}" for item in cleaned_export_report.warnings])
 
-        # Stage 12: Working MIDI export
+        # Stage 13: Working MIDI export
         current_stage = "working_midi_export"
         working_export_report_path = working_midi_dir / "working_export_report.json"
         working_refined_notes_file = (
-            repaired_refined_note_events_path
-            if repaired_refined_note_events_path is not None
-            else refined_note_events_path
+            final_repaired_note_events_path
+            if final_repaired_note_events_path is not None
+            else (
+                repaired_refined_note_events_path
+                if repaired_refined_note_events_path is not None
+                else refined_note_events_path
+            )
+        )
+        working_repair_plan_file = (
+            iterative_best_plan_path
+            if iterative_best_plan_path is not None
+            else activity_repair_plan_path
         )
         working_export_report = export_working_midi(
             notes_file=note_events_path,
@@ -845,7 +1084,7 @@ def process_stem_pipeline(
                 include_diagnostic=params.include_diagnostic_working_midi,
                 write_empty_files=params.write_empty_files,
                 refined_notes_file=working_refined_notes_file,
-                repair_plan_file=activity_repair_plan_path,
+                repair_plan_file=working_repair_plan_file,
                 audio_aligned_notes_file=audio_aligned_note_events_path,
                 repair_extend_count=activity_repair_summary["extend_count"],
                 repair_shorten_count=activity_repair_summary["shorten_count"],

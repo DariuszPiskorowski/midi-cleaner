@@ -60,6 +60,14 @@ def _expected_paths(project_dir: Path) -> list[Path]:
         project_dir / "analysis" / "repaired_refined_note_events.json",
         project_dir / "analysis" / "activity_repair_plan.json",
         project_dir / "analysis" / "activity_repair_report.json",
+        project_dir / "analysis" / "iterative_repair_report.json",
+        project_dir / "analysis" / "iterative_repair_iteration_1_plan.json",
+        project_dir / "analysis" / "iterative_repair_iteration_1_notes.json",
+        project_dir / "analysis" / "iterative_repair_iteration_2_plan.json",
+        project_dir / "analysis" / "iterative_repair_iteration_2_notes.json",
+        project_dir / "analysis" / "iterative_repair_iteration_3_plan.json",
+        project_dir / "analysis" / "iterative_repair_iteration_3_notes.json",
+        project_dir / "analysis" / "final_repaired_note_events.json",
         project_dir / "cleanup" / "cleanup_plan.json",
         project_dir / "cleanup" / "cleanup_plan_report.json",
         project_dir / "midi" / "review" / "keep.mid",
@@ -71,6 +79,10 @@ def _expected_paths(project_dir: Path) -> list[Path]:
         project_dir / "midi" / "cleaned" / "rejected.mid",
         project_dir / "midi" / "cleaned" / "cleaned_export_report.json",
         project_dir / "midi" / "working" / "working.mid",
+        project_dir / "midi" / "working" / "working_iter1.mid",
+        project_dir / "midi" / "working" / "working_iter2.mid",
+        project_dir / "midi" / "working" / "working_iter3.mid",
+        project_dir / "midi" / "working" / "working_best.mid",
         project_dir / "midi" / "working" / "rejected.mid",
         project_dir / "midi" / "working" / "working_export_report.json",
         project_dir / "reports" / "pipeline_report.json",
@@ -113,7 +125,7 @@ def test_process_stem_creates_expected_structure_and_reports(tmp_path: Path) -> 
         (project_dir / "midi" / "working" / "working_export_report.json").read_text(encoding="utf-8")
     )
     assert working_export_report["refined_notes_file"].endswith(
-        "repaired_refined_note_events.json"
+        "final_repaired_note_events.json"
     )
 
 
@@ -171,6 +183,8 @@ def test_cli_process_stem_end_to_end(tmp_path: Path) -> None:
     assert (project_dir / "analysis" / "bass_pitch_contour.json").exists()
     assert (project_dir / "analysis" / "refined_note_events.json").exists()
     assert (project_dir / "analysis" / "repaired_refined_note_events.json").exists()
+    assert (project_dir / "analysis" / "iterative_repair_report.json").exists()
+    assert (project_dir / "analysis" / "final_repaired_note_events.json").exists()
     assert (project_dir / "midi" / "review" / "export_report.json").exists()
     assert (project_dir / "midi" / "cleaned" / "cleaned_export_report.json").exists()
     assert (project_dir / "midi" / "working" / "working_export_report.json").exists()
@@ -249,11 +263,67 @@ def test_pipeline_can_disable_activity_repair(tmp_path: Path) -> None:
     assert not (project_dir / "analysis" / "repaired_refined_note_events.json").exists()
     assert not (project_dir / "analysis" / "activity_repair_plan.json").exists()
     assert not (project_dir / "analysis" / "activity_repair_report.json").exists()
+    assert not (project_dir / "analysis" / "iterative_repair_report.json").exists()
+    assert not (project_dir / "analysis" / "final_repaired_note_events.json").exists()
 
     working_export_report = json.loads(
         (project_dir / "midi" / "working" / "working_export_report.json").read_text(encoding="utf-8")
     )
     assert working_export_report["refined_notes_file"].endswith("refined_note_events.json")
+
+
+def test_pipeline_can_disable_iterative_repair(tmp_path: Path) -> None:
+    midi_path = tmp_path / "candidate_no_iter.mid"
+    wav_path = tmp_path / "stem_no_iter.wav"
+    project_dir = tmp_path / "pipeline_no_iter"
+
+    _write_candidate_midi(midi_path)
+    _write_stem_wav(wav_path)
+
+    report = process_stem_pipeline(
+        input_midi=midi_path,
+        input_wav=wav_path,
+        source="ripx",
+        layer="bass",
+        project_dir=project_dir,
+        params=PipelineProcessParameters(enable_iterative_repair=False),
+    )
+
+    assert report.status == "ok"
+    assert (project_dir / "analysis" / "repaired_refined_note_events.json").exists()
+    assert not (project_dir / "analysis" / "iterative_repair_report.json").exists()
+    assert not (project_dir / "analysis" / "final_repaired_note_events.json").exists()
+
+    working_export_report = json.loads(
+        (project_dir / "midi" / "working" / "working_export_report.json").read_text(encoding="utf-8")
+    )
+    assert working_export_report["refined_notes_file"].endswith(
+        "repaired_refined_note_events.json"
+    )
+
+
+def test_pipeline_iterative_outputs_without_variant_midis(tmp_path: Path) -> None:
+    midi_path = tmp_path / "candidate_no_variants.mid"
+    wav_path = tmp_path / "stem_no_variants.wav"
+    project_dir = tmp_path / "pipeline_no_variants"
+
+    _write_candidate_midi(midi_path)
+    _write_stem_wav(wav_path)
+
+    report = process_stem_pipeline(
+        input_midi=midi_path,
+        input_wav=wav_path,
+        source="ripx",
+        layer="bass",
+        project_dir=project_dir,
+        params=PipelineProcessParameters(export_iteration_variants=False),
+    )
+
+    assert report.status == "ok"
+    assert (project_dir / "analysis" / "iterative_repair_report.json").exists()
+    assert (project_dir / "analysis" / "final_repaired_note_events.json").exists()
+    assert not (project_dir / "midi" / "working" / "working_iter1.mid").exists()
+    assert not (project_dir / "midi" / "working" / "working_best.mid").exists()
 
 
 def test_pipeline_can_disable_pitch_contour(tmp_path: Path) -> None:

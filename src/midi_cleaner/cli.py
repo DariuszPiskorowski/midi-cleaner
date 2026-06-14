@@ -57,6 +57,11 @@ from midi_cleaner.repair.activity import (
     ActivityRepairParameters,
     repair_activity,
 )
+from midi_cleaner.repair.iterative import (
+    IterativeRepairError,
+    IterativeRepairParameters,
+    run_iterative_activity_repair,
+)
 from midi_cleaner.refinement.bass import (
     BassRefinementError,
     BassRefinementParameters,
@@ -767,6 +772,24 @@ def repair_activity_command(
         0.75,
         "--insert-from-pitch-contour-confidence",
     ),
+    enable_iterative_repair: bool = typer.Option(
+        True,
+        "--enable-iterative-repair/--no-enable-iterative-repair",
+    ),
+    repair_iterations: int = typer.Option(3, "--repair-iterations"),
+    repair_min_improvement: float = typer.Option(0.005, "--repair-min-improvement"),
+    freeze_stable_notes: bool = typer.Option(
+        True,
+        "--freeze-stable-notes/--no-freeze-stable-notes",
+    ),
+    conservative_final_pass: bool = typer.Option(
+        True,
+        "--conservative-final-pass/--no-conservative-final-pass",
+    ),
+    export_iteration_variants: bool = typer.Option(
+        True,
+        "--export-iteration-variants/--no-export-iteration-variants",
+    ),
 ) -> None:
     params = ActivityRepairParameters(
         audio_active_threshold_ratio=audio_active_threshold_ratio,
@@ -779,6 +802,12 @@ def repair_activity_command(
         split_auto_confidence=split_auto_confidence,
         split_pitch_change_semitones=split_pitch_change_semitones,
         insert_from_pitch_contour_confidence=insert_from_pitch_contour_confidence,
+        enable_iterative_repair=enable_iterative_repair,
+        repair_iterations=repair_iterations,
+        repair_min_improvement=repair_min_improvement,
+        freeze_stable_notes=freeze_stable_notes,
+        conservative_final_pass=conservative_final_pass,
+        export_iteration_variants=export_iteration_variants,
     )
 
     try:
@@ -815,6 +844,114 @@ def repair_activity_command(
         f"split={repair_report.split_count}, "
         f"review={repair_report.review_manual_count}, "
         f"warnings={repair_report.warning_count}"
+    )
+
+
+@repair_app.command("iterative")
+def repair_iterative_command(
+    refined_notes: Path = typer.Option(
+        ..., "--refined-notes", help="Path to refined_note_events.json."
+    ),
+    audio_features: Path = typer.Option(
+        ..., "--audio-features", help="Path to audio_features.json."
+    ),
+    cleanup_plan: Path = typer.Option(
+        ..., "--cleanup-plan", help="Path to cleanup_plan.json."
+    ),
+    output: Path = typer.Option(
+        ..., "--output", help="Output path for final repaired refined notes JSON."
+    ),
+    report: Path = typer.Option(
+        ..., "--report", help="Output path for iterative repair report JSON."
+    ),
+    dsp_features: Path | None = typer.Option(
+        None,
+        "--dsp-features",
+        help="Optional path to audio_features_dsp.json.",
+    ),
+    pitch_contour: Path | None = typer.Option(
+        None,
+        "--pitch-contour",
+        help="Optional path to bass_pitch_contour.json.",
+    ),
+    max_iterations: int = typer.Option(3, "--max-iterations"),
+    min_improvement: float = typer.Option(0.005, "--min-improvement"),
+    conservative_final_pass: bool = typer.Option(
+        True,
+        "--conservative-final-pass/--no-conservative-final-pass",
+    ),
+    freeze_stable_notes: bool = typer.Option(
+        True,
+        "--freeze-stable-notes/--no-freeze-stable-notes",
+    ),
+    pass1_profile: str = typer.Option(
+        "balanced",
+        "--pass1-profile",
+        help="Pass-1 profile: balanced|sustain_legato|aggressive.",
+    ),
+    pass2_profile: str = typer.Option(
+        "sustain_legato",
+        "--pass2-profile",
+        help="Pass-2 profile: balanced|sustain_legato|aggressive.",
+    ),
+    pass3_profile: str = typer.Option(
+        "conservative",
+        "--pass3-profile",
+        help="Pass-3 profile: conservative|sustain_legato|balanced.",
+    ),
+) -> None:
+    pass12_allowed = {"balanced", "sustain_legato", "aggressive"}
+    pass3_allowed = {"conservative", "sustain_legato", "balanced"}
+    if pass1_profile not in pass12_allowed:
+        typer.echo(f"Invalid --pass1-profile: {pass1_profile}", err=True)
+        raise typer.Exit(code=1)
+    if pass2_profile not in pass12_allowed:
+        typer.echo(f"Invalid --pass2-profile: {pass2_profile}", err=True)
+        raise typer.Exit(code=1)
+    if pass3_profile not in pass3_allowed:
+        typer.echo(f"Invalid --pass3-profile: {pass3_profile}", err=True)
+        raise typer.Exit(code=1)
+
+    iterative_params = IterativeRepairParameters(
+        max_iterations=max_iterations,
+        min_improvement=min_improvement,
+        conservative_final_pass=conservative_final_pass,
+        freeze_stable_notes=freeze_stable_notes,
+        pass1_profile=pass1_profile,
+        pass2_profile=pass2_profile,
+        pass3_profile=pass3_profile,
+    )
+
+    try:
+        final_document, iterative_report, _artifacts = run_iterative_activity_repair(
+            refined_notes_file=refined_notes,
+            audio_features_file=audio_features,
+            cleanup_plan_file=cleanup_plan,
+            params=iterative_params,
+            activity_params=ActivityRepairParameters(),
+            dsp_features_file=dsp_features,
+            pitch_contour_file=pitch_contour,
+        )
+    except IterativeRepairError as exc:
+        typer.echo(f"Iterative repair failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    report.parent.mkdir(parents=True, exist_ok=True)
+
+    output.write_text(final_document.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    iterative_report.final_repaired_notes_file = str(output)
+    iterative_report.output_file = str(report)
+    report.write_text(iterative_report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    typer.echo(
+        "Iterative repair complete: "
+        f"iterations={iterative_report.iterations_completed}/{iterative_report.iterations_requested}, "
+        f"best_iteration={iterative_report.best_iteration_index}, "
+        f"initial_score={iterative_report.initial_score:.4f}, "
+        f"final_score={iterative_report.final_score:.4f}, "
+        f"improvement={iterative_report.total_improvement:.4f}, "
+        f"warnings={iterative_report.warning_count}"
     )
 
 

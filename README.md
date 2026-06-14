@@ -2,7 +2,7 @@
 
 Hermes MIDI Fidelity Engine project scaffold.
 
-This repository cleans and validates MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 13B**: bass pitch contour analysis and sustain-aware repair guards on top of Milestones 11/12/13A.
+This repository cleans and validates MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 14**: bounded iterative MIDI self-repair on top of Milestones 11/12/13A/13B.
 
 Milestone 10.1 integration and reporting hardening is now in place:
 - Validation consumes audio-aligned timing when alignment data exists.
@@ -44,12 +44,21 @@ Milestone 13B sustain-aware repair guards are now in place:
 - Pitch contour is used as repair evidence, not treated as final truth.
 - Overhang shortening is conservative and uncertainty is routed to `REVIEW_MANUAL`.
 
-Future Milestone 13 work remains planned:
-- Milestone 13C: render-back audio comparison.
+Future render-back work remains planned:
+- Milestone 15 (13C): render-back audio comparison.
+
+Milestone 14 iterative self-repair is now in place:
+- Adds a bounded multi-pass repair controller after activity repair and before final working export.
+- Each pass re-scores candidate MIDI activity against WAV/DSP/pitch evidence.
+- Pass profiles support `balanced`, `sustain_legato`, `aggressive`, and final-pass `conservative` behavior.
+- Stable-region freezing can lock good regions across passes to prevent unnecessary re-edits.
+- Regression guard can reject score regressions and keep the best prior candidate.
+- Pipeline outputs include per-iteration plans/notes, iterative report, and `analysis/final_repaired_note_events.json`.
+- Working export uses final repaired notes and can export `working_iter1.mid`, `working_iter2.mid`, `working_iter3.mid`, and `working_best.mid` for REAPER comparison.
 
 ## Current Milestone
 
-Milestone 13B currently implements:
+Milestone 14 currently implements:
 - Python package scaffold
 - Strict Python 3.11 guard
 - Runtime/environment report via CLI doctor command
@@ -89,6 +98,10 @@ Milestone 13B currently implements:
 - QA report includes DSP backend/frame classification summary metrics
 - QA report includes activity-repair summary fields and per-note repair columns
 - QA report includes sustain/pitch/legato protection and shorten decision counters
+- Bounded iterative repair loop with pass-specific profiles and deterministic stopping
+- Iterative scoring with coverage/overhang/continuity/pitch metrics and error-region counting
+- Stable note/region freezing and optional conservative final pass
+- Iteration artifact exports and optional working MIDI variants for visual comparison
 - Tests for guard behavior, MIDI import, audio analysis, validation, cleanup planning, review MIDI export, cleaned MIDI export, process-stem pipeline, and QA reports
 
 Destructive note deletion, rendering, UI, and ML are not implemented yet.
@@ -252,6 +265,24 @@ Example:
 uv run midi-cleaner repair activity --refined-notes .\artifacts\refined_note_events.json --audio-features .\artifacts\audio_features.json --cleanup-plan .\artifacts\cleanup_plan.json --output .\artifacts\repaired_refined_note_events.json --plan .\artifacts\activity_repair_plan.json --report .\artifacts\activity_repair_report.json
 ```
 
+## Iterative MIDI Self-Repair
+
+```powershell
+uv run midi-cleaner repair iterative --refined-notes REFINED_NOTE_EVENTS_JSON --audio-features AUDIO_FEATURES_JSON --cleanup-plan CLEANUP_PLAN_JSON --output FINAL_REPAIRED_REFINED_NOTES_JSON --report ITERATIVE_REPAIR_REPORT_JSON
+```
+
+Optional DSP and pitch inputs:
+
+```powershell
+uv run midi-cleaner repair iterative --refined-notes REFINED_NOTE_EVENTS_JSON --audio-features AUDIO_FEATURES_JSON --cleanup-plan CLEANUP_PLAN_JSON --dsp-features AUDIO_FEATURES_DSP_JSON --pitch-contour BASS_PITCH_CONTOUR_JSON --output FINAL_REPAIRED_REFINED_NOTES_JSON --report ITERATIVE_REPAIR_REPORT_JSON
+```
+
+Example:
+
+```powershell
+uv run midi-cleaner repair iterative --refined-notes .\artifacts\repaired_refined_note_events.json --audio-features .\artifacts\audio_features.json --cleanup-plan .\artifacts\cleanup_plan.json --dsp-features .\artifacts\audio_features_dsp.json --pitch-contour .\artifacts\bass_pitch_contour.json --output .\artifacts\final_repaired_note_events.json --report .\artifacts\iterative_repair_report.json
+```
+
 ## Cleanup Plan (Non-Destructive)
 
 ```powershell
@@ -351,6 +382,14 @@ Activity repair controls (defaults shown):
 - `--split-pitch-change-semitones` (default `0.75`)
 - `--insert-from-pitch-contour-confidence` (default `0.75`)
 
+Iterative repair controls (defaults shown):
+- `--enable-iterative-repair/--no-enable-iterative-repair` (default enabled for bass)
+- `--repair-iterations` (default `3`)
+- `--repair-min-improvement` (default `0.005`)
+- `--freeze-stable-notes/--no-freeze-stable-notes` (default enabled)
+- `--conservative-final-pass/--no-conservative-final-pass` (default enabled)
+- `--export-iteration-variants/--no-export-iteration-variants` (default enabled)
+
 Example:
 
 ```powershell
@@ -371,4 +410,4 @@ uv run midi-cleaner pipeline qa-report --project-dir .\artifacts\pipeline_run
 
 ## Planned Pipeline
 
-Suno/RipX stem WAV -> RipX MIDI candidate -> Hermes note-event JSON -> WAV comparison -> DSP analysis (additive) -> bass pitch contour (additive) -> audio-time alignment -> validation -> bass refinement -> activity repair (sustain-aware guards) -> cleanup planning/exports -> working/rejected (prefers repaired refined notes) -> QA artifacts
+Suno/RipX stem WAV -> RipX MIDI candidate -> Hermes note-event JSON -> WAV comparison -> DSP analysis (additive) -> bass pitch contour (additive) -> audio-time alignment -> validation -> bass refinement -> activity repair (sustain-aware guards) -> iterative repair loop (pass1/pass2/pass3 with scoring and freeze guards) -> cleanup planning/exports -> working/rejected (uses final repaired notes) -> QA artifacts

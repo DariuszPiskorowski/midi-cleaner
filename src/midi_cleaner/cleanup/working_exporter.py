@@ -36,6 +36,9 @@ class WorkingMidiExportParameters:
     repair_split_count: int = 0
     repair_close_gap_count: int = 0
     repair_review_manual_count: int = 0
+    working_filename: str = "working.mid"
+    rejected_filename: str = "rejected.mid"
+    diagnostic_filename: str = "diagnostic.mid"
 
 
 @dataclass(frozen=True)
@@ -212,8 +215,16 @@ def _build_refined_export_notes(
         note_ids = [refined.note_id, *refined.merged_note_ids]
         resolved_action = _resolve_action_from_ids(note_ids, action_by_note_id)
         if resolved_action is None:
-            warnings.append(f"No cleanup action for refined note and merges: {refined.note_id}")
-            continue
+            # Keep iterative/repair-generated notes in working exports by default.
+            if refined.note_id.startswith(("repair_missing_", "repair_split_")):
+                resolved_action = "KEEP"
+                warnings.append(
+                    "No cleanup action for repair-generated note; defaulted to KEEP: "
+                    f"{refined.note_id}"
+                )
+            else:
+                warnings.append(f"No cleanup action for refined note and merges: {refined.note_id}")
+                continue
 
         source_note = note_by_id.get(refined.note_id)
         if source_note is None:
@@ -424,21 +435,21 @@ def export_working_midi(
     export_specs: list[tuple[str, str, list[_ExportNote], list[str], bool]] = [
         (
             "WORKING",
-            "working.mid",
+            params.working_filename,
             working_notes,
             ["KEEP", "REVIEW"],
             True,
         ),
         (
             "REJECTED",
-            "rejected.mid",
+            params.rejected_filename,
             rejected_notes,
             ["DELETE_CANDIDATE", "MUTE"],
             True,
         ),
         (
             "DIAGNOSTIC",
-            "diagnostic.mid",
+            params.diagnostic_filename,
             diagnostic_notes,
             ["KEEP", "REVIEW", "MUTE", "DELETE_CANDIDATE"],
             params.include_diagnostic,

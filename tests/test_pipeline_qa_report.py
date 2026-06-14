@@ -435,6 +435,112 @@ def _write_pipeline_like_project(tmp_path: Path, include_optional: bool = True) 
             encoding="utf-8",
         )
 
+        (project_dir / "analysis" / "iterative_repair_report.json").write_text(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "layer": "bass",
+                    "input_refined_notes_file": "analysis/repaired_refined_note_events.json",
+                    "final_repaired_notes_file": "analysis/final_repaired_note_events.json",
+                    "iterations_requested": 3,
+                    "iterations_completed": 3,
+                    "convergence_reached": True,
+                    "best_iteration_index": 2,
+                    "final_score": 0.91,
+                    "initial_score": 0.82,
+                    "total_improvement": 0.09,
+                    "warning_count": 0,
+                    "warnings": [],
+                    "iterations": [
+                        {
+                            "iteration_index": 1,
+                            "input_note_count": 3,
+                            "output_note_count": 3,
+                            "applied_action_count": 2,
+                            "candidate_action_count": 5,
+                            "extend_count": 1,
+                            "shorten_count": 0,
+                            "insert_count": 1,
+                            "split_count": 0,
+                            "merge_count": 0,
+                            "close_gap_count": 0,
+                            "protected_count": 0,
+                            "review_manual_count": 0,
+                            "audio_gap_count": 1,
+                            "midi_overhang_count": 0,
+                            "unresolved_error_count": 2,
+                            "coverage_score": 0.86,
+                            "overhang_score": 0.95,
+                            "continuity_score": 0.84,
+                            "pitch_consistency_score": 0.88,
+                            "total_score": 0.87,
+                            "improvement_from_previous": 0.05,
+                            "stopped_reason": None,
+                        },
+                        {
+                            "iteration_index": 2,
+                            "input_note_count": 3,
+                            "output_note_count": 2,
+                            "applied_action_count": 1,
+                            "candidate_action_count": 4,
+                            "extend_count": 0,
+                            "shorten_count": 1,
+                            "insert_count": 0,
+                            "split_count": 0,
+                            "merge_count": 0,
+                            "close_gap_count": 0,
+                            "protected_count": 1,
+                            "review_manual_count": 0,
+                            "audio_gap_count": 0,
+                            "midi_overhang_count": 0,
+                            "unresolved_error_count": 1,
+                            "coverage_score": 0.91,
+                            "overhang_score": 0.95,
+                            "continuity_score": 0.90,
+                            "pitch_consistency_score": 0.89,
+                            "total_score": 0.91,
+                            "improvement_from_previous": 0.04,
+                            "stopped_reason": None,
+                        },
+                        {
+                            "iteration_index": 3,
+                            "input_note_count": 2,
+                            "output_note_count": 2,
+                            "applied_action_count": 0,
+                            "candidate_action_count": 2,
+                            "extend_count": 0,
+                            "shorten_count": 0,
+                            "insert_count": 0,
+                            "split_count": 0,
+                            "merge_count": 0,
+                            "close_gap_count": 0,
+                            "protected_count": 1,
+                            "review_manual_count": 1,
+                            "audio_gap_count": 0,
+                            "midi_overhang_count": 0,
+                            "unresolved_error_count": 1,
+                            "coverage_score": 0.91,
+                            "overhang_score": 0.95,
+                            "continuity_score": 0.90,
+                            "pitch_consistency_score": 0.89,
+                            "total_score": 0.91,
+                            "improvement_from_previous": 0.0,
+                            "stopped_reason": "min_improvement_not_met",
+                        },
+                    ],
+                    "output_file": "analysis/iterative_repair_report.json",
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        (project_dir / "analysis" / "final_repaired_note_events.json").write_text(
+            repaired_doc.model_dump_json(indent=2) + "\n",
+            encoding="utf-8",
+        )
+
         alignment_report = AudioAlignmentReport(
             notes_file="analysis/note_events.json",
             audio_features_file="analysis/audio_features.json",
@@ -518,7 +624,7 @@ def _write_pipeline_like_project(tmp_path: Path, include_optional: bool = True) 
         working_report = WorkingMidiExportReport(
             notes_file="analysis/note_events.json",
             cleanup_plan_file="cleanup/cleanup_plan.json",
-            refined_notes_file="analysis/repaired_refined_note_events.json",
+            refined_notes_file="analysis/final_repaired_note_events.json",
             repair_plan_file="analysis/activity_repair_plan.json",
             audio_aligned_notes_file="analysis/audio_aligned_note_events.json",
             status="ok",
@@ -640,6 +746,9 @@ def test_csv_contains_expected_rows(tmp_path: Path) -> None:
     assert "was_split_by_repair" in rows[0]
     assert "was_extended_by_repair" in rows[0]
     assert "was_shortened_by_repair" in rows[0]
+    assert "final_iteration_changed" in rows[0]
+    assert "stable_region" in rows[0]
+    assert "iterative_repair_actions" in rows[0]
     assert "alignment_action" in rows[0]
     assert "alignment_confidence" in rows[0]
     assert "validation_action" in rows[0]
@@ -668,6 +777,9 @@ def test_html_contains_sections_and_escaped_content(tmp_path: Path) -> None:
     assert "repair_sustain_protected_count" in html_text
     assert "repair_pitch_protected_count" in html_text
     assert "repair_shorten_rejected_count" in html_text
+    assert "Iterative Repair" in html_text
+    assert "repair_iterations_completed" in html_text
+    assert "repair_stopped_reason" in html_text
     assert "Top 25 Lowest-Confidence Notes" in html_text
     assert "&lt;unsafe&gt;" in html_text
 
@@ -711,6 +823,14 @@ def test_summary_contains_audio_sync_fields(tmp_path: Path) -> None:
     assert summary.audio_gap_count == 1
     assert summary.working_midi_note_count == 2
     assert summary.working_export_time_error_ms == 0.4
+    assert summary.iterative_repair_enabled is True
+    assert summary.repair_iterations_completed == 3
+    assert summary.repair_initial_score == 0.82
+    assert summary.repair_final_score == 0.91
+    assert summary.repair_total_improvement == 0.09
+    assert summary.repair_best_iteration_index == 2
+    assert summary.repair_convergence_reached is True
+    assert summary.repair_stopped_reason == "min_improvement_not_met"
 
 
 def test_missing_optional_reports_warns_but_succeeds(tmp_path: Path) -> None:

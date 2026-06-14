@@ -48,6 +48,9 @@ class QANoteRow(BaseModel):
     was_split_by_repair: bool = False
     was_extended_by_repair: bool = False
     was_shortened_by_repair: bool = False
+    final_iteration_changed: bool = False
+    stable_region: bool = False
+    iterative_repair_actions: str | None = None
     alignment_action: str | None
     alignment_confidence: float | None
     confidence: float
@@ -104,6 +107,14 @@ class QASummary(BaseModel):
     midi_active_region_count: int = 0
     audio_gap_count: int = 0
     midi_overhang_count: int = 0
+    iterative_repair_enabled: bool = False
+    repair_iterations_completed: int = 0
+    repair_initial_score: float | None = None
+    repair_final_score: float | None = None
+    repair_total_improvement: float | None = None
+    repair_best_iteration_index: int = 0
+    repair_convergence_reached: bool = False
+    repair_stopped_reason: str | None = None
     working_midi_note_count: int = 0
     working_export_time_error_ms: float | None = None
     validation_timing_source: str | None
