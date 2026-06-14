@@ -1116,6 +1116,24 @@ def process_stem_command(
         0.75,
         "--insert-from-pitch-contour-confidence",
     ),
+    enable_iterative_repair: bool = typer.Option(
+        True,
+        "--enable-iterative-repair/--no-enable-iterative-repair",
+    ),
+    repair_iterations: int = typer.Option(3, "--repair-iterations"),
+    repair_min_improvement: float = typer.Option(0.005, "--repair-min-improvement"),
+    freeze_stable_notes: bool = typer.Option(
+        True,
+        "--freeze-stable-notes/--no-freeze-stable-notes",
+    ),
+    conservative_final_pass: bool = typer.Option(
+        True,
+        "--conservative-final-pass/--no-conservative-final-pass",
+    ),
+    export_iteration_variants: bool = typer.Option(
+        True,
+        "--export-iteration-variants/--no-export-iteration-variants",
+    ),
 ) -> None:
     params = PipelineProcessParameters(
         onset_window_ms=onset_window_ms,
@@ -1172,6 +1190,12 @@ def process_stem_command(
         split_auto_confidence=split_auto_confidence,
         split_pitch_change_semitones=split_pitch_change_semitones,
         insert_from_pitch_contour_confidence=insert_from_pitch_contour_confidence,
+        enable_iterative_repair=enable_iterative_repair,
+        repair_iterations=repair_iterations,
+        repair_min_improvement=repair_min_improvement,
+        freeze_stable_notes=freeze_stable_notes,
+        conservative_final_pass=conservative_final_pass,
+        export_iteration_variants=export_iteration_variants,
     )
 
     try:
