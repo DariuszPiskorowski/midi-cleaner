@@ -42,6 +42,12 @@ class QANoteRow(BaseModel):
     end_refinement_ms: float | None = None
     refinement_actions: str | None = None
     merged_note_ids: str | None = None
+    repair_actions: str | None = None
+    repair_reason_summary: str | None = None
+    was_inserted_by_repair: bool = False
+    was_split_by_repair: bool = False
+    was_extended_by_repair: bool = False
+    was_shortened_by_repair: bool = False
     alignment_action: str | None
     alignment_confidence: float | None
     confidence: float
@@ -80,6 +86,18 @@ class QASummary(BaseModel):
     dsp_tail_count: int = 0
     dsp_silence_count: int = 0
     dsp_debug_csv_file: str | None = None
+    activity_repair_enabled: bool = False
+    repaired_note_count: int = 0
+    repair_extend_count: int = 0
+    repair_shorten_count: int = 0
+    repair_insert_missing_count: int = 0
+    repair_split_count: int = 0
+    repair_close_gap_count: int = 0
+    repair_review_manual_count: int = 0
+    audio_active_region_count: int = 0
+    midi_active_region_count: int = 0
+    audio_gap_count: int = 0
+    midi_overhang_count: int = 0
     working_midi_note_count: int = 0
     working_export_time_error_ms: float | None = None
     validation_timing_source: str | None

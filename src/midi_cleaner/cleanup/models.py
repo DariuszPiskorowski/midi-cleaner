@@ -116,6 +116,7 @@ class WorkingMidiExportReport(BaseModel):
     notes_file: str
     cleanup_plan_file: str
     refined_notes_file: str | None
+    repair_plan_file: str | None = None
     audio_aligned_notes_file: str | None
     status: Literal["ok", "error"]
     layer: str
@@ -137,6 +138,12 @@ class WorkingMidiExportReport(BaseModel):
     working_note_count: int
     rejected_note_count: int
     diagnostic_note_count: int
+    repair_extend_count: int = 0
+    repair_shorten_count: int = 0
+    repair_insert_missing_count: int = 0
+    repair_split_count: int = 0
+    repair_close_gap_count: int = 0
+    repair_review_manual_count: int = 0
     exported_files: list[WorkingMidiExportFile]
     warning_count: int
     warnings: list[str]

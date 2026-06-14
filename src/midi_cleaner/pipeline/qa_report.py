@@ -14,6 +14,7 @@ from midi_cleaner.alignment.models import (
 )
 from midi_cleaner.cleanup.models import CleanupPlanDocument, WorkingMidiExportReport
 from midi_cleaner.pipeline.models import PipelineReport, QANoteRow, QASummary
+from midi_cleaner.repair.models import ActivityRepairReport
 from midi_cleaner.refinement.models import BassRefinementReport, RefinedNoteDocument, RefinedNoteEvent
 from midi_cleaner.validation.models import NoteValidationDocument
 
@@ -65,6 +66,10 @@ def _load_working_export_report(path: Path) -> WorkingMidiExportReport:
     return WorkingMidiExportReport.model_validate_json(path.read_text(encoding="utf-8"))
 
 
+def _load_activity_repair_report(path: Path) -> ActivityRepairReport:
+    return ActivityRepairReport.model_validate_json(path.read_text(encoding="utf-8"))
+
+
 def _build_rows(
     note_validation: NoteValidationDocument | None,
     cleanup_plan: CleanupPlanDocument | None,
@@ -103,6 +108,8 @@ def _build_rows(
             continue
         if any(merged_id in validation_note_ids for merged_id in refined.merged_note_ids):
             continue
+        if any(action.startswith("ACTIVITY_REPAIR_") for action in refined.refinement_actions):
+            continue
         warnings.append(f"refinement contains unknown note_id: {note_id}")
 
     rows: list[QANoteRow] = []
@@ -127,6 +134,12 @@ def _build_rows(
         end_refinement_ms: float | None = None
         refinement_actions: str | None = None
         merged_note_ids: str | None = None
+        repair_actions: str | None = None
+        repair_reason_summary: str | None = None
+        was_inserted_by_repair = False
+        was_split_by_repair = False
+        was_extended_by_repair = False
+        was_shortened_by_repair = False
 
         if aligned is not None:
             original_start_sec = float(aligned.original_start_sec)
@@ -143,6 +156,20 @@ def _build_rows(
             end_refinement_ms = float(refined.end_refinement_ms)
             refinement_actions = "; ".join(refined.refinement_actions)
             merged_note_ids = "; ".join(refined.merged_note_ids)
+
+            repair_tokens = [
+                action
+                for action in refined.refinement_actions
+                if action.startswith("ACTIVITY_REPAIR_")
+            ]
+            if repair_tokens:
+                repair_actions = "; ".join(repair_tokens)
+                repair_reason_summary = "; ".join(refined.reasons)
+            token_set = set(repair_tokens)
+            was_inserted_by_repair = "ACTIVITY_REPAIR_INSERTED" in token_set
+            was_split_by_repair = "ACTIVITY_REPAIR_SPLIT" in token_set
+            was_extended_by_repair = "ACTIVITY_REPAIR_EXTENDED" in token_set
+            was_shortened_by_repair = "ACTIVITY_REPAIR_SHORTENED" in token_set
 
         rows.append(
             QANoteRow(
@@ -161,6 +188,12 @@ def _build_rows(
                 end_refinement_ms=end_refinement_ms,
                 refinement_actions=refinement_actions,
                 merged_note_ids=merged_note_ids,
+                repair_actions=repair_actions,
+                repair_reason_summary=repair_reason_summary,
+                was_inserted_by_repair=was_inserted_by_repair,
+                was_split_by_repair=was_split_by_repair,
+                was_extended_by_repair=was_extended_by_repair,
+                was_shortened_by_repair=was_shortened_by_repair,
                 alignment_action=alignment_action,
                 alignment_confidence=alignment_confidence,
                 confidence=item.confidence,
@@ -202,6 +235,12 @@ def _write_csv(path: Path, rows: list[QANoteRow]) -> None:
                 "end_refinement_ms",
                 "refinement_actions",
                 "merged_note_ids",
+                "repair_actions",
+                "repair_reason_summary",
+                "was_inserted_by_repair",
+                "was_split_by_repair",
+                "was_extended_by_repair",
+                "was_shortened_by_repair",
                 "alignment_action",
                 "alignment_confidence",
                 "confidence",
@@ -266,6 +305,12 @@ def _rows_table_html(title: str, rows: list[QANoteRow]) -> str:
             f"{end_refinement_cell}"
             f"<td>{escape(str(row.refinement_actions))}</td>"
             f"<td>{escape(str(row.merged_note_ids))}</td>"
+            f"<td>{escape(str(row.repair_actions))}</td>"
+            f"<td>{escape(str(row.repair_reason_summary))}</td>"
+            f"<td>{str(row.was_inserted_by_repair)}</td>"
+            f"<td>{str(row.was_split_by_repair)}</td>"
+            f"<td>{str(row.was_extended_by_repair)}</td>"
+            f"<td>{str(row.was_shortened_by_repair)}</td>"
             f"<td>{row.onset_score:.6f}</td>"
             f"<td>{row.mean_rms_during_note:.6f}</td>"
             f"<td>{row.sustained_energy_ratio:.4f}</td>"
@@ -283,6 +328,9 @@ def _rows_table_html(title: str, rows: list[QANoteRow]) -> str:
         "<th>refined_start_sec</th><th>refined_end_sec</th>"
         "<th>start_refinement_ms</th><th>end_refinement_ms</th>"
         "<th>refinement_actions</th><th>merged_note_ids</th>"
+        "<th>repair_actions</th><th>repair_reason_summary</th>"
+        "<th>repair_inserted</th><th>repair_split</th>"
+        "<th>repair_extended</th><th>repair_shortened</th>"
         "<th>onset_score</th><th>mean_rms</th><th>sustained_ratio</th><th>reasons</th>"
         "</tr></thead><tbody>"
         + "".join(html_rows)
@@ -375,6 +423,18 @@ def _write_html(
             <tr><th>dsp_tail_count</th><td>{summary.dsp_tail_count}</td></tr>
             <tr><th>dsp_silence_count</th><td>{summary.dsp_silence_count}</td></tr>
             <tr><th>dsp_debug_csv_file</th><td>{summary.dsp_debug_csv_file}</td></tr>
+            <tr><th>activity_repair_enabled</th><td>{summary.activity_repair_enabled}</td></tr>
+            <tr><th>repaired_note_count</th><td>{summary.repaired_note_count}</td></tr>
+            <tr><th>repair_extend_count</th><td>{summary.repair_extend_count}</td></tr>
+            <tr><th>repair_shorten_count</th><td>{summary.repair_shorten_count}</td></tr>
+            <tr><th>repair_insert_missing_count</th><td>{summary.repair_insert_missing_count}</td></tr>
+            <tr><th>repair_split_count</th><td>{summary.repair_split_count}</td></tr>
+            <tr><th>repair_close_gap_count</th><td>{summary.repair_close_gap_count}</td></tr>
+            <tr><th>repair_review_manual_count</th><td>{summary.repair_review_manual_count}</td></tr>
+            <tr><th>audio_active_region_count</th><td>{summary.audio_active_region_count}</td></tr>
+            <tr><th>midi_active_region_count</th><td>{summary.midi_active_region_count}</td></tr>
+            <tr><th>audio_gap_count</th><td>{summary.audio_gap_count}</td></tr>
+            <tr><th>midi_overhang_count</th><td>{summary.midi_overhang_count}</td></tr>
             <tr><th>working_midi_note_count</th><td>{summary.working_midi_note_count}</td></tr>
     <tr><th>aligned_count</th><td>{summary.aligned_count}</td></tr>
     <tr><th>keep_original_count</th><td>{summary.keep_original_count}</td></tr>
@@ -438,8 +498,10 @@ def generate_qa_report(
     audio_aligned_notes_path = project_dir / "analysis" / "audio_aligned_note_events.json"
     audio_alignment_report_path = project_dir / "analysis" / "audio_alignment_report.json"
     refined_notes_path = project_dir / "analysis" / "refined_note_events.json"
+    repaired_refined_notes_path = project_dir / "analysis" / "repaired_refined_note_events.json"
     bass_refinement_report_path = project_dir / "analysis" / "bass_refinement_report.json"
     dsp_analysis_report_path = project_dir / "analysis" / "audio_analysis_dsp_report.json"
+    activity_repair_report_path = project_dir / "analysis" / "activity_repair_report.json"
     midi_audio_validation_report_path = project_dir / "analysis" / "midi_audio_validation_report.json"
     cleanup_plan_path = project_dir / "cleanup" / "cleanup_plan.json"
     cleaned_export_report_path = project_dir / "midi" / "cleaned" / "cleaned_export_report.json"
@@ -473,6 +535,10 @@ def generate_qa_report(
     else:
         warnings.append(f"Missing refined notes: {refined_notes_path}")
 
+    repaired_notes: RefinedNoteDocument | None = None
+    if repaired_refined_notes_path.exists():
+        repaired_notes = _load_refined_document(repaired_refined_notes_path)
+
     alignment_report: AudioAlignmentReport | None = None
     if audio_alignment_report_path.exists():
         alignment_report = _load_audio_alignment_report(audio_alignment_report_path)
@@ -500,6 +566,18 @@ def generate_qa_report(
     cleaned_note_count = 0
     rejected_note_count = 0
     working_midi_note_count = 0
+    activity_repair_enabled = False
+    repaired_note_count = 0
+    repair_extend_count = 0
+    repair_shorten_count = 0
+    repair_insert_missing_count = 0
+    repair_split_count = 0
+    repair_close_gap_count = 0
+    repair_review_manual_count = 0
+    audio_active_region_count = 0
+    midi_active_region_count = 0
+    audio_gap_count = 0
+    midi_overhang_count = 0
     dsp_backend_name: str | None = None
     dsp_backend_available: bool | None = None
     dsp_frame_count = 0
@@ -557,6 +635,21 @@ def generate_qa_report(
     else:
         warnings.append(f"Missing working export report: {working_export_report_path}")
 
+    if activity_repair_report_path.exists():
+        activity_repair_report = _load_activity_repair_report(activity_repair_report_path)
+        activity_repair_enabled = True
+        repaired_note_count = int(activity_repair_report.output_note_count)
+        repair_extend_count = int(activity_repair_report.extend_count)
+        repair_shorten_count = int(activity_repair_report.shorten_count)
+        repair_insert_missing_count = int(activity_repair_report.insert_missing_count)
+        repair_split_count = int(activity_repair_report.split_count)
+        repair_close_gap_count = int(activity_repair_report.close_gap_count)
+        repair_review_manual_count = int(activity_repair_report.review_manual_count)
+        audio_active_region_count = int(activity_repair_report.audio_active_region_count)
+        midi_active_region_count = int(activity_repair_report.midi_active_region_count)
+        audio_gap_count = int(activity_repair_report.audio_gap_count)
+        midi_overhang_count = int(activity_repair_report.midi_overhang_count)
+
     if dsp_analysis_report_path.exists():
         dsp_report_payload = _read_json(dsp_analysis_report_path)
         raw_backend_name = dsp_report_payload.get("backend_name")
@@ -595,7 +688,7 @@ def generate_qa_report(
         note_validation=note_validation,
         cleanup_plan=cleanup_plan,
         aligned_notes=aligned_notes,
-        refined_notes=refined_notes,
+        refined_notes=(repaired_notes if repaired_notes is not None else refined_notes),
         warnings=warnings,
     )
 
@@ -698,6 +791,10 @@ def generate_qa_report(
                 median(item.end_refinement_ms for item in refined_notes.notes)
             )
 
+    if repaired_notes is not None and repaired_note_count == 0:
+        repaired_note_count = len(repaired_notes.notes)
+        activity_repair_enabled = True
+
     max_export_time_error_ms = max(export_max_errors_ms) if export_max_errors_ms else None
     mean_export_time_error_ms = (
         (sum(export_mean_errors_ms) / len(export_mean_errors_ms))
@@ -761,6 +858,18 @@ def generate_qa_report(
         dsp_tail_count=dsp_tail_count,
         dsp_silence_count=dsp_silence_count,
         dsp_debug_csv_file=dsp_debug_csv_file,
+        activity_repair_enabled=activity_repair_enabled,
+        repaired_note_count=repaired_note_count,
+        repair_extend_count=repair_extend_count,
+        repair_shorten_count=repair_shorten_count,
+        repair_insert_missing_count=repair_insert_missing_count,
+        repair_split_count=repair_split_count,
+        repair_close_gap_count=repair_close_gap_count,
+        repair_review_manual_count=repair_review_manual_count,
+        audio_active_region_count=audio_active_region_count,
+        midi_active_region_count=midi_active_region_count,
+        audio_gap_count=audio_gap_count,
+        midi_overhang_count=midi_overhang_count,
         working_midi_note_count=working_midi_note_count,
         working_export_time_error_ms=working_export_time_error_ms,
         validation_timing_source=validation_timing_source,

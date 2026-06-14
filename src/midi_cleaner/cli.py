@@ -47,6 +47,11 @@ from midi_cleaner.pipeline.qa_report import (
     QAReportParameters,
     generate_qa_report,
 )
+from midi_cleaner.repair.activity import (
+    ActivityRepairError,
+    ActivityRepairParameters,
+    repair_activity,
+)
 from midi_cleaner.refinement.bass import (
     BassRefinementError,
     BassRefinementParameters,
@@ -66,6 +71,7 @@ audio_app = typer.Typer(help="Audio stem analysis tools.")
 validate_app = typer.Typer(help="MIDI-vs-audio validation tools.")
 cleanup_app = typer.Typer(help="Non-destructive MIDI cleanup planning tools.")
 refine_app = typer.Typer(help="MIDI timing quality refinement tools.")
+repair_app = typer.Typer(help="Audio/MIDI activity repair tools.")
 pipeline_app = typer.Typer(help="End-to-end pipeline tools.")
 console = Console()
 
@@ -74,6 +80,7 @@ app.add_typer(audio_app, name="audio")
 app.add_typer(validate_app, name="validate")
 app.add_typer(cleanup_app, name="cleanup")
 app.add_typer(refine_app, name="refine")
+app.add_typer(repair_app, name="repair")
 app.add_typer(pipeline_app, name="pipeline")
 
 
@@ -648,6 +655,11 @@ def cleanup_export_working_midi_command(
         "--refined-notes",
         help="Optional path to refined_note_events.json.",
     ),
+    repair_plan: Path | None = typer.Option(
+        None,
+        "--repair-plan",
+        help="Optional path to activity_repair_plan.json.",
+    ),
     audio_aligned_notes: Path | None = typer.Option(
         None,
         "--audio-aligned-notes",
@@ -676,6 +688,7 @@ def cleanup_export_working_midi_command(
         include_diagnostic=include_diagnostic,
         write_empty_files=write_empty_files,
         refined_notes_file=refined_notes,
+        repair_plan_file=repair_plan,
         audio_aligned_notes_file=audio_aligned_notes,
     )
 
@@ -699,6 +712,89 @@ def cleanup_export_working_midi_command(
         f"rejected={export_report.rejected_note_count}, "
         f"diagnostic={export_report.diagnostic_note_count}, "
         f"timing_source={export_report.timing_source}"
+    )
+
+
+@repair_app.command("activity")
+def repair_activity_command(
+    refined_notes: Path = typer.Option(
+        ..., "--refined-notes", help="Path to refined_note_events.json."
+    ),
+    audio_features: Path = typer.Option(
+        ..., "--audio-features", help="Path to audio_features.json."
+    ),
+    cleanup_plan: Path = typer.Option(
+        ..., "--cleanup-plan", help="Path to cleanup_plan.json."
+    ),
+    output: Path = typer.Option(
+        ..., "--output", help="Output path for repaired refined notes JSON."
+    ),
+    plan: Path = typer.Option(
+        ..., "--plan", help="Output path for activity repair plan JSON."
+    ),
+    report: Path = typer.Option(
+        ..., "--report", help="Output path for activity repair report JSON."
+    ),
+    dsp_features: Path | None = typer.Option(
+        None,
+        "--dsp-features",
+        help="Optional path to audio_features_dsp.json.",
+    ),
+    audio_active_threshold_ratio: float = typer.Option(
+        0.18, "--audio-active-threshold-ratio"
+    ),
+    audio_silence_hold_ms: float = typer.Option(120.0, "--audio-silence-hold-ms"),
+    missing_gap_min_ms: float = typer.Option(80.0, "--missing-gap-min-ms"),
+    overhang_min_ms: float = typer.Option(120.0, "--overhang-min-ms"),
+    split_min_note_duration_ms: float = typer.Option(500.0, "--split-min-note-duration-ms"),
+    close_gap_ms: float = typer.Option(50.0, "--close-gap-ms"),
+    insert_auto_confidence: float = typer.Option(0.80, "--insert-auto-confidence"),
+    split_auto_confidence: float = typer.Option(0.75, "--split-auto-confidence"),
+) -> None:
+    params = ActivityRepairParameters(
+        audio_active_threshold_ratio=audio_active_threshold_ratio,
+        audio_silence_hold_ms=audio_silence_hold_ms,
+        missing_gap_min_ms=missing_gap_min_ms,
+        overhang_min_ms=overhang_min_ms,
+        split_min_note_duration_ms=split_min_note_duration_ms,
+        close_gap_ms=close_gap_ms,
+        insert_auto_confidence=insert_auto_confidence,
+        split_auto_confidence=split_auto_confidence,
+    )
+
+    try:
+        repaired_document, repair_plan, repair_report = repair_activity(
+            refined_notes_file=refined_notes,
+            audio_features_file=audio_features,
+            cleanup_plan_file=cleanup_plan,
+            params=params,
+            dsp_features_file=dsp_features,
+        )
+    except ActivityRepairError as exc:
+        typer.echo(f"Activity repair failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    report.parent.mkdir(parents=True, exist_ok=True)
+
+    output.write_text(repaired_document.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    plan.write_text(repair_plan.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    repair_report.output_file = str(output)
+    repair_report.plan_file = str(plan)
+    report.write_text(repair_report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    typer.echo(
+        "Activity repair complete: "
+        f"input={repair_report.input_note_count}, "
+        f"output={repair_report.output_note_count}, "
+        f"extend={repair_report.extend_count}, "
+        f"shorten={repair_report.shorten_count}, "
+        f"insert={repair_report.insert_missing_count}, "
+        f"split={repair_report.split_count}, "
+        f"review={repair_report.review_manual_count}, "
+        f"warnings={repair_report.warning_count}"
     )
 
 
@@ -783,6 +879,21 @@ def process_stem_command(
         True,
         "--dsp-debug-csv/--no-dsp-debug-csv",
     ),
+    enable_activity_repair: bool = typer.Option(
+        True,
+        "--enable-activity-repair/--no-enable-activity-repair",
+    ),
+    audio_active_threshold_ratio: float = typer.Option(
+        0.18,
+        "--audio-active-threshold-ratio",
+    ),
+    audio_silence_hold_ms: float = typer.Option(120.0, "--audio-silence-hold-ms"),
+    missing_gap_min_ms: float = typer.Option(80.0, "--missing-gap-min-ms"),
+    overhang_min_ms: float = typer.Option(120.0, "--overhang-min-ms"),
+    split_min_note_duration_ms: float = typer.Option(500.0, "--split-min-note-duration-ms"),
+    close_gap_ms: float = typer.Option(50.0, "--close-gap-ms"),
+    insert_auto_confidence: float = typer.Option(0.80, "--insert-auto-confidence"),
+    split_auto_confidence: float = typer.Option(0.75, "--split-auto-confidence"),
 ) -> None:
     params = PipelineProcessParameters(
         onset_window_ms=onset_window_ms,
@@ -822,6 +933,15 @@ def process_stem_command(
         require_dsp_analysis=require_dsp_analysis,
         dsp_backend=dsp_backend,
         dsp_debug_csv=dsp_debug_csv,
+        enable_activity_repair=enable_activity_repair,
+        audio_active_threshold_ratio=audio_active_threshold_ratio,
+        audio_silence_hold_ms=audio_silence_hold_ms,
+        missing_gap_min_ms=missing_gap_min_ms,
+        overhang_min_ms=overhang_min_ms,
+        split_min_note_duration_ms=split_min_note_duration_ms,
+        close_gap_ms=close_gap_ms,
+        insert_auto_confidence=insert_auto_confidence,
+        split_auto_confidence=split_auto_confidence,
     )
 
     try:

@@ -24,6 +24,10 @@ from midi_cleaner.cleanup.planner import CleanupPlannerParameters, build_cleanup
 from midi_cleaner.dsp.analyzer import DspAnalysisError, analyze_dsp_stem
 from midi_cleaner.midi.importer import import_midi_candidate
 from midi_cleaner.pipeline.models import PipelineReport, PipelineStageReport
+from midi_cleaner.repair.activity import (
+    ActivityRepairParameters,
+    repair_activity,
+)
 from midi_cleaner.refinement.bass import BassRefinementParameters, refine_bass_notes
 from midi_cleaner.refinement.models import BassRefinementReport, RefinedNoteDocument, RefinedNoteEvent
 from midi_cleaner.validation.midi_audio import ValidationParameters, validate_midi_vs_audio
@@ -73,6 +77,15 @@ class PipelineProcessParameters:
     require_dsp_analysis: bool = False
     dsp_backend: str = "auto"
     dsp_debug_csv: bool = True
+    enable_activity_repair: bool = True
+    audio_active_threshold_ratio: float = 0.18
+    audio_silence_hold_ms: float = 120.0
+    missing_gap_min_ms: float = 80.0
+    overhang_min_ms: float = 120.0
+    split_min_note_duration_ms: float = 500.0
+    close_gap_ms: float = 50.0
+    insert_auto_confidence: float = 0.80
+    split_auto_confidence: float = 0.75
 
 
 def _write_json(path: Path, payload: BaseModel | dict[str, object]) -> None:
@@ -252,6 +265,24 @@ def process_stem_pipeline(
                     "minimum_note_duration_ms": params.minimum_note_duration_ms,
                     "monophonic": params.monophonic,
                 },
+                "activity_repair": {
+                    "enable_activity_repair": params.enable_activity_repair,
+                    "audio_active_threshold_ratio": params.audio_active_threshold_ratio,
+                    "audio_silence_hold_ms": params.audio_silence_hold_ms,
+                    "missing_gap_min_ms": params.missing_gap_min_ms,
+                    "overhang_min_ms": params.overhang_min_ms,
+                    "split_min_note_duration_ms": params.split_min_note_duration_ms,
+                    "close_gap_ms": params.close_gap_ms,
+                    "insert_auto_confidence": params.insert_auto_confidence,
+                    "split_auto_confidence": params.split_auto_confidence,
+                    "repaired_refined_notes_file": str(
+                        analysis_dir / "repaired_refined_note_events.json"
+                    ),
+                    "activity_repair_plan_file": str(analysis_dir / "activity_repair_plan.json"),
+                    "activity_repair_report_file": str(
+                        analysis_dir / "activity_repair_report.json"
+                    ),
+                },
                 "midi_export": {
                     "ticks_per_beat": params.ticks_per_beat,
                     "track_name_prefix": params.track_name_prefix,
@@ -272,6 +303,17 @@ def process_stem_pipeline(
     warnings: list[str] = []
     current_stage = "initialization"
     dsp_features_path: Path | None = None
+    repaired_refined_note_events_path: Path | None = None
+    activity_repair_plan_path: Path | None = None
+    activity_repair_report_path: Path | None = None
+    activity_repair_summary: dict[str, int] = {
+        "extend_count": 0,
+        "shorten_count": 0,
+        "insert_missing_count": 0,
+        "split_count": 0,
+        "close_gap_count": 0,
+        "review_manual_count": 0,
+    }
 
     try:
         # Stage 1: MIDI import
@@ -511,8 +553,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"bass_refinement: {item}" for item in refinement_report.warnings])
 
-        # Stage 7: Cleanup planning
-        current_stage = "cleanup_plan"
+        # Precompute cleanup plan so activity repair can use KEEP/REVIEW masking.
         cleanup_plan_path = cleanup_dir / "cleanup_plan.json"
         cleanup_plan_report_path = cleanup_dir / "cleanup_plan_report.json"
         cleanup_document, cleanup_report = build_cleanup_plan(
@@ -527,6 +568,80 @@ def process_stem_pipeline(
         cleanup_report.output_file = str(cleanup_plan_path)
         _write_json(cleanup_plan_path, cleanup_document)
         _write_json(cleanup_plan_report_path, cleanup_report)
+
+        # Stage 7: Activity repair
+        current_stage = "activity_repair"
+        repaired_refined_note_events_path = analysis_dir / "repaired_refined_note_events.json"
+        activity_repair_plan_path = analysis_dir / "activity_repair_plan.json"
+        activity_repair_report_path = analysis_dir / "activity_repair_report.json"
+
+        activity_repair_enabled = params.enable_activity_repair and layer.lower() == "bass"
+        if activity_repair_enabled:
+            repaired_document, repair_plan, repair_report = repair_activity(
+                refined_notes_file=refined_note_events_path,
+                audio_features_file=audio_features_path,
+                cleanup_plan_file=cleanup_plan_path,
+                params=ActivityRepairParameters(
+                    audio_active_threshold_ratio=params.audio_active_threshold_ratio,
+                    audio_silence_hold_ms=params.audio_silence_hold_ms,
+                    missing_gap_min_ms=params.missing_gap_min_ms,
+                    overhang_min_ms=params.overhang_min_ms,
+                    split_min_note_duration_ms=params.split_min_note_duration_ms,
+                    close_gap_ms=params.close_gap_ms,
+                    insert_auto_confidence=params.insert_auto_confidence,
+                    split_auto_confidence=params.split_auto_confidence,
+                ),
+                dsp_features_file=dsp_features_path,
+            )
+            repair_report.output_file = str(repaired_refined_note_events_path)
+            repair_report.plan_file = str(activity_repair_plan_path)
+            _write_json(repaired_refined_note_events_path, repaired_document)
+            _write_json(activity_repair_plan_path, repair_plan)
+            _write_json(activity_repair_report_path, repair_report)
+
+            output_files["repaired_refined_note_events"] = str(repaired_refined_note_events_path)
+            output_files["activity_repair_plan"] = str(activity_repair_plan_path)
+            output_files["activity_repair_report"] = str(activity_repair_report_path)
+
+            activity_repair_summary = {
+                "extend_count": repair_report.extend_count,
+                "shorten_count": repair_report.shorten_count,
+                "insert_missing_count": repair_report.insert_missing_count,
+                "split_count": repair_report.split_count,
+                "close_gap_count": repair_report.close_gap_count,
+                "review_manual_count": repair_report.review_manual_count,
+            }
+
+            stages.append(
+                PipelineStageReport(
+                    name="activity_repair",
+                    status="ok",
+                    output_files=[
+                        str(repaired_refined_note_events_path),
+                        str(activity_repair_plan_path),
+                        str(activity_repair_report_path),
+                    ],
+                    warning_count=repair_report.warning_count,
+                    warnings=repair_report.warnings,
+                )
+            )
+            warnings.extend([f"activity_repair: {item}" for item in repair_report.warnings])
+        else:
+            repaired_refined_note_events_path = None
+            activity_repair_plan_path = None
+            activity_repair_report_path = None
+            stages.append(
+                PipelineStageReport(
+                    name="activity_repair",
+                    status="ok",
+                    output_files=[],
+                    warning_count=0,
+                    warnings=[],
+                )
+            )
+
+        # Stage 8: Cleanup planning
+        current_stage = "cleanup_plan"
         output_files["cleanup_plan"] = str(cleanup_plan_path)
         output_files["cleanup_plan_report"] = str(cleanup_plan_report_path)
         stages.append(
@@ -540,7 +655,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"cleanup_plan: {item}" for item in cleanup_report.warnings])
 
-        # Stage 8: Review MIDI export (backward compatible)
+        # Stage 9: Review MIDI export (backward compatible)
         current_stage = "review_midi_export"
         review_export_report_path = review_midi_dir / "export_report.json"
         review_export_report = export_review_midi(
@@ -604,6 +719,11 @@ def process_stem_pipeline(
         # Stage 10: Working MIDI export
         current_stage = "working_midi_export"
         working_export_report_path = working_midi_dir / "working_export_report.json"
+        working_refined_notes_file = (
+            repaired_refined_note_events_path
+            if repaired_refined_note_events_path is not None
+            else refined_note_events_path
+        )
         working_export_report = export_working_midi(
             notes_file=note_events_path,
             cleanup_plan_file=cleanup_plan_path,
@@ -613,8 +733,15 @@ def process_stem_pipeline(
                 track_name_prefix=params.track_name_prefix,
                 include_diagnostic=params.include_diagnostic_working_midi,
                 write_empty_files=params.write_empty_files,
-                refined_notes_file=refined_note_events_path,
+                refined_notes_file=working_refined_notes_file,
+                repair_plan_file=activity_repair_plan_path,
                 audio_aligned_notes_file=audio_aligned_note_events_path,
+                repair_extend_count=activity_repair_summary["extend_count"],
+                repair_shorten_count=activity_repair_summary["shorten_count"],
+                repair_insert_missing_count=activity_repair_summary["insert_missing_count"],
+                repair_split_count=activity_repair_summary["split_count"],
+                repair_close_gap_count=activity_repair_summary["close_gap_count"],
+                repair_review_manual_count=activity_repair_summary["review_manual_count"],
             ),
         )
         _write_json(working_export_report_path, working_export_report)

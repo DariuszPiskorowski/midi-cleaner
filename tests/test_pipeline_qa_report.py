@@ -275,6 +275,71 @@ def _write_pipeline_like_project(tmp_path: Path, include_optional: bool = True) 
             encoding="utf-8",
         )
 
+        repaired_doc = RefinedNoteDocument(
+            schema_version="0.1.0",
+            aligned_notes_file="analysis/audio_aligned_note_events.json",
+            audio_features_file="analysis/audio_features.json",
+            validation_file="analysis/note_validation.json",
+            layer="bass",
+            sample_rate=44100,
+            audio_duration_sec=1.0,
+            refinement_parameters=refined_doc.refinement_parameters,
+            notes=[
+                RefinedNoteEvent(
+                    note_id="k",
+                    source="ripx",
+                    layer="bass",
+                    pitch_midi=60,
+                    pitch_name="C4",
+                    velocity=90,
+                    channel=0,
+                    original_start_sec=0.0,
+                    original_end_sec=0.5,
+                    aligned_start_sec=0.01,
+                    aligned_end_sec=0.51,
+                    refined_start_sec=0.0,
+                    refined_end_sec=0.60,
+                    refined_duration_sec=0.60,
+                    start_refinement_ms=-10.0,
+                    end_refinement_ms=90.0,
+                    merged_note_ids=["r"],
+                    refinement_actions=[
+                        "ATTACK_START_ADJUSTED",
+                        "SUSTAIN_TAIL_EXTENDED",
+                        "ACTIVITY_REPAIR_EXTENDED",
+                    ],
+                    refinement_confidence=0.9,
+                    reasons=["test", "activity repair extension"],
+                ),
+                RefinedNoteEvent(
+                    note_id="repair_missing_000001",
+                    source="hermes_repair",
+                    layer="bass",
+                    pitch_midi=60,
+                    pitch_name="C4",
+                    velocity=80,
+                    channel=0,
+                    original_start_sec=0.62,
+                    original_end_sec=0.74,
+                    aligned_start_sec=0.62,
+                    aligned_end_sec=0.74,
+                    refined_start_sec=0.62,
+                    refined_end_sec=0.74,
+                    refined_duration_sec=0.12,
+                    start_refinement_ms=0.0,
+                    end_refinement_ms=0.0,
+                    merged_note_ids=[],
+                    refinement_actions=["ACTIVITY_REPAIR_INSERTED"],
+                    refinement_confidence=0.85,
+                    reasons=["inserted missing note"],
+                ),
+            ],
+        )
+        (project_dir / "analysis" / "repaired_refined_note_events.json").write_text(
+            repaired_doc.model_dump_json(indent=2) + "\n",
+            encoding="utf-8",
+        )
+
         refinement_report = BassRefinementReport(
             aligned_notes_file="analysis/audio_aligned_note_events.json",
             audio_features_file="analysis/audio_features.json",
@@ -323,6 +388,39 @@ def _write_pipeline_like_project(tmp_path: Path, include_optional: bool = True) 
                     "warnings": [],
                     "output_file": "analysis/audio_features_dsp.json",
                     "debug_csv_file": "analysis/audio_features_dsp_debug.csv",
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        (project_dir / "analysis" / "activity_repair_report.json").write_text(
+            json.dumps(
+                {
+                    "refined_notes_file": "analysis/refined_note_events.json",
+                    "audio_features_file": "analysis/audio_features.json",
+                    "dsp_features_file": "analysis/audio_features_dsp.json",
+                    "cleanup_plan_file": "cleanup/cleanup_plan.json",
+                    "status": "ok",
+                    "layer": "bass",
+                    "input_note_count": 3,
+                    "output_note_count": 2,
+                    "extend_count": 1,
+                    "shorten_count": 0,
+                    "insert_missing_count": 1,
+                    "split_count": 0,
+                    "close_gap_count": 0,
+                    "review_manual_count": 0,
+                    "keep_count": 1,
+                    "audio_active_region_count": 4,
+                    "midi_active_region_count": 3,
+                    "audio_gap_count": 1,
+                    "midi_overhang_count": 0,
+                    "warning_count": 0,
+                    "warnings": [],
+                    "output_file": "analysis/repaired_refined_note_events.json",
+                    "plan_file": "analysis/activity_repair_plan.json",
                 },
                 indent=2,
             )
@@ -413,7 +511,8 @@ def _write_pipeline_like_project(tmp_path: Path, include_optional: bool = True) 
         working_report = WorkingMidiExportReport(
             notes_file="analysis/note_events.json",
             cleanup_plan_file="cleanup/cleanup_plan.json",
-            refined_notes_file="analysis/refined_note_events.json",
+            refined_notes_file="analysis/repaired_refined_note_events.json",
+            repair_plan_file="analysis/activity_repair_plan.json",
             audio_aligned_notes_file="analysis/audio_aligned_note_events.json",
             status="ok",
             layer="bass",
@@ -428,6 +527,12 @@ def _write_pipeline_like_project(tmp_path: Path, include_optional: bool = True) 
             working_note_count=2,
             rejected_note_count=1,
             diagnostic_note_count=0,
+            repair_extend_count=1,
+            repair_shorten_count=0,
+            repair_insert_missing_count=1,
+            repair_split_count=0,
+            repair_close_gap_count=0,
+            repair_review_manual_count=0,
             exported_files=[
                 WorkingMidiExportFile(
                     role="WORKING",
@@ -522,6 +627,12 @@ def test_csv_contains_expected_rows(tmp_path: Path) -> None:
     assert "end_refinement_ms" in rows[0]
     assert "refinement_actions" in rows[0]
     assert "merged_note_ids" in rows[0]
+    assert "repair_actions" in rows[0]
+    assert "repair_reason_summary" in rows[0]
+    assert "was_inserted_by_repair" in rows[0]
+    assert "was_split_by_repair" in rows[0]
+    assert "was_extended_by_repair" in rows[0]
+    assert "was_shortened_by_repair" in rows[0]
     assert "alignment_action" in rows[0]
     assert "alignment_confidence" in rows[0]
     assert "validation_action" in rows[0]
@@ -545,6 +656,8 @@ def test_html_contains_sections_and_escaped_content(tmp_path: Path) -> None:
     assert "refined_note_count" in html_text
     assert "dsp_backend_name" in html_text
     assert "dsp_frame_count" in html_text
+    assert "activity_repair_enabled" in html_text
+    assert "repaired_note_count" in html_text
     assert "Top 25 Lowest-Confidence Notes" in html_text
     assert "&lt;unsafe&gt;" in html_text
 
@@ -575,6 +688,12 @@ def test_summary_contains_audio_sync_fields(tmp_path: Path) -> None:
     assert summary.dsp_tail_count == 20
     assert summary.dsp_silence_count == 22
     assert summary.dsp_debug_csv_file == "analysis/audio_features_dsp_debug.csv"
+    assert summary.activity_repair_enabled is True
+    assert summary.repaired_note_count == 2
+    assert summary.repair_extend_count == 1
+    assert summary.repair_insert_missing_count == 1
+    assert summary.audio_active_region_count == 4
+    assert summary.audio_gap_count == 1
     assert summary.working_midi_note_count == 2
     assert summary.working_export_time_error_ms == 0.4
 

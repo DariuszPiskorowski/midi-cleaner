@@ -28,7 +28,14 @@ class WorkingMidiExportParameters:
     include_diagnostic: bool = False
     write_empty_files: bool = True
     refined_notes_file: Path | None = None
+    repair_plan_file: Path | None = None
     audio_aligned_notes_file: Path | None = None
+    repair_extend_count: int = 0
+    repair_shorten_count: int = 0
+    repair_insert_missing_count: int = 0
+    repair_split_count: int = 0
+    repair_close_gap_count: int = 0
+    repair_review_manual_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -483,6 +490,7 @@ def export_working_midi(
         notes_file=str(notes_file),
         cleanup_plan_file=str(cleanup_plan_file),
         refined_notes_file=(str(params.refined_notes_file) if params.refined_notes_file is not None else None),
+        repair_plan_file=(str(params.repair_plan_file) if params.repair_plan_file is not None else None),
         audio_aligned_notes_file=(
             str(params.audio_aligned_notes_file)
             if params.audio_aligned_notes_file is not None
@@ -502,6 +510,12 @@ def export_working_midi(
         working_note_count=len(working_notes),
         rejected_note_count=len(rejected_notes),
         diagnostic_note_count=len(diagnostic_notes) if params.include_diagnostic else 0,
+        repair_extend_count=int(params.repair_extend_count),
+        repair_shorten_count=int(params.repair_shorten_count),
+        repair_insert_missing_count=int(params.repair_insert_missing_count),
+        repair_split_count=int(params.repair_split_count),
+        repair_close_gap_count=int(params.repair_close_gap_count),
+        repair_review_manual_count=int(params.repair_review_manual_count),
         exported_files=exported_files,
         warning_count=len(warnings),
         warnings=warnings,

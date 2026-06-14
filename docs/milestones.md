@@ -102,6 +102,23 @@
 - Keep refinement behavior backward compatible when DSP features are unavailable.
 - Expand QA artifacts with DSP backend/frame-classification summary fields.
 
+## Milestone 13A - Audio/MIDI Activity Repair
+- Add `midi-cleaner repair activity` to compare repaired/refined MIDI activity against audio activity regions.
+- Keep WAV/audio seconds canonical for all repair decisions and avoid BPM/bar-derived timing assumptions.
+- Build deterministic audio activity regions from DSP features when available; fall back to lightweight audio features.
+- Detect and repair missing activity gaps by extending notes, closing small front gaps, or inserting context-pitch notes.
+- Detect and repair MIDI overhang tails when notes extend beyond nearby audio activity.
+- Detect long-note split candidates from strong internal onset and valley evidence.
+- Close tiny same/near-pitch gaps when audio stays active.
+- Respect confidence gating: lower-confidence insert/split cases become `REVIEW_MANUAL` actions.
+- Export repair artifacts:
+	- `analysis/repaired_refined_note_events.json`
+	- `analysis/activity_repair_plan.json`
+	- `analysis/activity_repair_report.json`
+- Integrate repair stage after bass refinement and before working export in `pipeline process-stem`.
+- Keep Milestone 11/12 behavior intact when repair is disabled or not applicable.
+- Expand QA artifacts with activity-repair summary metrics and per-note repair columns.
+
 ## Future Milestones (Planned)
-- Classify actions: KEEP, MUTE, MERGE, SHORTEN, QUANTIZE, REASSIGN, DELETE.
-- Export cleaned MIDI and machine-readable QA reports.
+- Milestone 13B: add f0/pitch tracking-assisted repair decisions.
+- Milestone 13C: add render-back audio comparison for post-export verification.

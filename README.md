@@ -2,7 +2,7 @@
 
 Hermes MIDI Fidelity Engine project scaffold.
 
-This repository cleans and validates MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 12**: DSP-backed audio feature analysis on top of canonical audio-time alignment and Milestone 11 refinement.
+This repository cleans and validates MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 13A**: audio/MIDI activity repair on top of canonical audio-time alignment, Milestone 11 refinement, and Milestone 12 DSP analysis.
 
 Milestone 10.1 integration and reporting hardening is now in place:
 - Validation consumes audio-aligned timing when alignment data exists.
@@ -28,9 +28,22 @@ Milestone 12 DSP analysis is now in place:
 - Bass refinement optionally consumes DSP features to improve attack/tail/retrigger decisions when DSP evidence is present.
 - QA summary and HTML include DSP backend/classification metrics.
 
+Milestone 13A activity repair is now in place:
+- Additive post-refinement repair stage compares audio activity regions against MIDI activity regions.
+- Detects and repairs obvious bass issues: missing gaps, overhang tails, split candidates, and tiny gaps.
+- Uses DSP activity evidence when available; falls back to lightweight audio features when DSP data is absent.
+- Keeps WAV/audio seconds canonical and avoids BPM/bar timing assumptions.
+- Exports `analysis/repaired_refined_note_events.json`, `analysis/activity_repair_plan.json`, and `analysis/activity_repair_report.json`.
+- Working export prefers repaired refined notes when activity repair is enabled.
+- QA summary/CSV/HTML include activity-repair counts and per-note repair flags.
+
+Future Milestone 13 work remains planned:
+- Milestone 13B: f0/pitch tracking-assisted repair.
+- Milestone 13C: render-back audio comparison.
+
 ## Current Milestone
 
-Milestone 12 currently implements:
+Milestone 13A currently implements:
 - Python package scaffold
 - Strict Python 3.11 guard
 - Runtime/environment report via CLI doctor command
@@ -46,6 +59,10 @@ Milestone 12 currently implements:
 - Conservative cleaned/review/rejected MIDI export from cleanup plan
 - One-command process-stem pipeline that orchestrates existing stages
 - Optional DSP stage in process-stem with fallback/strict controls
+- Activity-repair stage between bass refinement and working export
+- Repair plan/report artifacts and repaired refined note output
+- Activity-repair CLI command and process-stem repair controls
+- Working export preference for repaired refined notes
 - Static QA artifacts: qa_summary.json, qa_notes.csv, qa_report.html
 - Audio-time canonical note alignment into analysis/audio_aligned_note_events.json
 - Audio alignment report in analysis/audio_alignment_report.json
@@ -61,6 +78,7 @@ Milestone 12 currently implements:
 - QA report includes explicit Audio-Time Alignment / Sync metrics and timing sources
 - QA report includes refinement summary metrics and per-note refinement columns
 - QA report includes DSP backend/frame classification summary metrics
+- QA report includes activity-repair summary fields and per-note repair columns
 - Tests for guard behavior, MIDI import, audio analysis, validation, cleanup planning, review MIDI export, cleaned MIDI export, process-stem pipeline, and QA reports
 
 Destructive note deletion, rendering, UI, and ML are not implemented yet.
@@ -188,6 +206,24 @@ Example:
 uv run midi-cleaner refine bass --aligned-notes .\artifacts\audio_aligned_note_events.json --audio-features .\artifacts\audio_features.json --validation .\artifacts\note_validation.json --output .\artifacts\refined_note_events.json --report .\artifacts\bass_refinement_report.json
 ```
 
+## Audio/MIDI Activity Repair
+
+```powershell
+uv run midi-cleaner repair activity --refined-notes REFINED_NOTE_EVENTS_JSON --audio-features AUDIO_FEATURES_JSON --cleanup-plan CLEANUP_PLAN_JSON --output REPAIRED_REFINED_NOTE_EVENTS_JSON --plan ACTIVITY_REPAIR_PLAN_JSON --report ACTIVITY_REPAIR_REPORT_JSON
+```
+
+Optional DSP feature input:
+
+```powershell
+uv run midi-cleaner repair activity --refined-notes REFINED_NOTE_EVENTS_JSON --audio-features AUDIO_FEATURES_JSON --dsp-features AUDIO_FEATURES_DSP_JSON --cleanup-plan CLEANUP_PLAN_JSON --output REPAIRED_REFINED_NOTE_EVENTS_JSON --plan ACTIVITY_REPAIR_PLAN_JSON --report ACTIVITY_REPAIR_REPORT_JSON
+```
+
+Example:
+
+```powershell
+uv run midi-cleaner repair activity --refined-notes .\artifacts\refined_note_events.json --audio-features .\artifacts\audio_features.json --cleanup-plan .\artifacts\cleanup_plan.json --output .\artifacts\repaired_refined_note_events.json --plan .\artifacts\activity_repair_plan.json --report .\artifacts\activity_repair_report.json
+```
+
 ## Cleanup Plan (Non-Destructive)
 
 ```powershell
@@ -242,6 +278,12 @@ uv run midi-cleaner cleanup export-cleaned-midi --notes .\artifacts\note_events.
 uv run midi-cleaner cleanup export-working-midi --notes NOTE_EVENTS_JSON --plan CLEANUP_PLAN_JSON --refined-notes REFINED_NOTE_EVENTS_JSON --output-dir OUTPUT_DIR --report REPORT_JSON
 ```
 
+Optional repair plan metadata:
+
+```powershell
+uv run midi-cleaner cleanup export-working-midi --notes NOTE_EVENTS_JSON --plan CLEANUP_PLAN_JSON --refined-notes REPAIRED_REFINED_NOTE_EVENTS_JSON --repair-plan ACTIVITY_REPAIR_PLAN_JSON --output-dir OUTPUT_DIR --report REPORT_JSON
+```
+
 Example:
 
 ```powershell
@@ -259,6 +301,17 @@ DSP controls (defaults shown):
 - `--require-dsp-analysis/--no-require-dsp-analysis` (default permissive)
 - `--dsp-backend auto|librosa|scipy|basic` (default `auto`)
 - `--dsp-debug-csv/--no-dsp-debug-csv` (default enabled)
+
+Activity repair controls (defaults shown):
+- `--enable-activity-repair/--no-enable-activity-repair` (default enabled for bass)
+- `--audio-active-threshold-ratio` (default `0.18`)
+- `--audio-silence-hold-ms` (default `120`)
+- `--missing-gap-min-ms` (default `80`)
+- `--overhang-min-ms` (default `120`)
+- `--split-min-note-duration-ms` (default `500`)
+- `--close-gap-ms` (default `50`)
+- `--insert-auto-confidence` (default `0.80`)
+- `--split-auto-confidence` (default `0.75`)
 
 Example:
 
@@ -280,4 +333,4 @@ uv run midi-cleaner pipeline qa-report --project-dir .\artifacts\pipeline_run
 
 ## Planned Pipeline
 
-Suno/RipX stem WAV -> RipX MIDI candidate -> Hermes note-event JSON -> WAV comparison -> DSP analysis (additive) -> audio-time alignment -> validation -> bass refinement -> cleanup planning -> working/rejected (plus backward-compatible review/cleaned exports) -> QA artifacts
+Suno/RipX stem WAV -> RipX MIDI candidate -> Hermes note-event JSON -> WAV comparison -> DSP analysis (additive) -> audio-time alignment -> validation -> bass refinement -> activity repair -> cleanup planning/exports -> working/rejected (prefers repaired refined notes) -> QA artifacts
