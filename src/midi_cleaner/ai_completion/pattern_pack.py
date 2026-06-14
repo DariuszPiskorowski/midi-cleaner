@@ -1,0 +1,527 @@
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+import math
+
+import mido
+
+from midi_cleaner.alignment.models import AudioAlignedNoteDocument
+from midi_cleaner.audio.models import AudioFeatureDocument
+from midi_cleaner.dsp.models import DspAudioFeatureDocument
+from midi_cleaner.midi.models import NoteEventDocument
+from midi_cleaner.pitch.models import BassPitchContourDocument
+from midi_cleaner.refinement.models import RefinedNoteDocument
+
+
+class PatternPackBuildError(Exception):
+    """Raised when pattern pack inputs are invalid or missing."""
+
+
+@dataclass(frozen=True)
+class BasePatternNote:
+    note_id: str
+    start_sec: float
+    end_sec: float
+    duration_sec: float
+    pitch_midi: int
+    velocity: int
+    confidence: float | None
+    source: str | None
+    reasons: list[str]
+
+
+@dataclass(frozen=True)
+class PatternPackBuildResult:
+    pattern_pack: dict[str, object]
+    base_notes: list[BasePatternNote]
+    duration_sec: float
+    ticks_per_beat: int
+    tempo_us_per_beat: int
+    warnings: list[str]
+
+
+def build_pattern_pack(project_dir: Path, layer: str = "bass") -> PatternPackBuildResult:
+    analysis_dir = project_dir / "analysis"
+    working_midi_path = project_dir / "midi" / "working" / "working.mid"
+    audio_features_path = analysis_dir / "audio_features.json"
+
+    if not working_midi_path.exists() or not working_midi_path.is_file():
+        raise PatternPackBuildError(f"Missing working MIDI: {working_midi_path}")
+    if not audio_features_path.exists() or not audio_features_path.is_file():
+        raise PatternPackBuildError(f"Missing audio features: {audio_features_path}")
+
+    base_notes, base_note_source = _load_base_notes(analysis_dir)
+    if not base_notes:
+        raise PatternPackBuildError("Base note set is empty. Cannot build pattern_pack.json.")
+
+    audio_features = AudioFeatureDocument.model_validate_json(
+        audio_features_path.read_text(encoding="utf-8")
+    )
+
+    dsp_doc = _load_optional_dsp(analysis_dir / "audio_features_dsp.json")
+    pitch_doc = _load_optional_pitch(analysis_dir / "bass_pitch_contour.json")
+
+    ticks_per_beat, tempo_us_per_beat, tempo_bpm = _read_timing_from_working_midi(working_midi_path)
+    duration_sec = float(audio_features.duration_sec)
+
+    warnings: list[str] = []
+    if base_note_source.endswith("note_events.json"):
+        warnings.append(
+            "Pattern pack used note_events timing source because refined/repaired notes were unavailable."
+        )
+
+    base_notes_records = [_base_note_record(item) for item in base_notes]
+    base_notes_records, trunc_warnings = _truncate_base_notes_if_needed(base_notes_records)
+    warnings.extend(trunc_warnings)
+
+    audio_activity_regions = _build_audio_activity_regions(
+        audio_features=audio_features,
+        dsp_doc=dsp_doc,
+        pitch_doc=pitch_doc,
+    )
+    pitch_contour_summary = _build_pitch_contour_summary(
+        pitch_doc=pitch_doc,
+        duration_sec=duration_sec,
+    )
+    pattern_windows = _build_pattern_windows(
+        base_notes=base_notes,
+        duration_sec=duration_sec,
+        audio_activity_regions=audio_activity_regions,
+        pitch_contour_summary=pitch_contour_summary,
+    )
+
+    pattern_pack: dict[str, object] = {
+        "version": "1.0",
+        "track_role": layer,
+        "timeline": {
+            "duration_sec": round(duration_sec, 6),
+            "time_origin": "wav_seconds",
+            "ticks_per_beat": int(ticks_per_beat),
+            "tempo_bpm": (round(tempo_bpm, 6) if tempo_bpm is not None else None),
+            "midi_source": "working.mid",
+        },
+        "base_midi_summary": _build_base_midi_summary(base_notes=base_notes, duration_sec=duration_sec),
+        "base_notes": base_notes_records,
+        "audio_activity_regions": audio_activity_regions,
+        "pitch_contour_summary": pitch_contour_summary,
+        "pattern_windows": pattern_windows,
+        "instructions_for_ai": {
+            "goal": (
+                "Generate an additional synchronized bass MIDI completion track that adds "
+                "missing/continuation fragments of the existing pattern. "
+                "Do not rewrite or duplicate the base MIDI."
+            ),
+            "output_time_unit": "seconds",
+            "output_file_expected": "bass_ai_completion.mid",
+        },
+    }
+
+    if warnings:
+        pattern_pack["pack_warnings"] = warnings
+
+    return PatternPackBuildResult(
+        pattern_pack=pattern_pack,
+        base_notes=base_notes,
+        duration_sec=duration_sec,
+        ticks_per_beat=ticks_per_beat,
+        tempo_us_per_beat=tempo_us_per_beat,
+        warnings=warnings,
+    )
+
+
+def _load_base_notes(analysis_dir: Path) -> tuple[list[BasePatternNote], str]:
+    source_candidates = [
+        analysis_dir / "final_repaired_note_events.json",
+        analysis_dir / "repaired_refined_note_events.json",
+        analysis_dir / "refined_note_events.json",
+        analysis_dir / "audio_aligned_note_events.json",
+        analysis_dir / "note_events.json",
+    ]
+
+    for path in source_candidates:
+        if not path.exists() or not path.is_file():
+            continue
+
+        if path.name.endswith("repaired_note_events.json") or path.name == "refined_note_events.json":
+            document = RefinedNoteDocument.model_validate_json(path.read_text(encoding="utf-8"))
+            notes = [
+                BasePatternNote(
+                    note_id=item.note_id,
+                    start_sec=float(item.refined_start_sec),
+                    end_sec=float(item.refined_end_sec),
+                    duration_sec=float(item.refined_duration_sec),
+                    pitch_midi=int(item.pitch_midi),
+                    velocity=int(item.velocity),
+                    confidence=float(item.refinement_confidence),
+                    source=item.source,
+                    reasons=list(item.reasons),
+                )
+                for item in document.notes
+            ]
+            return notes, str(path)
+
+        if path.name == "audio_aligned_note_events.json":
+            document = AudioAlignedNoteDocument.model_validate_json(path.read_text(encoding="utf-8"))
+            notes = [
+                BasePatternNote(
+                    note_id=item.note_id,
+                    start_sec=float(item.aligned_start_sec),
+                    end_sec=float(item.aligned_end_sec),
+                    duration_sec=float(item.aligned_duration_sec),
+                    pitch_midi=int(item.pitch_midi),
+                    velocity=int(item.velocity),
+                    confidence=float(item.alignment_confidence),
+                    source=item.source,
+                    reasons=list(item.reasons),
+                )
+                for item in document.notes
+            ]
+            return notes, str(path)
+
+        if path.name == "note_events.json":
+            document = NoteEventDocument.model_validate_json(path.read_text(encoding="utf-8"))
+            notes = [
+                BasePatternNote(
+                    note_id=item.note_id,
+                    start_sec=float(item.start_sec),
+                    end_sec=float(item.end_sec),
+                    duration_sec=float(item.duration_sec),
+                    pitch_midi=int(item.pitch_midi),
+                    velocity=int(item.velocity),
+                    confidence=(float(item.confidence) if item.confidence is not None else None),
+                    source=item.source,
+                    reasons=[],
+                )
+                for item in document.notes
+            ]
+            return notes, str(path)
+
+    raise PatternPackBuildError("Missing note source in analysis directory.")
+
+
+def _load_optional_dsp(path: Path) -> DspAudioFeatureDocument | None:
+    if not path.exists() or not path.is_file():
+        return None
+    return DspAudioFeatureDocument.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _load_optional_pitch(path: Path) -> BassPitchContourDocument | None:
+    if not path.exists() or not path.is_file():
+        return None
+    return BassPitchContourDocument.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _read_timing_from_working_midi(path: Path) -> tuple[int, int, float | None]:
+    midi = mido.MidiFile(str(path))
+    ticks_per_beat = int(midi.ticks_per_beat)
+    tempo_us_per_beat: int | None = None
+
+    for track in midi.tracks:
+        for message in track:
+            if message.type == "set_tempo":
+                tempo_us_per_beat = int(message.tempo)
+                break
+        if tempo_us_per_beat is not None:
+            break
+
+    if tempo_us_per_beat is None:
+        return ticks_per_beat, 500000, None
+
+    tempo_bpm = 60_000_000.0 / float(tempo_us_per_beat)
+    return ticks_per_beat, tempo_us_per_beat, tempo_bpm
+
+
+def _base_note_record(note: BasePatternNote) -> dict[str, object]:
+    return {
+        "note_id": note.note_id,
+        "start_sec": round(note.start_sec, 6),
+        "end_sec": round(note.end_sec, 6),
+        "duration_sec": round(note.duration_sec, 6),
+        "pitch_midi": int(note.pitch_midi),
+        "velocity": int(note.velocity),
+        "confidence": (round(note.confidence, 6) if note.confidence is not None else None),
+        "source": note.source,
+        "reasons": list(note.reasons),
+    }
+
+
+def _truncate_base_notes_if_needed(
+    base_notes_records: list[dict[str, object]],
+    limit: int = 2000,
+) -> tuple[list[dict[str, object]], list[str]]:
+    if len(base_notes_records) <= limit:
+        return base_notes_records, []
+
+    step = max(1, math.ceil(len(base_notes_records) / float(limit)))
+    truncated = base_notes_records[::step][:limit]
+    warnings = [
+        "base_notes were truncated for compactness; pattern_windows and summaries preserve context.",
+        f"base_notes_total={len(base_notes_records)}, base_notes_included={len(truncated)}",
+    ]
+    return truncated, warnings
+
+
+def _build_base_midi_summary(base_notes: list[BasePatternNote], duration_sec: float) -> dict[str, object]:
+    pitches = [item.pitch_midi for item in base_notes]
+    durations = sorted(item.duration_sec for item in base_notes)
+
+    common_pitches_counter = Counter(pitches)
+    common_pitches = [
+        {"pitch_midi": int(pitch), "count": int(count)}
+        for pitch, count in common_pitches_counter.most_common(8)
+    ]
+
+    density_by_section = []
+    section_len = max(2.0, duration_sec / 8.0 if duration_sec > 0 else 2.0)
+    start = 0.0
+    while start < duration_sec + 1e-9:
+        end = min(duration_sec, start + section_len)
+        note_count = sum(1 for item in base_notes if item.start_sec < end and item.end_sec > start)
+        seconds = max(1e-6, end - start)
+        density_by_section.append(
+            {
+                "start_sec": round(start, 6),
+                "end_sec": round(end, 6),
+                "note_count": int(note_count),
+                "notes_per_sec": round(note_count / seconds, 6),
+            }
+        )
+        if end >= duration_sec:
+            break
+        start = end
+
+    median_duration = 0.0
+    if durations:
+        mid = len(durations) // 2
+        if len(durations) % 2 == 1:
+            median_duration = durations[mid]
+        else:
+            median_duration = (durations[mid - 1] + durations[mid]) / 2.0
+
+    return {
+        "note_count": len(base_notes),
+        "pitch_range": {
+            "min": int(min(pitches)) if pitches else 0,
+            "max": int(max(pitches)) if pitches else 0,
+        },
+        "median_note_duration_sec": round(median_duration, 6),
+        "common_pitches": common_pitches,
+        "density_by_section": density_by_section,
+    }
+
+
+def _build_audio_activity_regions(
+    audio_features: AudioFeatureDocument,
+    dsp_doc: DspAudioFeatureDocument | None,
+    pitch_doc: BassPitchContourDocument | None,
+) -> list[dict[str, object]]:
+    threshold = max(1e-6, float(audio_features.global_features.rms) * 0.18)
+    onset_threshold = 0.015
+
+    regions: list[tuple[int, int]] = []
+    start_idx: int | None = None
+    frames = audio_features.frames
+    for index, frame in enumerate(frames):
+        is_active = frame.rms >= threshold or frame.onset_score >= onset_threshold
+        if is_active and start_idx is None:
+            start_idx = index
+        if not is_active and start_idx is not None:
+            regions.append((start_idx, index - 1))
+            start_idx = None
+    if start_idx is not None:
+        regions.append((start_idx, len(frames) - 1))
+
+    if not regions:
+        return []
+
+    dsp_frames = dsp_doc.frames if dsp_doc is not None else []
+    pitch_frames = pitch_doc.frames if pitch_doc is not None else []
+
+    payload: list[dict[str, object]] = []
+    for start_idx, end_idx in regions:
+        section = frames[start_idx : end_idx + 1]
+        start_sec = float(section[0].start_sec)
+        end_sec = float(section[-1].end_sec)
+        rms_values = [float(item.rms) for item in section]
+        onset_count = sum(1 for item in section if item.onset_score >= onset_threshold)
+
+        region_dsp = [
+            item
+            for item in dsp_frames
+            if item.start_sec < end_sec and item.end_sec > start_sec
+        ]
+        low_band_mean = (
+            sum(float(item.low_band_rms) for item in region_dsp) / len(region_dsp)
+            if region_dsp
+            else None
+        )
+        harmonic_mean = (
+            sum(float(item.harmonic_rms) for item in region_dsp) / len(region_dsp)
+            if region_dsp
+            else None
+        )
+
+        region_pitch = [
+            item
+            for item in pitch_frames
+            if item.start_sec < end_sec and item.end_sec > start_sec
+        ]
+        pitch_candidates = [
+            int(item.pitch_midi_rounded)
+            for item in region_pitch
+            if item.voiced and item.pitch_midi_rounded is not None
+        ]
+        dominant_pitch = None
+        if pitch_candidates:
+            dominant_pitch = Counter(pitch_candidates).most_common(1)[0][0]
+
+        pitch_confidence = None
+        if region_pitch:
+            pitch_confidence = sum(float(item.pitch_confidence) for item in region_pitch) / len(region_pitch)
+
+        payload.append(
+            {
+                "start_sec": round(start_sec, 6),
+                "end_sec": round(end_sec, 6),
+                "duration_sec": round(end_sec - start_sec, 6),
+                "rms_mean": round(sum(rms_values) / len(rms_values), 8),
+                "rms_peak": round(max(rms_values), 8),
+                "low_band_mean": (
+                    round(float(low_band_mean), 8) if low_band_mean is not None else None
+                ),
+                "harmonic_mean": (
+                    round(float(harmonic_mean), 8) if harmonic_mean is not None else None
+                ),
+                "onset_count": int(onset_count),
+                "dominant_pitch_midi": (int(dominant_pitch) if dominant_pitch is not None else None),
+                "pitch_confidence": (
+                    round(float(pitch_confidence), 6) if pitch_confidence is not None else None
+                ),
+            }
+        )
+
+    return payload
+
+
+def _build_pitch_contour_summary(
+    pitch_doc: BassPitchContourDocument | None,
+    duration_sec: float,
+) -> list[dict[str, object]]:
+    if pitch_doc is None or not pitch_doc.frames:
+        return []
+
+    summary: list[dict[str, object]] = []
+    window_sec = 1.0
+    index = 0
+    start_sec = 0.0
+
+    while start_sec < duration_sec + 1e-9:
+        end_sec = min(duration_sec, start_sec + window_sec)
+        section = [
+            frame
+            for frame in pitch_doc.frames
+            if frame.start_sec < end_sec and frame.end_sec > start_sec
+        ]
+        if section:
+            voiced_frames = [item for item in section if item.voiced and item.pitch_midi_rounded is not None]
+            dominant_pitch = None
+            pitch_mean = None
+            if voiced_frames:
+                dominant_pitch = Counter(
+                    int(item.pitch_midi_rounded) for item in voiced_frames
+                ).most_common(1)[0][0]
+                pitch_mean = sum(float(item.pitch_midi_float) for item in voiced_frames if item.pitch_midi_float is not None)
+                pitch_mean = pitch_mean / len(voiced_frames)
+
+            voiced_ratio = len(voiced_frames) / float(len(section))
+            mean_conf = sum(float(item.pitch_confidence) for item in section) / float(len(section))
+
+            summary.append(
+                {
+                    "start_sec": round(start_sec, 6),
+                    "end_sec": round(end_sec, 6),
+                    "dominant_pitch_midi": (
+                        int(dominant_pitch) if dominant_pitch is not None else None
+                    ),
+                    "pitch_midi_mean": (
+                        round(float(pitch_mean), 6) if pitch_mean is not None else None
+                    ),
+                    "voiced_ratio": round(float(voiced_ratio), 6),
+                    "mean_confidence": round(float(mean_conf), 6),
+                }
+            )
+
+        if end_sec >= duration_sec:
+            break
+        start_sec = end_sec
+        index += 1
+        _ = index
+
+    return summary
+
+
+def _build_pattern_windows(
+    base_notes: list[BasePatternNote],
+    duration_sec: float,
+    audio_activity_regions: list[dict[str, object]],
+    pitch_contour_summary: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    windows: list[dict[str, object]] = []
+    window_sec = max(2.0, duration_sec / 12.0 if duration_sec > 0 else 2.0)
+    start_sec = 0.0
+    window_index = 0
+
+    while start_sec < duration_sec + 1e-9:
+        end_sec = min(duration_sec, start_sec + window_sec)
+        section_notes = [
+            item
+            for item in base_notes
+            if item.start_sec < end_sec and item.end_sec > start_sec
+        ]
+        section_notes = sorted(section_notes, key=lambda item: item.start_sec)
+
+        onsets = [round(item.start_sec, 6) for item in section_notes][:64]
+        intervals: list[float] = []
+        for idx in range(1, len(onsets)):
+            intervals.append(round(onsets[idx] - onsets[idx - 1], 6))
+        durations = [round(item.duration_sec, 6) for item in section_notes]
+        common_durations = [
+            float(value)
+            for value, _count in Counter(durations).most_common(8)
+        ]
+
+        region_indices = [
+            idx
+            for idx, region in enumerate(audio_activity_regions)
+            if float(region["start_sec"]) < end_sec and float(region["end_sec"]) > start_sec
+        ]
+        pitch_indices = [
+            idx
+            for idx, section in enumerate(pitch_contour_summary)
+            if float(section["start_sec"]) < end_sec and float(section["end_sec"]) > start_sec
+        ]
+
+        windows.append(
+            {
+                "window_index": int(window_index),
+                "start_sec": round(start_sec, 6),
+                "end_sec": round(end_sec, 6),
+                "base_notes": [item.note_id for item in section_notes],
+                "audio_activity_region_indices": region_indices,
+                "pitch_summary_indices": pitch_indices,
+                "rhythmic_summary": {
+                    "note_onsets_sec": onsets,
+                    "intervals_sec": intervals[:64],
+                    "common_durations_sec": common_durations,
+                },
+            }
+        )
+
+        if end_sec >= duration_sec:
+            break
+        start_sec = end_sec
+        window_index += 1
+
+    return windows

@@ -4,6 +4,11 @@ Hermes MIDI Fidelity Engine project scaffold.
 
 This repository cleans and validates MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 14**: bounded iterative MIDI self-repair on top of Milestones 11/12/13A/13B.
 
+AI pattern completion is now available as an additive feature:
+- Hermes provides a rich `pattern_pack.json` and synchronized base MIDI context.
+- OpenAI infers musically implied bass continuation/missing fragments without editing base MIDI.
+- Output is a separate synchronized completion track: `midi/ai/bass_ai_completion.mid`.
+
 Milestone 10.1 integration and reporting hardening is now in place:
 - Validation consumes audio-aligned timing when alignment data exists.
 - Cleanup exports consume audio-aligned timing when alignment data exists.
@@ -102,6 +107,7 @@ Milestone 14 currently implements:
 - Iterative scoring with coverage/overhang/continuity/pitch metrics and error-region counting
 - Stable note/region freezing and optional conservative final pass
 - Iteration artifact exports and optional working MIDI variants for visual comparison
+- OpenAI-powered `ai_pattern_completion` feature with JSON-validated bass completion export
 - Tests for guard behavior, MIDI import, audio analysis, validation, cleanup planning, review MIDI export, cleaned MIDI export, process-stem pipeline, and QA reports
 
 Destructive note deletion, rendering, UI, and ML are not implemented yet.
@@ -150,6 +156,17 @@ Write JSON report to file:
 ```powershell
 uv run midi-cleaner doctor --output runtime_report.json
 ```
+
+## AI Pattern Completion Environment
+
+Create a local `.env` from `.env.example`:
+
+```text
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4o-mini
+```
+
+If `OPENAI_MODEL` is omitted, `gpt-4o-mini` is used by default.
 
 ## MIDI Candidate Import
 
@@ -283,6 +300,27 @@ Example:
 uv run midi-cleaner repair iterative --refined-notes .\artifacts\repaired_refined_note_events.json --audio-features .\artifacts\audio_features.json --cleanup-plan .\artifacts\cleanup_plan.json --dsp-features .\artifacts\audio_features_dsp.json --pitch-contour .\artifacts\bass_pitch_contour.json --output .\artifacts\final_repaired_note_events.json --report .\artifacts\iterative_repair_report.json
 ```
 
+## AI Pattern Completion
+
+```powershell
+uv run midi-cleaner ai complete-pattern --project-dir PROJECT_DIR --layer bass
+```
+
+Common options:
+- `--model` optional override (default `OPENAI_MODEL` or `gpt-4o-mini`)
+- `--output-dir` optional output directory (default `midi/ai` under project)
+- `--dry-run` build `pattern_pack.json` + `ai_prompt.txt` without API call
+- `--max-completion-notes` default `64`
+- `--temperature` default `0.2`
+- `--keep-ai-json/--no-keep-ai-json` default keep enabled
+
+Default artifacts:
+- `analysis/ai_pattern_completion/pattern_pack.json`
+- `analysis/ai_pattern_completion/ai_prompt.txt`
+- `analysis/ai_pattern_completion/bass_ai_completion.json`
+- `analysis/ai_pattern_completion/bass_ai_completion_report.json`
+- `midi/ai/bass_ai_completion.mid`
+
 ## Cleanup Plan (Non-Destructive)
 
 ```powershell
@@ -389,6 +427,9 @@ Iterative repair controls (defaults shown):
 - `--freeze-stable-notes/--no-freeze-stable-notes` (default enabled)
 - `--conservative-final-pass/--no-conservative-final-pass` (default enabled)
 - `--export-iteration-variants/--no-export-iteration-variants` (default enabled)
+
+AI completion control:
+- `--enable-ai-pattern-completion/--no-enable-ai-pattern-completion` (default disabled)
 
 Example:
 

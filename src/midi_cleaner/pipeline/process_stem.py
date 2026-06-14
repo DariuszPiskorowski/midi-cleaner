@@ -6,6 +6,10 @@ import json
 
 from pydantic import BaseModel
 
+from midi_cleaner.ai_completion import (
+    AIPatternCompletionParameters,
+    complete_ai_pattern_completion,
+)
 from midi_cleaner.alignment.audio_time import (
     AudioTimeAlignmentParameters,
     align_notes_to_audio_time,
@@ -109,6 +113,7 @@ class PipelineProcessParameters:
     freeze_stable_notes: bool = True
     conservative_final_pass: bool = True
     export_iteration_variants: bool = True
+    enable_ai_pattern_completion: bool = False
 
 
 def _write_json(path: Path, payload: BaseModel | dict[str, object]) -> None:
@@ -339,6 +344,21 @@ def process_stem_pipeline(
                     ),
                     "final_repaired_note_events_file": str(
                         analysis_dir / "final_repaired_note_events.json"
+                    ),
+                },
+                "ai_pattern_completion": {
+                    "enable_ai_pattern_completion": params.enable_ai_pattern_completion,
+                    "layer": layer,
+                    "model": "OPENAI_MODEL or gpt-4o-mini",
+                    "output_midi_file": str(project_dir / "midi" / "ai" / "bass_ai_completion.mid"),
+                    "pattern_pack_file": str(
+                        analysis_dir / "ai_pattern_completion" / "pattern_pack.json"
+                    ),
+                    "ai_completion_json_file": str(
+                        analysis_dir / "ai_pattern_completion" / "bass_ai_completion.json"
+                    ),
+                    "ai_completion_report_file": str(
+                        analysis_dir / "ai_pattern_completion" / "bass_ai_completion_report.json"
                     ),
                 },
                 "midi_export": {
@@ -1140,6 +1160,63 @@ def process_stem_pipeline(
             )
         )
         warnings.extend([f"working_midi_export: {item}" for item in working_export_report.warnings])
+
+        # Stage 14: AI pattern completion (optional)
+        current_stage = "ai_pattern_completion"
+        ai_pattern_completion_enabled = params.enable_ai_pattern_completion and layer.lower() == "bass"
+
+        if ai_pattern_completion_enabled:
+            ai_report = complete_ai_pattern_completion(
+                project_dir=project_dir,
+                params=AIPatternCompletionParameters(
+                    layer=layer,
+                    model=None,
+                    output_dir=Path("midi/ai"),
+                    dry_run=False,
+                    max_completion_notes=64,
+                    temperature=0.2,
+                    keep_ai_json=True,
+                ),
+            )
+
+            ai_outputs = [
+                ai_report.pattern_pack_file,
+                ai_report.ai_prompt_file,
+                *([ai_report.ai_json_file] if ai_report.ai_json_file is not None else []),
+                *([ai_report.output_midi_file] if ai_report.output_midi_file is not None else []),
+                str(analysis_dir / "ai_pattern_completion" / "bass_ai_completion_report.json"),
+            ]
+
+            output_files["ai_pattern_pack"] = ai_report.pattern_pack_file
+            output_files["ai_prompt"] = ai_report.ai_prompt_file
+            if ai_report.ai_json_file is not None:
+                output_files["bass_ai_completion_json"] = ai_report.ai_json_file
+            if ai_report.output_midi_file is not None:
+                output_files["bass_ai_completion_midi"] = ai_report.output_midi_file
+            output_files["bass_ai_completion_report"] = str(
+                analysis_dir / "ai_pattern_completion" / "bass_ai_completion_report.json"
+            )
+
+            stages.append(
+                PipelineStageReport(
+                    name="ai_pattern_completion",
+                    status="ok",
+                    output_files=ai_outputs,
+                    warning_count=ai_report.warning_count,
+                    warnings=ai_report.warnings,
+                )
+            )
+            warnings.extend([f"ai_pattern_completion: {item}" for item in ai_report.warnings])
+        else:
+            stages.append(
+                PipelineStageReport(
+                    name="ai_pattern_completion",
+                    status="ok",
+                    output_files=[],
+                    warning_count=0,
+                    warnings=[],
+                )
+            )
 
         pipeline_report = PipelineReport(
             status="ok",

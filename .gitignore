@@ -4,6 +4,7 @@ projects/*
 
 # Python/uv local environment and caches
 .venv/
+.env
 __pycache__/
 .pytest_cache/
 .ruff_cache/

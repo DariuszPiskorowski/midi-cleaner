@@ -45,6 +45,8 @@ def test_pipeline_process_stem_help_lists_iterative_options() -> None:
     assert "--no-conservative-final-pass" in result.stdout
     assert "--export-iteration-variants" in result.stdout
     assert "--no-export-iteration-variants" in result.stdout
+    assert "--enable-ai-pattern-completion" in result.stdout
+    assert "--no-enable-ai-pattern-completion" in result.stdout
 
 
 def test_pipeline_process_stem_passes_iterative_cli_values(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -84,6 +86,7 @@ def test_pipeline_process_stem_passes_iterative_cli_values(monkeypatch: pytest.M
             "--no-freeze-stable-notes",
             "--no-conservative-final-pass",
             "--no-export-iteration-variants",
+            "--enable-ai-pattern-completion",
         ],
     )
 
@@ -95,3 +98,22 @@ def test_pipeline_process_stem_passes_iterative_cli_values(monkeypatch: pytest.M
     assert params.freeze_stable_notes is False
     assert params.conservative_final_pass is False
     assert params.export_iteration_variants is False
+    assert params.enable_ai_pattern_completion is True
+
+
+def test_ai_complete_pattern_help_lists_required_options() -> None:
+    result = runner.invoke(
+        app,
+        ["ai", "complete-pattern", "--help"],
+        env={"COLUMNS": "240", "LINES": "120"},
+    )
+
+    assert result.exit_code == 0
+    assert "--project-dir" in result.stdout
+    assert "--layer" in result.stdout
+    assert "--model" in result.stdout
+    assert "--output-dir" in result.stdout
+    assert "--dry-run" in result.stdout
+    assert "--max-completion-notes" in result.stdout
+    assert "--temperature" in result.stdout
+    assert "--keep-ai-json" in result.stdout

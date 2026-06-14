@@ -7,6 +7,11 @@ from rich.console import Console
 from rich.table import Table
 
 from midi_cleaner import __version__
+from midi_cleaner.ai_completion import (
+    AIPatternCompletionError,
+    AIPatternCompletionParameters,
+    complete_ai_pattern_completion,
+)
 from midi_cleaner.alignment.audio_time import (
     AudioTimeAlignmentError,
     AudioTimeAlignmentParameters,
@@ -84,6 +89,7 @@ refine_app = typer.Typer(help="MIDI timing quality refinement tools.")
 repair_app = typer.Typer(help="Audio/MIDI activity repair tools.")
 pitch_app = typer.Typer(help="Bass pitch contour analysis tools.")
 pipeline_app = typer.Typer(help="End-to-end pipeline tools.")
+ai_app = typer.Typer(help="AI pattern completion tools.")
 console = Console()
 
 app.add_typer(midi_app, name="midi")
@@ -94,6 +100,7 @@ app.add_typer(refine_app, name="refine")
 app.add_typer(repair_app, name="repair")
 app.add_typer(pitch_app, name="pitch")
 app.add_typer(pipeline_app, name="pipeline")
+app.add_typer(ai_app, name="ai")
 
 
 def version_callback(value: bool) -> None:
@@ -999,6 +1006,55 @@ def pitch_bass_contour_command(
     )
 
 
+@ai_app.command("complete-pattern")
+def ai_complete_pattern_command(
+    project_dir: Path = typer.Option(..., "--project-dir", help="Pipeline project directory."),
+    layer: str = typer.Option("bass", "--layer", help="Instrument layer to complete."),
+    model: str | None = typer.Option(
+        None,
+        "--model",
+        help="Optional model override (default OPENAI_MODEL or gpt-4o-mini).",
+    ),
+    output_dir: Path = typer.Option(
+        Path("midi/ai"),
+        "--output-dir",
+        help="AI MIDI output directory (relative to project_dir by default).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Build pattern pack and prompt only, without API call.",
+    ),
+    max_completion_notes: int = typer.Option(64, "--max-completion-notes"),
+    temperature: float = typer.Option(0.2, "--temperature"),
+    keep_ai_json: bool = typer.Option(True, "--keep-ai-json/--no-keep-ai-json"),
+) -> None:
+    params = AIPatternCompletionParameters(
+        layer=layer,
+        model=model,
+        output_dir=output_dir,
+        dry_run=dry_run,
+        max_completion_notes=max_completion_notes,
+        temperature=temperature,
+        keep_ai_json=keep_ai_json,
+    )
+
+    try:
+        report = complete_ai_pattern_completion(project_dir=project_dir, params=params)
+    except AIPatternCompletionError as exc:
+        typer.echo(f"AI pattern completion failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        "AI pattern completion complete: "
+        f"api_called={report.api_called}, "
+        f"proposed={report.proposed_note_count}, "
+        f"accepted={report.accepted_note_count}, "
+        f"rejected={report.rejected_note_count}, "
+        f"warnings={report.warning_count}"
+    )
+
+
 @pipeline_app.command("process-stem")
 def process_stem_command(
     midi: Path = typer.Option(..., "--midi", help="Path to candidate MIDI file."),
@@ -1134,6 +1190,10 @@ def process_stem_command(
         True,
         "--export-iteration-variants/--no-export-iteration-variants",
     ),
+    enable_ai_pattern_completion: bool = typer.Option(
+        False,
+        "--enable-ai-pattern-completion/--no-enable-ai-pattern-completion",
+    ),
 ) -> None:
     params = PipelineProcessParameters(
         onset_window_ms=onset_window_ms,
@@ -1196,6 +1256,7 @@ def process_stem_command(
         freeze_stable_notes=freeze_stable_notes,
         conservative_final_pass=conservative_final_pass,
         export_iteration_variants=export_iteration_variants,
+        enable_ai_pattern_completion=enable_ai_pattern_completion,
     )
 
     try:

@@ -166,5 +166,18 @@
 	- `midi/working/working_best.mid`
 - Expand QA summary/HTML/CSV with iterative repair metrics and per-iteration table.
 
+## Milestone 14A - OpenAI AI Pattern Completion (Additive)
+- Add `midi-cleaner ai complete-pattern` command for OpenAI-powered bass pattern completion.
+- Build rich `analysis/ai_pattern_completion/pattern_pack.json` from synchronized base MIDI and audio artifacts.
+- Keep Hermes/base MIDI immutable and generate only a separate completion track.
+- Require JSON-only model response and validate output schema/constraints deterministically.
+- Reject invalid/unsafe AI notes (timing bounds, duration, pitch range, duplicate overlap).
+- Export one synchronized completion file: `midi/ai/bass_ai_completion.mid`.
+- Export AI artifacts:
+	- `analysis/ai_pattern_completion/ai_prompt.txt`
+	- `analysis/ai_pattern_completion/bass_ai_completion.json`
+	- `analysis/ai_pattern_completion/bass_ai_completion_report.json`
+- Integrate optional stage into `pipeline process-stem` via `--enable-ai-pattern-completion`.
+
 ## Future Milestones (Planned)
 - Milestone 15 (13C): add render-back audio comparison for post-export verification.
