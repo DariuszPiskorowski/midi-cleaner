@@ -955,6 +955,37 @@ def process_stem_pipeline(
                     for exported in best_variant_report.exported_files:
                         if exported.role == "WORKING":
                             output_files["working_best_midi"] = exported.path
+                else:
+                    fallback_best_report = export_working_midi(
+                        notes_file=note_events_path,
+                        cleanup_plan_file=cleanup_plan_path,
+                        output_dir=working_midi_dir,
+                        params=WorkingMidiExportParameters(
+                            ticks_per_beat=params.ticks_per_beat,
+                            track_name_prefix=params.track_name_prefix,
+                            include_diagnostic=False,
+                            write_empty_files=params.write_empty_files,
+                            refined_notes_file=final_repaired_note_events_path,
+                            repair_plan_file=activity_repair_plan_path,
+                            audio_aligned_notes_file=audio_aligned_note_events_path,
+                            repair_extend_count=activity_repair_summary["extend_count"],
+                            repair_shorten_count=activity_repair_summary["shorten_count"],
+                            repair_insert_missing_count=activity_repair_summary[
+                                "insert_missing_count"
+                            ],
+                            repair_split_count=activity_repair_summary["split_count"],
+                            repair_close_gap_count=activity_repair_summary["close_gap_count"],
+                            repair_review_manual_count=activity_repair_summary[
+                                "review_manual_count"
+                            ],
+                            working_filename="working_best.mid",
+                            rejected_filename="rejected_best.mid",
+                            diagnostic_filename="diagnostic_best.mid",
+                        ),
+                    )
+                    for exported in fallback_best_report.exported_files:
+                        if exported.role == "WORKING":
+                            output_files["working_best_midi"] = exported.path
 
             stages.append(
                 PipelineStageReport(

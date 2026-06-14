@@ -80,6 +80,7 @@ class RepairIterationSummary(BaseModel):
     output_note_count: int
     applied_action_count: int
     candidate_action_count: int
+    rejected_action_count: int = 0
     extend_count: int
     shorten_count: int
     insert_count: int
@@ -97,6 +98,12 @@ class RepairIterationSummary(BaseModel):
     pitch_consistency_score: float
     total_score: float
     improvement_from_previous: float
+    accepted: bool = True
+    rejected_reason: str | None = None
+    candidate_score: float | None = None
+    accepted_score: float | None = None
+    candidate_note_count: int | None = None
+    accepted_note_count: int | None = None
     stopped_reason: str | None
 
 

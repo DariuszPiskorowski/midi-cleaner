@@ -689,6 +689,11 @@ def _derive_iteration_summary(
     repair_plan: ActivityRepairPlan,
     repair_report: ActivityRepairReport,
     stopped_reason: str | None,
+    *,
+    accepted: bool,
+    rejected_reason: str | None,
+    candidate_score: _CandidateScore | None,
+    candidate_note_count: int | None,
 ) -> RepairIterationSummary:
     candidate_action_count = len(
         [action for action in repair_plan.actions if action.action_type != "KEEP"]
@@ -700,6 +705,10 @@ def _derive_iteration_summary(
             if action.action_type not in {"KEEP", "REVIEW_MANUAL"}
         ]
     )
+    if not accepted:
+        applied_action_count = 0
+
+    rejected_action_count = 0 if accepted else candidate_action_count
 
     protected_count = (
         int(repair_report.sustain_protected_count)
@@ -713,6 +722,7 @@ def _derive_iteration_summary(
         output_note_count=len(output_doc.notes),
         applied_action_count=applied_action_count,
         candidate_action_count=candidate_action_count,
+        rejected_action_count=rejected_action_count,
         extend_count=int(repair_report.extend_count),
         shorten_count=int(repair_report.shorten_count),
         insert_count=int(repair_report.insert_missing_count),
@@ -730,6 +740,12 @@ def _derive_iteration_summary(
         pitch_consistency_score=float(score.pitch_consistency_score),
         total_score=float(score.total_score),
         improvement_from_previous=float(score.total_score - previous_total_score),
+        accepted=accepted,
+        rejected_reason=rejected_reason,
+        candidate_score=(None if candidate_score is None else float(candidate_score.total_score)),
+        accepted_score=float(score.total_score),
+        candidate_note_count=candidate_note_count,
+        accepted_note_count=len(output_doc.notes),
         stopped_reason=stopped_reason,
     )
 
@@ -835,7 +851,6 @@ def run_iterative_activity_repair(
     )
 
     current_document = initial_document
-    previous_score = initial_score
 
     best_document = initial_document
     best_score = initial_score
@@ -845,6 +860,9 @@ def run_iterative_activity_repair(
     stable_note_ids: set[str] = set()
     convergence_reached = False
     stop_reason: str | None = None
+    accepted_any = False
+    rejected_count = 0
+    all_candidate_actions_zero = True
 
     for iteration_index in range(1, params.max_iterations + 1):
         profile = _profile_for_iteration(params, iteration_index)
@@ -871,6 +889,14 @@ def run_iterative_activity_repair(
             except ActivityRepairError as exc:
                 raise IterativeRepairError(str(exc)) from exc
 
+        current_iteration_score = _score_candidate(
+            candidate_document=current_document,
+            cleanup_plan=cleanup_plan,
+            activity_frames=activity_frames,
+            activity_params=iteration_activity_params,
+            pitch_document=pitch_document,
+        )
+
         candidate_document = _annotate_iterative_changes(
             previous_doc=current_document,
             candidate_doc=repaired_document,
@@ -881,7 +907,7 @@ def run_iterative_activity_repair(
             candidate_document, blocked_outside_errors = _restrict_changes_to_error_regions(
                 previous_doc=current_document,
                 candidate_doc=candidate_document,
-                error_regions=previous_score.error_regions,
+                error_regions=current_iteration_score.error_regions,
             )
             if blocked_outside_errors > 0:
                 warnings.append(
@@ -912,23 +938,42 @@ def run_iterative_activity_repair(
             candidate_document=candidate_document,
             cleanup_plan=cleanup_plan,
             activity_frames=activity_frames,
-            activity_params=activity_params,
+            activity_params=iteration_activity_params,
             pitch_document=pitch_document,
         )
 
-        improvement = candidate_score.total_score - previous_score.total_score
+        improvement = candidate_score.total_score - current_iteration_score.total_score
 
-        if not params.allow_regression and improvement < 0.0:
-            stop_reason = "regression_rejected"
+        candidate_action_count = len(
+            [action for action in repair_plan.actions if action.action_type != "KEEP"]
+        )
+        if candidate_action_count > 0:
+            all_candidate_actions_zero = False
+
+        reject_reason: str | None = None
+        should_reject = False
+        if improvement < 0.0 and not params.allow_regression:
+            should_reject = True
+            reject_reason = "regression_rejected"
+        elif improvement == 0.0:
+            should_reject = True
+            reject_reason = "no_improvement"
+
+        if should_reject:
+            rejected_count += 1
             summary = _derive_iteration_summary(
                 iteration_index=iteration_index,
                 input_doc=current_document,
                 output_doc=current_document,
-                score=previous_score,
-                previous_total_score=previous_score.total_score,
+                score=current_iteration_score,
+                previous_total_score=current_iteration_score.total_score,
                 repair_plan=repair_plan,
                 repair_report=repair_report,
-                stopped_reason=stop_reason,
+                stopped_reason=reject_reason,
+                accepted=False,
+                rejected_reason=reject_reason,
+                candidate_score=candidate_score,
+                candidate_note_count=len(candidate_document.notes),
             )
             artifacts.append(
                 IterationArtifacts(
@@ -936,22 +981,25 @@ def run_iterative_activity_repair(
                     repaired_document=current_document,
                     repair_plan=repair_plan,
                     repair_report=repair_report,
-                    score_report=_build_scoring_report(previous_score),
+                    score_report=_build_scoring_report(current_iteration_score),
                     summary=summary,
                 )
             )
-            convergence_reached = True
-            break
+            continue
 
         summary = _derive_iteration_summary(
             iteration_index=iteration_index,
             input_doc=current_document,
             output_doc=candidate_document,
             score=candidate_score,
-            previous_total_score=previous_score.total_score,
+            previous_total_score=current_iteration_score.total_score,
             repair_plan=repair_plan,
             repair_report=repair_report,
             stopped_reason=None,
+            accepted=True,
+            rejected_reason=None,
+            candidate_score=candidate_score,
+            candidate_note_count=len(candidate_document.notes),
         )
 
         artifacts.append(
@@ -965,13 +1013,21 @@ def run_iterative_activity_repair(
             )
         )
 
+        accepted_any = True
         previous_document = current_document
         current_document = candidate_document
-        previous_score = candidate_score
 
-        if candidate_score.total_score > best_score.total_score:
+        candidate_baseline_score = _score_candidate(
+            candidate_document=candidate_document,
+            cleanup_plan=cleanup_plan,
+            activity_frames=activity_frames,
+            activity_params=activity_params,
+            pitch_document=pitch_document,
+        )
+
+        if candidate_baseline_score.total_score > best_score.total_score:
             best_document = candidate_document
-            best_score = candidate_score
+            best_score = candidate_baseline_score
             best_iteration_index = iteration_index
 
         if params.freeze_stable_notes and params.protect_previous_good_regions:
@@ -993,7 +1049,10 @@ def run_iterative_activity_repair(
             break
 
     if stop_reason is None:
-        stop_reason = "max_iterations_reached"
+        if not accepted_any and rejected_count == len(artifacts):
+            stop_reason = "no_actions_available" if all_candidate_actions_zero else "all_candidates_rejected"
+        else:
+            stop_reason = "max_iterations_reached"
 
     if artifacts:
         last = artifacts[-1]
@@ -1006,20 +1065,12 @@ def run_iterative_activity_repair(
             summary=last.summary.model_copy(update={"stopped_reason": stop_reason}),
         )
 
-    if best_iteration_index == 0 and artifacts:
-        best_iteration_index = artifacts[0].iteration_index
-        best_document = artifacts[0].repaired_document
+    if best_iteration_index == 0:
+        best_document = initial_document
+        best_score = initial_score
 
-    final_score = (
-        float(best_score.total_score)
-        if best_iteration_index > 0
-        else (
-            float(artifacts[0].summary.total_score)
-            if artifacts
-            else float(initial_score.total_score)
-        )
-    )
-    total_improvement = float(final_score - initial_score.total_score)
+    final_score = float(best_score.total_score)
+    total_improvement = float(max(0.0, final_score - initial_score.total_score))
 
     report = IterativeRepairReport(
         status="ok",
