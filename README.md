@@ -2,7 +2,7 @@
 
 Hermes MIDI Fidelity Engine project scaffold.
 
-This repository cleans and validates MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 11**: bass MIDI quality refinement on top of canonical audio-time alignment.
+This repository cleans and validates MIDI extracted from Suno/RipX against original WAV stems. The current scope is **Milestone 12**: DSP-backed audio feature analysis on top of canonical audio-time alignment and Milestone 11 refinement.
 
 Milestone 10.1 integration and reporting hardening is now in place:
 - Validation consumes audio-aligned timing when alignment data exists.
@@ -20,9 +20,17 @@ Milestone 11 quality refinement is now in place:
 - Minimum-duration and monophonic overlap cleanup improve practical bass playback.
 - Practical DAW output adds `midi/working/working.mid` and `midi/working/rejected.mid` with optional diagnostic MIDI.
 
+Milestone 12 DSP analysis is now in place:
+- A new additive DSP analyzer command `audio analyze-dsp` exports frame-level DSP evidence and report JSON.
+- Existing lightweight analyzer `audio analyze-stem` remains unchanged and is still used by legacy flows.
+- DSP backend selection supports `auto|librosa|scipy|basic` with fallback warnings when optional backends are unavailable.
+- `process-stem` runs DSP analysis between WAV analysis and alignment, with strict (`--require-dsp-analysis`) and permissive modes.
+- Bass refinement optionally consumes DSP features to improve attack/tail/retrigger decisions when DSP evidence is present.
+- QA summary and HTML include DSP backend/classification metrics.
+
 ## Current Milestone
 
-Milestone 11 currently implements:
+Milestone 12 currently implements:
 - Python package scaffold
 - Strict Python 3.11 guard
 - Runtime/environment report via CLI doctor command
@@ -30,11 +38,14 @@ Milestone 11 currently implements:
 - Hermes note-event JSON export and import report JSON
 - WAV stem feature extraction using `numpy`, `scipy`, and `soundfile`
 - Audio feature JSON export and audio analysis report JSON
+- DSP-backed WAV feature extraction via `audio analyze-dsp`
+- DSP feature JSON export, DSP analysis report JSON, and optional DSP debug CSV
 - MIDI-vs-audio heuristic validation into note validation JSON and report JSON
 - Non-destructive cleanup plan generation from note validation JSON
 - Non-destructive review MIDI export grouped by cleanup action
 - Conservative cleaned/review/rejected MIDI export from cleanup plan
 - One-command process-stem pipeline that orchestrates existing stages
+- Optional DSP stage in process-stem with fallback/strict controls
 - Static QA artifacts: qa_summary.json, qa_notes.csv, qa_report.html
 - Audio-time canonical note alignment into analysis/audio_aligned_note_events.json
 - Audio alignment report in analysis/audio_alignment_report.json
@@ -44,10 +55,12 @@ Milestone 11 currently implements:
 - Bass refinement report in analysis/bass_refinement_report.json
 - Attack-aware onset refinement and false-retrigger merge suppression for bass
 - Sustain-tail extension, minimum-duration extension, and optional monophonic overlap resolution
+- Optional DSP-aware bass refinement behavior when DSP features are provided
 - Practical working export in midi/working/working.mid and midi/working/rejected.mid
 - Optional midi/working/diagnostic.mid for quick inspection
 - QA report includes explicit Audio-Time Alignment / Sync metrics and timing sources
 - QA report includes refinement summary metrics and per-note refinement columns
+- QA report includes DSP backend/frame classification summary metrics
 - Tests for guard behavior, MIDI import, audio analysis, validation, cleanup planning, review MIDI export, cleaned MIDI export, process-stem pipeline, and QA reports
 
 Destructive note deletion, rendering, UI, and ML are not implemented yet.
@@ -121,6 +134,18 @@ Example:
 uv run midi-cleaner audio analyze-stem .\stem.wav --layer bass --output .\artifacts\audio_features.json --report .\artifacts\audio_analysis_report.json
 ```
 
+## DSP WAV Stem Analysis (Additive)
+
+```powershell
+uv run midi-cleaner audio analyze-dsp --wav INPUT_WAV --layer bass --output OUTPUT_JSON --report REPORT_JSON --backend auto
+```
+
+Example:
+
+```powershell
+uv run midi-cleaner audio analyze-dsp --wav .\stem.wav --layer bass --output .\artifacts\audio_features_dsp.json --report .\artifacts\audio_analysis_dsp_report.json --backend auto --debug-csv .\artifacts\audio_features_dsp_debug.csv
+```
+
 ## MIDI-vs-Audio Validation
 
 ```powershell
@@ -149,6 +174,12 @@ uv run midi-cleaner validate align-audio-time --notes .\artifacts\note_events.js
 
 ```powershell
 uv run midi-cleaner refine bass --aligned-notes AUDIO_ALIGNED_NOTE_EVENTS_JSON --audio-features AUDIO_FEATURES_JSON --validation NOTE_VALIDATION_JSON --output REFINED_NOTE_EVENTS_JSON --report REFINEMENT_REPORT_JSON
+```
+
+Optional DSP feature input:
+
+```powershell
+uv run midi-cleaner refine bass --aligned-notes AUDIO_ALIGNED_NOTE_EVENTS_JSON --audio-features AUDIO_FEATURES_JSON --dsp-features AUDIO_FEATURES_DSP_JSON --validation NOTE_VALIDATION_JSON --output REFINED_NOTE_EVENTS_JSON --report REFINEMENT_REPORT_JSON
 ```
 
 Example:
@@ -223,6 +254,12 @@ uv run midi-cleaner cleanup export-working-midi --notes .\artifacts\note_events.
 uv run midi-cleaner pipeline process-stem --midi INPUT_MIDI --wav INPUT_WAV --source ripx --layer bass --project-dir PROJECT_DIR
 ```
 
+DSP controls (defaults shown):
+- `--enable-dsp-analysis/--no-enable-dsp-analysis` (default enabled)
+- `--require-dsp-analysis/--no-require-dsp-analysis` (default permissive)
+- `--dsp-backend auto|librosa|scipy|basic` (default `auto`)
+- `--dsp-debug-csv/--no-dsp-debug-csv` (default enabled)
+
 Example:
 
 ```powershell
@@ -243,4 +280,4 @@ uv run midi-cleaner pipeline qa-report --project-dir .\artifacts\pipeline_run
 
 ## Planned Pipeline
 
-Suno/RipX stem WAV -> RipX MIDI candidate -> Hermes note-event JSON -> WAV comparison -> audio-time alignment -> validation -> bass refinement -> cleanup planning -> working/rejected (plus backward-compatible review/cleaned exports) -> QA artifacts
+Suno/RipX stem WAV -> RipX MIDI candidate -> Hermes note-event JSON -> WAV comparison -> DSP analysis (additive) -> audio-time alignment -> validation -> bass refinement -> cleanup planning -> working/rejected (plus backward-compatible review/cleaned exports) -> QA artifacts

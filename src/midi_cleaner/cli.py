@@ -14,6 +14,7 @@ from midi_cleaner.alignment.audio_time import (
 )
 from midi_cleaner.alignment.models import AudioAlignmentReport
 from midi_cleaner.audio.analyzer import AudioAnalysisError, analyze_stem
+from midi_cleaner.dsp.analyzer import DspAnalysisError, analyze_dsp_stem
 from midi_cleaner.cleanup.cleaned_exporter import (
     CleanedMidiExportError,
     CleanedMidiExportParameters,
@@ -225,6 +226,58 @@ def analyze_stem_command(
     )
 
 
+@audio_app.command("analyze-dsp")
+def analyze_dsp_command(
+    wav: Path = typer.Option(..., "--wav", help="Path to input WAV stem file."),
+    layer: str = typer.Option(..., "--layer", help="Logical instrument layer, e.g. bass."),
+    output: Path = typer.Option(..., "--output", help="Output path for DSP feature JSON."),
+    report: Path = typer.Option(..., "--report", help="Output path for DSP analysis report JSON."),
+    debug_csv: Path | None = typer.Option(
+        None,
+        "--debug-csv",
+        help="Optional output path for DSP debug frame CSV.",
+    ),
+    backend: str = typer.Option(
+        "auto",
+        "--backend",
+        help="DSP backend: auto|librosa|scipy|basic.",
+    ),
+) -> None:
+    try:
+        document, analysis_report = analyze_dsp_stem(
+            wav_file=wav,
+            layer=layer,
+            backend=backend,
+            allow_backend_fallback=True,
+            debug_csv_path=debug_csv,
+        )
+    except DspAnalysisError as exc:
+        typer.echo(f"DSP analysis failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    report.parent.mkdir(parents=True, exist_ok=True)
+    if debug_csv is not None:
+        debug_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    output.write_text(document.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    analysis_report.output_file = str(output)
+    if debug_csv is not None:
+        analysis_report.debug_csv_file = str(debug_csv)
+    report.write_text(analysis_report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    typer.echo(
+        "Analyzed DSP stem: "
+        f"backend={analysis_report.backend_name}, "
+        f"frames={analysis_report.frame_count}, "
+        f"attacks={analysis_report.attack_rise_count}, "
+        f"sustain={analysis_report.sustain_count}, "
+        f"tail={analysis_report.tail_count}, "
+        f"warnings={analysis_report.warning_count}"
+    )
+
+
 @validate_app.command("midi-vs-audio")
 def validate_midi_vs_audio_command(
     notes: Path = typer.Option(..., "--notes", help="Path to note_events.json."),
@@ -360,6 +413,11 @@ def refine_bass_command(
     audio_features: Path = typer.Option(
         ..., "--audio-features", help="Path to audio_features.json."
     ),
+    dsp_features: Path | None = typer.Option(
+        None,
+        "--dsp-features",
+        help="Optional path to audio_features_dsp.json.",
+    ),
     validation: Path = typer.Option(..., "--validation", help="Path to note_validation.json."),
     output: Path = typer.Option(..., "--output", help="Output path for refined notes JSON."),
     report: Path = typer.Option(..., "--report", help="Output path for refinement report JSON."),
@@ -405,6 +463,7 @@ def refine_bass_command(
             audio_features_file=audio_features,
             validation_file=validation,
             params=params,
+            dsp_features_file=dsp_features,
         )
     except BassRefinementError as exc:
         typer.echo(f"Bass refinement failed: {exc}", err=True)
@@ -707,6 +766,23 @@ def process_stem_command(
     max_tail_extension_ms: float = typer.Option(900.0, "--max-tail-extension-ms"),
     minimum_note_duration_ms: float = typer.Option(80.0, "--minimum-note-duration-ms"),
     monophonic: bool = typer.Option(True, "--monophonic/--polyphonic"),
+    enable_dsp_analysis: bool = typer.Option(
+        True,
+        "--enable-dsp-analysis/--no-enable-dsp-analysis",
+    ),
+    require_dsp_analysis: bool = typer.Option(
+        False,
+        "--require-dsp-analysis/--no-require-dsp-analysis",
+    ),
+    dsp_backend: str = typer.Option(
+        "auto",
+        "--dsp-backend",
+        help="DSP backend: auto|librosa|scipy|basic.",
+    ),
+    dsp_debug_csv: bool = typer.Option(
+        True,
+        "--dsp-debug-csv/--no-dsp-debug-csv",
+    ),
 ) -> None:
     params = PipelineProcessParameters(
         onset_window_ms=onset_window_ms,
@@ -742,6 +818,10 @@ def process_stem_command(
         max_tail_extension_ms=max_tail_extension_ms,
         minimum_note_duration_ms=minimum_note_duration_ms,
         monophonic=monophonic,
+        enable_dsp_analysis=enable_dsp_analysis,
+        require_dsp_analysis=require_dsp_analysis,
+        dsp_backend=dsp_backend,
+        dsp_debug_csv=dsp_debug_csv,
     )
 
     try:

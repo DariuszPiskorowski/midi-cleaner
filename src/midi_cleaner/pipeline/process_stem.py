@@ -21,6 +21,7 @@ from midi_cleaner.cleanup.working_exporter import (
     export_working_midi,
 )
 from midi_cleaner.cleanup.planner import CleanupPlannerParameters, build_cleanup_plan
+from midi_cleaner.dsp.analyzer import DspAnalysisError, analyze_dsp_stem
 from midi_cleaner.midi.importer import import_midi_candidate
 from midi_cleaner.pipeline.models import PipelineReport, PipelineStageReport
 from midi_cleaner.refinement.bass import BassRefinementParameters, refine_bass_notes
@@ -68,6 +69,10 @@ class PipelineProcessParameters:
     minimum_note_duration_ms: float = 80.0
     monophonic: bool = True
     include_diagnostic_working_midi: bool = False
+    enable_dsp_analysis: bool = True
+    require_dsp_analysis: bool = False
+    dsp_backend: str = "auto"
+    dsp_debug_csv: bool = True
 
 
 def _write_json(path: Path, payload: BaseModel | dict[str, object]) -> None:
@@ -228,6 +233,13 @@ def process_stem_pipeline(
                     "max_end_correction_ms": params.max_end_correction_ms,
                     "low_confidence_action": params.low_confidence_action,
                 },
+                "dsp_analysis": {
+                    "enable_dsp_analysis": params.enable_dsp_analysis,
+                    "require_dsp_analysis": params.require_dsp_analysis,
+                    "dsp_backend": params.dsp_backend,
+                    "dsp_debug_csv": params.dsp_debug_csv,
+                    "dsp_features_file": str(analysis_dir / "audio_features_dsp.json"),
+                },
                 "refinement": {
                     "enable_bass_refinement": params.enable_bass_refinement,
                     "attack_lookback_ms": params.attack_lookback_ms,
@@ -259,6 +271,7 @@ def process_stem_pipeline(
     stages: list[PipelineStageReport] = []
     warnings: list[str] = []
     current_stage = "initialization"
+    dsp_features_path: Path | None = None
 
     try:
         # Stage 1: MIDI import
@@ -303,7 +316,74 @@ def process_stem_pipeline(
         )
         warnings.extend([f"audio_analysis: {item}" for item in audio_report.warnings])
 
-        # Stage 3: Audio-time note alignment
+        # Stage 3: DSP-backed audio analysis (optional, with graceful fallback)
+        current_stage = "dsp_analysis"
+        dsp_features_path = analysis_dir / "audio_features_dsp.json"
+        dsp_analysis_report_path = analysis_dir / "audio_analysis_dsp_report.json"
+        dsp_debug_csv_path = (
+            analysis_dir / "audio_features_dsp_debug.csv" if params.dsp_debug_csv else None
+        )
+
+        if params.enable_dsp_analysis:
+            try:
+                dsp_document, dsp_report = analyze_dsp_stem(
+                    wav_file=input_wav,
+                    layer=layer,
+                    backend=params.dsp_backend,
+                    allow_backend_fallback=not params.require_dsp_analysis,
+                    debug_csv_path=dsp_debug_csv_path,
+                )
+            except DspAnalysisError as exc:
+                if params.require_dsp_analysis:
+                    raise
+                dsp_features_path = None
+                warnings.append(f"dsp_analysis: {exc}")
+                stages.append(
+                    PipelineStageReport(
+                        name="dsp_analysis",
+                        status="ok",
+                        output_files=[],
+                        warning_count=1,
+                        warnings=[str(exc)],
+                    )
+                )
+            else:
+                dsp_report.output_file = str(dsp_features_path)
+                if dsp_debug_csv_path is not None:
+                    dsp_report.debug_csv_file = str(dsp_debug_csv_path)
+                _write_json(dsp_features_path, dsp_document)
+                _write_json(dsp_analysis_report_path, dsp_report)
+                output_files["audio_features_dsp"] = str(dsp_features_path)
+                output_files["audio_analysis_dsp_report"] = str(dsp_analysis_report_path)
+                if dsp_debug_csv_path is not None:
+                    output_files["audio_features_dsp_debug_csv"] = str(dsp_debug_csv_path)
+                stages.append(
+                    PipelineStageReport(
+                        name="dsp_analysis",
+                        status="ok",
+                        output_files=[
+                            str(dsp_features_path),
+                            str(dsp_analysis_report_path),
+                            *([str(dsp_debug_csv_path)] if dsp_debug_csv_path is not None else []),
+                        ],
+                        warning_count=dsp_report.warning_count,
+                        warnings=dsp_report.warnings,
+                    )
+                )
+                warnings.extend([f"dsp_analysis: {item}" for item in dsp_report.warnings])
+        else:
+            dsp_features_path = None
+            stages.append(
+                PipelineStageReport(
+                    name="dsp_analysis",
+                    status="ok",
+                    output_files=[],
+                    warning_count=0,
+                    warnings=[],
+                )
+            )
+
+        # Stage 4: Audio-time note alignment
         current_stage = "audio_time_alignment"
         audio_aligned_note_events_path = analysis_dir / "audio_aligned_note_events.json"
         audio_alignment_report_path = analysis_dir / "audio_alignment_report.json"
@@ -338,7 +418,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"audio_time_alignment: {item}" for item in alignment_report.warnings])
 
-        # Stage 4: MIDI-vs-audio validation
+        # Stage 5: MIDI-vs-audio validation
         current_stage = "midi_audio_validation"
         note_validation_path = analysis_dir / "note_validation.json"
         midi_audio_validation_report_path = analysis_dir / "midi_audio_validation_report.json"
@@ -375,7 +455,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"midi_audio_validation: {item}" for item in validation_report.warnings])
 
-        # Stage 5: Bass refinement (or passthrough for non-bass/disabled)
+        # Stage 6: Bass refinement (or passthrough for non-bass/disabled)
         current_stage = "bass_refinement"
         refined_note_events_path = analysis_dir / "refined_note_events.json"
         bass_refinement_report_path = analysis_dir / "bass_refinement_report.json"
@@ -398,6 +478,7 @@ def process_stem_pipeline(
                     monophonic=params.monophonic,
                     allow_pitch_overlap=False,
                 ),
+                dsp_features_file=dsp_features_path,
             )
         else:
             reason = (
@@ -430,7 +511,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"bass_refinement: {item}" for item in refinement_report.warnings])
 
-        # Stage 6: Cleanup planning
+        # Stage 7: Cleanup planning
         current_stage = "cleanup_plan"
         cleanup_plan_path = cleanup_dir / "cleanup_plan.json"
         cleanup_plan_report_path = cleanup_dir / "cleanup_plan_report.json"
@@ -459,7 +540,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"cleanup_plan: {item}" for item in cleanup_report.warnings])
 
-        # Stage 7: Review MIDI export (backward compatible)
+        # Stage 8: Review MIDI export (backward compatible)
         current_stage = "review_midi_export"
         review_export_report_path = review_midi_dir / "export_report.json"
         review_export_report = export_review_midi(
@@ -489,7 +570,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"review_midi_export: {item}" for item in review_export_report.warnings])
 
-        # Stage 8: Cleaned MIDI export (backward compatible)
+        # Stage 9: Cleaned MIDI export (backward compatible)
         current_stage = "cleaned_midi_export"
         cleaned_export_report_path = cleaned_midi_dir / "cleaned_export_report.json"
         cleaned_export_report = export_cleaned_midi(
@@ -520,7 +601,7 @@ def process_stem_pipeline(
         )
         warnings.extend([f"cleaned_midi_export: {item}" for item in cleaned_export_report.warnings])
 
-        # Stage 9: Working MIDI export
+        # Stage 10: Working MIDI export
         current_stage = "working_midi_export"
         working_export_report_path = working_midi_dir / "working_export_report.json"
         working_export_report = export_working_midi(

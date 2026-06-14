@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Rules for AI coding agents in `midi-cleaner` during Milestone 11:
+Rules for AI coding agents in `midi-cleaner` during Milestone 12:
 
 - Keep the Python environment guard strict for Python 3.11.x.
 - Run all commands through `uv run` when executing project tools.
@@ -17,6 +17,11 @@ Rules for AI coding agents in `midi-cleaner` during Milestone 11:
 - Milestone 11 refines bass note quality after audio-time alignment.
 - Milestone 11 must support attack-aware start adjustment, false-retrigger suppression, and sustain-tail extension.
 - Milestone 11 exports practical `working.mid` plus `rejected.mid` (optional diagnostic output).
+- Milestone 12 adds DSP-backed audio feature analysis as an additional stage; do not remove or replace the existing lightweight analyzer.
+- Milestone 12 must support backend selection (`auto|librosa|scipy|basic`) with deterministic fallback behavior.
+- Milestone 12 must allow strict mode (`require_dsp_analysis`) and permissive mode (warning + continue when DSP fails).
+- Milestone 12 refinement may use DSP evidence when available but must preserve Milestone 11 behavior when DSP data is absent.
+- Milestone 12 QA outputs must include DSP backend and frame/classification summary metrics.
 - Synchronization is critical.
 - Global offset search must run before local per-note alignment.
 - Do not rely on BPM/bar calculations for timing alignment.

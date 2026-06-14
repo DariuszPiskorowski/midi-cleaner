@@ -6,6 +6,7 @@ from statistics import median
 
 from midi_cleaner.alignment.models import AudioAlignedNoteDocument, AudioAlignedNoteEvent
 from midi_cleaner.audio.models import AudioFeatureDocument, AudioFrameFeature
+from midi_cleaner.dsp.models import DspAudioFeatureDocument, DspAudioFrame
 from midi_cleaner.refinement.models import BassRefinementReport, RefinedNoteDocument, RefinedNoteEvent
 from midi_cleaner.validation.models import NoteValidationDocument
 
@@ -85,6 +86,13 @@ def _load_validation_document(path: Path) -> NoteValidationDocument:
         raise BassRefinementError(f"Invalid validation JSON: {path}") from exc
 
 
+def _load_dsp_document(path: Path) -> DspAudioFeatureDocument:
+    try:
+        return DspAudioFeatureDocument.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # pragma: no cover - pydantic internals vary
+        raise BassRefinementError(f"Invalid DSP features JSON: {path}") from exc
+
+
 def _nearest_frame(frames: list[AudioFrameFeature], anchor_sec: float) -> AudioFrameFeature | None:
     if not frames:
         return None
@@ -103,6 +111,14 @@ def _median_frame_span_ms(frames: list[AudioFrameFeature]) -> float:
 
 
 def _window_frames(frames: list[AudioFrameFeature], low_sec: float, high_sec: float) -> list[AudioFrameFeature]:
+    return [frame for frame in frames if frame.end_sec > low_sec and frame.start_sec < high_sec]
+
+
+def _window_dsp_frames(
+    frames: list[DspAudioFrame],
+    low_sec: float,
+    high_sec: float,
+) -> list[DspAudioFrame]:
     return [frame for frame in frames if frame.end_sec > low_sec and frame.start_sec < high_sec]
 
 
@@ -146,17 +162,62 @@ def _is_silence_between(
     return False
 
 
+def _is_dsp_silence_between(
+    frames: list[DspAudioFrame],
+    start_sec: float,
+    end_sec: float,
+    minimum_silence_ms: float,
+) -> bool:
+    if end_sec <= start_sec:
+        return False
+
+    interval = _window_dsp_frames(frames, start_sec, end_sec)
+    if not interval:
+        return True
+
+    run_start = None
+    for frame in interval:
+        if frame.is_silence:
+            if run_start is None:
+                run_start = float(frame.start_sec)
+            run_end = float(frame.end_sec)
+            if (run_end - run_start) * 1000.0 >= minimum_silence_ms:
+                return True
+        else:
+            run_start = None
+    return False
+
+
 def _find_attack_start(
     note: _MutableRefinedNote,
     frames: list[AudioFrameFeature],
     params: BassRefinementParameters,
     audio_duration_sec: float,
+    dsp_frames: list[DspAudioFrame] | None = None,
 ) -> float:
     _ = audio_duration_sec
     lookback_sec = max(0.0, params.attack_lookback_ms / 1000.0)
     max_advance_sec = max(0.0, params.max_attack_advance_ms / 1000.0)
 
     current_start = max(0.0, note.refined_start_sec)
+
+    if dsp_frames:
+        low = max(0.0, current_start - lookback_sec)
+        dsp_candidates = sorted(
+            [
+                frame
+                for frame in _window_dsp_frames(dsp_frames, low, current_start + 1e-6)
+                if frame.start_sec <= current_start and frame.is_attack_rise
+            ],
+            key=lambda frame: frame.start_sec,
+        )
+        if dsp_candidates:
+            dsp_start = max(current_start - max_advance_sec, float(dsp_candidates[0].start_sec))
+            if dsp_start < current_start:
+                note.add_action("ATTACK_START_ADJUSTED")
+                note.reasons.append("moved start earlier to DSP attack evidence")
+                return dsp_start
+
     low = max(0.0, current_start - lookback_sec)
     candidates = [
         frame
@@ -210,6 +271,7 @@ def _merge_false_retriggers(
     notes: list[_MutableRefinedNote],
     frames: list[AudioFrameFeature],
     params: BassRefinementParameters,
+    dsp_frames: list[DspAudioFrame] | None = None,
 ) -> tuple[list[_MutableRefinedNote], int]:
     if not notes:
         return [], 0
@@ -247,6 +309,26 @@ def _merge_false_retriggers(
             minimum_silence_ms=params.minimum_silence_ms,
         )
 
+        if dsp_frames is not None:
+            has_dsp_silence = _is_dsp_silence_between(
+                frames=dsp_frames,
+                start_sec=previous.refined_end_sec,
+                end_sec=note.refined_start_sec,
+                minimum_silence_ms=params.minimum_silence_ms,
+            )
+            has_dsp_sustain = any(
+                (frame.is_sustain or frame.is_tail) and (not frame.is_silence)
+                for frame in _window_dsp_frames(
+                    dsp_frames,
+                    previous.refined_end_sec,
+                    note.refined_start_sec,
+                )
+            )
+            if has_dsp_silence:
+                has_real_silence = True
+            elif has_dsp_sustain:
+                has_real_silence = False
+
         if near_pitch and in_gap_window and merge_window_ok and not has_real_silence:
             previous.refined_end_sec = max(previous.refined_end_sec, note.refined_end_sec)
             previous.merged_note_ids.extend([note.note_id, *note.merged_note_ids])
@@ -273,6 +355,7 @@ def _find_tail_end(
     frames: list[AudioFrameFeature],
     params: BassRefinementParameters,
     audio_duration_sec: float,
+    dsp_frames: list[DspAudioFrame] | None = None,
 ) -> float:
     current_end = note.refined_end_sec
     max_tail_end = min(audio_duration_sec, current_end + (params.max_tail_extension_ms / 1000.0))
@@ -311,6 +394,30 @@ def _find_tail_end(
         if silence_len >= hold_sec:
             break
 
+    if dsp_frames:
+        dsp_tail_frames = sorted(
+            _window_dsp_frames(dsp_frames, current_end, max_tail_end),
+            key=lambda item: item.start_sec,
+        )
+        dsp_silence_run_start = None
+        dsp_candidate_end = current_end
+        for frame in dsp_tail_frames:
+            frame_start = float(frame.start_sec)
+            frame_end = float(frame.end_sec)
+            has_tail_energy = (frame.is_sustain or frame.is_tail) and (not frame.is_silence)
+            if has_tail_energy:
+                dsp_candidate_end = max(dsp_candidate_end, frame_end)
+                dsp_silence_run_start = None
+                continue
+
+            if dsp_silence_run_start is None:
+                dsp_silence_run_start = frame_start
+            silence_len = max(0.0, frame_end - dsp_silence_run_start)
+            if silence_len >= hold_sec:
+                break
+
+        candidate_end = max(candidate_end, min(dsp_candidate_end, max_tail_end))
+
     candidate_end = min(candidate_end, max_tail_end)
     if candidate_end <= current_end:
         return current_end
@@ -326,6 +433,7 @@ def _ensure_minimum_duration(
     frames: list[AudioFrameFeature],
     params: BassRefinementParameters,
     audio_duration_sec: float,
+    dsp_frames: list[DspAudioFrame] | None = None,
 ) -> None:
     min_duration_sec = params.minimum_note_duration_ms / 1000.0
     duration = max(0.0, note.refined_end_sec - note.refined_start_sec)
@@ -334,6 +442,15 @@ def _ensure_minimum_duration(
 
     local_frames = _window_frames(frames, note.refined_start_sec, note.refined_end_sec + min_duration_sec)
     has_energy = any(float(frame.rms) > 0.0 for frame in local_frames)
+    if not has_energy and dsp_frames is not None:
+        has_energy = any(
+            not frame.is_silence
+            for frame in _window_dsp_frames(
+                dsp_frames,
+                note.refined_start_sec,
+                note.refined_end_sec + min_duration_sec,
+            )
+        )
     if not has_energy:
         return
 
@@ -432,6 +549,7 @@ def refine_bass_notes(
     audio_features_file: Path,
     validation_file: Path,
     params: BassRefinementParameters,
+    dsp_features_file: Path | None = None,
 ) -> tuple[RefinedNoteDocument, BassRefinementReport]:
     if not aligned_notes_file.exists() or not aligned_notes_file.is_file():
         raise BassRefinementError(f"Aligned notes file does not exist: {aligned_notes_file}")
@@ -439,10 +557,13 @@ def refine_bass_notes(
         raise BassRefinementError(f"Audio features file does not exist: {audio_features_file}")
     if not validation_file.exists() or not validation_file.is_file():
         raise BassRefinementError(f"Validation file does not exist: {validation_file}")
+    if dsp_features_file is not None and (not dsp_features_file.exists() or not dsp_features_file.is_file()):
+        raise BassRefinementError(f"DSP features file does not exist: {dsp_features_file}")
 
     aligned_document = _load_aligned_document(aligned_notes_file)
     audio_document = _load_audio_document(audio_features_file)
     validation_document = _load_validation_document(validation_file)
+    dsp_document = _load_dsp_document(dsp_features_file) if dsp_features_file is not None else None
 
     warnings: list[str] = []
     if aligned_document.layer != audio_document.layer:
@@ -455,8 +576,14 @@ def refine_bass_notes(
             "Layer mismatch between validation and aligned notes: "
             f"{validation_document.layer} vs {aligned_document.layer}."
         )
+    if dsp_document is not None and dsp_document.layer != aligned_document.layer:
+        warnings.append(
+            "Layer mismatch between DSP features and aligned notes: "
+            f"{dsp_document.layer} vs {aligned_document.layer}."
+        )
 
     validation_by_note_id = {item.note_id: item for item in validation_document.validations}
+    dsp_frames = dsp_document.frames if dsp_document is not None else None
 
     mutable_notes: list[_MutableRefinedNote] = []
     for note in aligned_document.notes:
@@ -490,12 +617,14 @@ def refine_bass_notes(
             frames=audio_document.frames,
             params=params,
             audio_duration_sec=float(audio_document.duration_sec),
+            dsp_frames=dsp_frames,
         )
 
     mutable_notes, false_merge_count = _merge_false_retriggers(
         notes=mutable_notes,
         frames=audio_document.frames,
         params=params,
+        dsp_frames=dsp_frames,
     )
 
     mutable_notes.sort(key=lambda item: (item.refined_start_sec, item.refined_end_sec, item.note_id))
@@ -516,6 +645,7 @@ def refine_bass_notes(
             frames=audio_document.frames,
             params=params,
             audio_duration_sec=float(audio_document.duration_sec),
+            dsp_frames=dsp_frames,
         )
         if note.refined_end_sec > before_end:
             tail_extended_count += 1
@@ -527,6 +657,7 @@ def refine_bass_notes(
             frames=audio_document.frames,
             params=params,
             audio_duration_sec=float(audio_document.duration_sec),
+            dsp_frames=dsp_frames,
         )
         after_duration = note.refined_end_sec - note.refined_start_sec
         if initial_duration < minimum_duration_sec and after_duration >= minimum_duration_sec:
@@ -580,6 +711,7 @@ def refine_bass_notes(
             "gap_close_ms": params.gap_close_ms,
             "monophonic": params.monophonic,
             "allow_pitch_overlap": params.allow_pitch_overlap,
+            "uses_dsp_features": dsp_document is not None,
         },
         notes=refined_events,
     )

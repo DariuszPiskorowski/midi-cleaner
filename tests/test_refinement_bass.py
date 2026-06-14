@@ -4,6 +4,7 @@ from pathlib import Path
 
 from midi_cleaner.alignment.models import AudioAlignedNoteDocument, AudioAlignedNoteEvent
 from midi_cleaner.audio.models import AudioFeatureDocument, AudioFrameFeature, AudioGlobalFeatures
+from midi_cleaner.dsp.models import DspAudioFeatureDocument, DspAudioFrame
 from midi_cleaner.refinement.bass import (
     BassRefinementParameters,
     refine_bass_notes,
@@ -177,6 +178,62 @@ def _write_inputs(
     return aligned_path, audio_path, validation_path
 
 
+def _build_dsp_document(
+    layer: str,
+    duration_sec: float,
+    frame_step_sec: float,
+    attack_at_sec: float,
+) -> DspAudioFeatureDocument:
+    frames: list[DspAudioFrame] = []
+    frame_count = int(duration_sec / frame_step_sec)
+    for idx in range(frame_count):
+        start = idx * frame_step_sec
+        end = start + frame_step_sec
+        is_attack = abs(start - attack_at_sec) < (frame_step_sec * 0.6)
+        is_sustain = 1.0 <= start <= 1.2 and not is_attack
+        is_tail = 1.2 < start <= 1.3
+        is_silence = not (is_attack or is_sustain or is_tail)
+        frames.append(
+            DspAudioFrame(
+                frame_index=idx,
+                start_sec=start,
+                end_sec=end,
+                rms=0.08 if not is_silence else 0.0,
+                rms_smooth=0.08 if not is_silence else 0.0,
+                rms_delta=0.0,
+                envelope=0.08 if not is_silence else 0.0,
+                envelope_smooth=0.08 if not is_silence else 0.0,
+                envelope_delta=0.0,
+                low_band_rms=0.08 if not is_silence else 0.0,
+                low_band_envelope=0.08 if not is_silence else 0.0,
+                low_band_envelope_smooth=0.08 if not is_silence else 0.0,
+                low_band_delta=0.0,
+                spectral_flux=0.1 if is_attack else 0.0,
+                onset_strength=0.1 if is_attack else 0.0,
+                harmonic_rms=0.08 if not is_silence else 0.0,
+                percussive_rms=0.02 if is_attack else 0.0,
+                is_attack_rise=is_attack,
+                is_sustain=is_sustain,
+                is_tail=is_tail,
+                is_silence=is_silence,
+            )
+        )
+
+    return DspAudioFeatureDocument(
+        schema_version="0.1.0",
+        wav_file="stem.wav",
+        layer=layer,
+        sample_rate=44100,
+        duration_sec=duration_sec,
+        backend_name="basic",
+        backend_available=True,
+        hop_length=512,
+        frame_length=2048,
+        low_band_hz=[40.0, 500.0],
+        frames=frames,
+    )
+
+
 def test_attack_adjustment_moves_start_earlier_toward_attack_rise(tmp_path: Path) -> None:
     audio_doc = _build_audio_document(
         layer="bass",
@@ -348,3 +405,45 @@ def test_monophonic_overlap_cleanup_resolves_overlapping_notes(tmp_path: Path) -
     assert len(refined_doc.notes) == 2
     assert refined_doc.notes[0].refined_end_sec <= refined_doc.notes[1].refined_start_sec
     assert report.overlap_resolved_count >= 1
+
+
+def test_dsp_attack_evidence_can_advance_start_when_audio_rise_is_flat(tmp_path: Path) -> None:
+    audio_doc = _build_audio_document(
+        layer="bass",
+        duration_sec=2.0,
+        frame_step_sec=0.01,
+        rms_fn=lambda t: 0.08 if 0.9 <= t <= 1.2 else 0.0,
+        onset_fn=lambda t: 0.0,
+    )
+    aligned_notes = [_aligned_note("n1", pitch=45, start_sec=1.0, end_sec=1.15)]
+    aligned_path, audio_path, validation_path = _write_inputs(tmp_path, aligned_notes, audio_doc)
+
+    baseline_doc, _ = refine_bass_notes(
+        aligned_notes_file=aligned_path,
+        audio_features_file=audio_path,
+        validation_file=validation_path,
+        params=BassRefinementParameters(),
+    )
+    baseline_start = baseline_doc.notes[0].refined_start_sec
+
+    dsp_document = _build_dsp_document(
+        layer="bass",
+        duration_sec=2.0,
+        frame_step_sec=0.01,
+        attack_at_sec=0.95,
+    )
+    dsp_path = tmp_path / "audio_features_dsp.json"
+    dsp_path.write_text(dsp_document.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    refined_doc, _ = refine_bass_notes(
+        aligned_notes_file=aligned_path,
+        audio_features_file=audio_path,
+        validation_file=validation_path,
+        params=BassRefinementParameters(),
+        dsp_features_file=dsp_path,
+    )
+
+    dsp_start = refined_doc.notes[0].refined_start_sec
+    assert baseline_start >= 0.999
+    assert dsp_start <= 0.96
+    assert "ATTACK_START_ADJUSTED" in refined_doc.notes[0].refinement_actions

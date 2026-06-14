@@ -367,6 +367,14 @@ def _write_html(
             <tr><th>tail_extended_count</th><td>{summary.tail_extended_count}</td></tr>
             <tr><th>short_note_extended_count</th><td>{summary.short_note_extended_count}</td></tr>
             <tr><th>overlap_resolved_count</th><td>{summary.overlap_resolved_count}</td></tr>
+            <tr><th>dsp_backend_name</th><td>{summary.dsp_backend_name}</td></tr>
+            <tr><th>dsp_backend_available</th><td>{summary.dsp_backend_available}</td></tr>
+            <tr><th>dsp_frame_count</th><td>{summary.dsp_frame_count}</td></tr>
+            <tr><th>dsp_attack_rise_count</th><td>{summary.dsp_attack_rise_count}</td></tr>
+            <tr><th>dsp_sustain_count</th><td>{summary.dsp_sustain_count}</td></tr>
+            <tr><th>dsp_tail_count</th><td>{summary.dsp_tail_count}</td></tr>
+            <tr><th>dsp_silence_count</th><td>{summary.dsp_silence_count}</td></tr>
+            <tr><th>dsp_debug_csv_file</th><td>{summary.dsp_debug_csv_file}</td></tr>
             <tr><th>working_midi_note_count</th><td>{summary.working_midi_note_count}</td></tr>
     <tr><th>aligned_count</th><td>{summary.aligned_count}</td></tr>
     <tr><th>keep_original_count</th><td>{summary.keep_original_count}</td></tr>
@@ -431,6 +439,7 @@ def generate_qa_report(
     audio_alignment_report_path = project_dir / "analysis" / "audio_alignment_report.json"
     refined_notes_path = project_dir / "analysis" / "refined_note_events.json"
     bass_refinement_report_path = project_dir / "analysis" / "bass_refinement_report.json"
+    dsp_analysis_report_path = project_dir / "analysis" / "audio_analysis_dsp_report.json"
     midi_audio_validation_report_path = project_dir / "analysis" / "midi_audio_validation_report.json"
     cleanup_plan_path = project_dir / "cleanup" / "cleanup_plan.json"
     cleaned_export_report_path = project_dir / "midi" / "cleaned" / "cleaned_export_report.json"
@@ -491,6 +500,14 @@ def generate_qa_report(
     cleaned_note_count = 0
     rejected_note_count = 0
     working_midi_note_count = 0
+    dsp_backend_name: str | None = None
+    dsp_backend_available: bool | None = None
+    dsp_frame_count = 0
+    dsp_attack_rise_count = 0
+    dsp_sustain_count = 0
+    dsp_tail_count = 0
+    dsp_silence_count = 0
+    dsp_debug_csv_file: str | None = None
     cleaned_export_timing_source: str | None = None
     review_export_timing_source: str | None = None
     working_export_time_error_ms: float | None = None
@@ -539,6 +556,34 @@ def generate_qa_report(
         working_export_time_error_ms = float(working_export_report.max_export_time_error_ms)
     else:
         warnings.append(f"Missing working export report: {working_export_report_path}")
+
+    if dsp_analysis_report_path.exists():
+        dsp_report_payload = _read_json(dsp_analysis_report_path)
+        raw_backend_name = dsp_report_payload.get("backend_name")
+        raw_backend_available = dsp_report_payload.get("backend_available")
+        raw_frame_count = dsp_report_payload.get("frame_count")
+        raw_attack_count = dsp_report_payload.get("attack_rise_count")
+        raw_sustain_count = dsp_report_payload.get("sustain_count")
+        raw_tail_count = dsp_report_payload.get("tail_count")
+        raw_silence_count = dsp_report_payload.get("silence_count")
+        raw_debug_csv = dsp_report_payload.get("debug_csv_file")
+
+        if isinstance(raw_backend_name, str):
+            dsp_backend_name = raw_backend_name
+        if isinstance(raw_backend_available, bool):
+            dsp_backend_available = raw_backend_available
+        if isinstance(raw_frame_count, int):
+            dsp_frame_count = raw_frame_count
+        if isinstance(raw_attack_count, int):
+            dsp_attack_rise_count = raw_attack_count
+        if isinstance(raw_sustain_count, int):
+            dsp_sustain_count = raw_sustain_count
+        if isinstance(raw_tail_count, int):
+            dsp_tail_count = raw_tail_count
+        if isinstance(raw_silence_count, int):
+            dsp_silence_count = raw_silence_count
+        if isinstance(raw_debug_csv, str):
+            dsp_debug_csv_file = raw_debug_csv
 
     if not pipeline_report_path.exists():
         warnings.append(f"Missing pipeline report: {pipeline_report_path}")
@@ -708,6 +753,14 @@ def generate_qa_report(
         overlap_resolved_count=overlap_resolved_count,
         median_start_refinement_ms=median_start_refinement_ms,
         median_end_refinement_ms=median_end_refinement_ms,
+        dsp_backend_name=dsp_backend_name,
+        dsp_backend_available=dsp_backend_available,
+        dsp_frame_count=dsp_frame_count,
+        dsp_attack_rise_count=dsp_attack_rise_count,
+        dsp_sustain_count=dsp_sustain_count,
+        dsp_tail_count=dsp_tail_count,
+        dsp_silence_count=dsp_silence_count,
+        dsp_debug_csv_file=dsp_debug_csv_file,
         working_midi_note_count=working_midi_note_count,
         working_export_time_error_ms=working_export_time_error_ms,
         validation_timing_source=validation_timing_source,

@@ -300,6 +300,36 @@ def _write_pipeline_like_project(tmp_path: Path, include_optional: bool = True) 
             encoding="utf-8",
         )
 
+        (project_dir / "analysis" / "audio_analysis_dsp_report.json").write_text(
+            json.dumps(
+                {
+                    "wav_file": "stem.wav",
+                    "status": "ok",
+                    "layer": "bass",
+                    "backend_name": "basic",
+                    "backend_available": True,
+                    "frame_count": 120,
+                    "duration_sec": 1.0,
+                    "low_band_hz": [40.0, 500.0],
+                    "mean_rms": 0.02,
+                    "max_rms": 0.2,
+                    "mean_low_band_rms": 0.015,
+                    "max_low_band_rms": 0.18,
+                    "attack_rise_count": 8,
+                    "sustain_count": 70,
+                    "tail_count": 20,
+                    "silence_count": 22,
+                    "warning_count": 0,
+                    "warnings": [],
+                    "output_file": "analysis/audio_features_dsp.json",
+                    "debug_csv_file": "analysis/audio_features_dsp_debug.csv",
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
         alignment_report = AudioAlignmentReport(
             notes_file="analysis/note_events.json",
             audio_features_file="analysis/audio_features.json",
@@ -513,6 +543,8 @@ def test_html_contains_sections_and_escaped_content(tmp_path: Path) -> None:
     assert "max_export_time_error_ms" in html_text
     assert "working_export_time_error_ms" in html_text
     assert "refined_note_count" in html_text
+    assert "dsp_backend_name" in html_text
+    assert "dsp_frame_count" in html_text
     assert "Top 25 Lowest-Confidence Notes" in html_text
     assert "&lt;unsafe&gt;" in html_text
 
@@ -535,6 +567,14 @@ def test_summary_contains_audio_sync_fields(tmp_path: Path) -> None:
     assert summary.false_retrigger_merge_count == 1
     assert summary.tail_extended_count == 1
     assert summary.overlap_resolved_count == 1
+    assert summary.dsp_backend_name == "basic"
+    assert summary.dsp_backend_available is True
+    assert summary.dsp_frame_count == 120
+    assert summary.dsp_attack_rise_count == 8
+    assert summary.dsp_sustain_count == 70
+    assert summary.dsp_tail_count == 20
+    assert summary.dsp_silence_count == 22
+    assert summary.dsp_debug_csv_file == "analysis/audio_features_dsp_debug.csv"
     assert summary.working_midi_note_count == 2
     assert summary.working_export_time_error_ms == 0.4
 

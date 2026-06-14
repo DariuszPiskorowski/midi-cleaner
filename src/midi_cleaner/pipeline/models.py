@@ -72,6 +72,14 @@ class QASummary(BaseModel):
     overlap_resolved_count: int = 0
     median_start_refinement_ms: float | None = None
     median_end_refinement_ms: float | None = None
+    dsp_backend_name: str | None = None
+    dsp_backend_available: bool | None = None
+    dsp_frame_count: int = 0
+    dsp_attack_rise_count: int = 0
+    dsp_sustain_count: int = 0
+    dsp_tail_count: int = 0
+    dsp_silence_count: int = 0
+    dsp_debug_csv_file: str | None = None
     working_midi_note_count: int = 0
     working_export_time_error_ms: float | None = None
     validation_timing_source: str | None

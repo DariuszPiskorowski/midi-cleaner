@@ -91,6 +91,17 @@
 - Keep legacy cleaned/review/rejected exports for backward compatibility.
 - Expand QA artifacts with refinement and working-export summary fields and per-note refinement columns.
 
+## Milestone 12 - DSP-Backed Audio Feature Analyzer
+- Add `midi-cleaner audio analyze-dsp` to generate DSP-oriented per-frame features and report JSON.
+- Keep Milestone 3 lightweight analyzer intact; DSP analysis is additive and does not replace existing outputs.
+- Support backend routing and fallback for `auto|librosa|scipy|basic` with deterministic warning behavior.
+- Add optional debug CSV export for DSP frame evidence.
+- Insert DSP stage into `pipeline process-stem` between lightweight WAV analysis and audio-time alignment.
+- Add pipeline controls: enable/disable DSP stage, require DSP success, backend selection, debug CSV toggle.
+- Allow bass refinement to consume DSP features when available for attack placement, retrigger suppression, and tail extension decisions.
+- Keep refinement behavior backward compatible when DSP features are unavailable.
+- Expand QA artifacts with DSP backend/frame-classification summary fields.
+
 ## Future Milestones (Planned)
 - Classify actions: KEEP, MUTE, MERGE, SHORTEN, QUANTIZE, REASSIGN, DELETE.
 - Export cleaned MIDI and machine-readable QA reports.

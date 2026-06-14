@@ -5,11 +5,17 @@ from pathlib import Path
 
 import mido
 import numpy as np
+import pytest
 import soundfile as sf
 from typer.testing import CliRunner
 
 from midi_cleaner.cli import app
-from midi_cleaner.pipeline.process_stem import PipelineProcessParameters, process_stem_pipeline
+from midi_cleaner.pipeline.process_stem import (
+    DspAnalysisError,
+    PipelineProcessError,
+    PipelineProcessParameters,
+    process_stem_pipeline,
+)
 
 
 runner = CliRunner()
@@ -40,6 +46,9 @@ def _expected_paths(project_dir: Path) -> list[Path]:
         project_dir / "analysis" / "midi_import_report.json",
         project_dir / "analysis" / "audio_features.json",
         project_dir / "analysis" / "audio_analysis_report.json",
+        project_dir / "analysis" / "audio_features_dsp.json",
+        project_dir / "analysis" / "audio_analysis_dsp_report.json",
+        project_dir / "analysis" / "audio_features_dsp_debug.csv",
         project_dir / "analysis" / "audio_aligned_note_events.json",
         project_dir / "analysis" / "audio_alignment_report.json",
         project_dir / "analysis" / "note_validation.json",
@@ -146,7 +155,60 @@ def test_cli_process_stem_end_to_end(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert (project_dir / "reports" / "pipeline_report.json").exists()
     assert (project_dir / "analysis" / "audio_aligned_note_events.json").exists()
+    assert (project_dir / "analysis" / "audio_features_dsp.json").exists()
     assert (project_dir / "analysis" / "refined_note_events.json").exists()
     assert (project_dir / "midi" / "review" / "export_report.json").exists()
     assert (project_dir / "midi" / "cleaned" / "cleaned_export_report.json").exists()
     assert (project_dir / "midi" / "working" / "working_export_report.json").exists()
+
+
+def test_pipeline_allows_non_required_dsp_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    midi_path = tmp_path / "candidate_non_required.mid"
+    wav_path = tmp_path / "stem_non_required.wav"
+    project_dir = tmp_path / "pipeline_non_required"
+
+    _write_candidate_midi(midi_path)
+    _write_stem_wav(wav_path)
+
+    def _raise_dsp(*args, **kwargs):
+        raise DspAnalysisError("simulated dsp failure")
+
+    monkeypatch.setattr("midi_cleaner.pipeline.process_stem.analyze_dsp_stem", _raise_dsp)
+
+    report = process_stem_pipeline(
+        input_midi=midi_path,
+        input_wav=wav_path,
+        source="ripx",
+        layer="bass",
+        project_dir=project_dir,
+        params=PipelineProcessParameters(require_dsp_analysis=False),
+    )
+
+    assert report.status == "ok"
+    assert any(stage.name == "dsp_analysis" for stage in report.stages)
+    assert any("dsp_analysis:" in warning for warning in report.warnings)
+    assert not (project_dir / "analysis" / "audio_features_dsp.json").exists()
+
+
+def test_pipeline_requires_dsp_when_configured(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    midi_path = tmp_path / "candidate_required.mid"
+    wav_path = tmp_path / "stem_required.wav"
+    project_dir = tmp_path / "pipeline_required"
+
+    _write_candidate_midi(midi_path)
+    _write_stem_wav(wav_path)
+
+    def _raise_dsp(*args, **kwargs):
+        raise DspAnalysisError("simulated required dsp failure")
+
+    monkeypatch.setattr("midi_cleaner.pipeline.process_stem.analyze_dsp_stem", _raise_dsp)
+
+    with pytest.raises(PipelineProcessError):
+        process_stem_pipeline(
+            input_midi=midi_path,
+            input_wav=wav_path,
+            source="ripx",
+            layer="bass",
+            project_dir=project_dir,
+            params=PipelineProcessParameters(require_dsp_analysis=True),
+        )
