@@ -719,6 +719,66 @@ def test_min_improvement_stops_after_small_accepted_gain(monkeypatch, tmp_path: 
     assert report.final_score >= report.initial_score
 
 
+def test_iterative_plans_do_not_contain_conflicting_pairs(tmp_path: Path) -> None:
+    audio_doc = _build_audio_document(
+        duration_sec=2.6,
+        frame_step_sec=0.01,
+        rms_fn=lambda t: (
+            0.08
+            if (0.2 <= t <= 1.2 or 1.62 <= t <= 2.28)
+            else 0.0
+        ),
+        onset_fn=lambda t: (
+            0.0
+            if (0.52 <= t <= 0.60 or 1.96 <= t <= 2.04)
+            else (1.0 if abs(t - 0.62) < 1e-6 or abs(t - 2.06) < 1e-6 else 0.02)
+        ),
+    )
+    refined_path, audio_path, cleanup_path = _write_inputs(
+        tmp_path,
+        notes=[
+            _refined_note("n1", 45, 0.2, 1.0),
+            _refined_note("n2", 45, 1.0, 1.05),
+        ],
+        audio_doc=audio_doc,
+        cleanup_actions=[_cleanup_action("n1"), _cleanup_action("n2")],
+    )
+
+    _final_doc, _report, artifacts = run_iterative_activity_repair(
+        refined_notes_file=refined_path,
+        audio_features_file=audio_path,
+        cleanup_plan_file=cleanup_path,
+        params=IterativeRepairParameters(max_iterations=3, min_improvement=-1.0),
+        activity_params=ActivityRepairParameters(audio_silence_hold_ms=0.0),
+    )
+
+    for artifact in artifacts:
+        by_target: dict[str, set[str]] = {}
+        inserted_ids: set[str] = set()
+        for action in artifact.repair_plan.actions:
+            if action.action_type in {"KEEP", "REVIEW_MANUAL"}:
+                continue
+            if action.new_note_id and action.action_type == "INSERT_MISSING_NOTE":
+                inserted_ids.add(action.new_note_id)
+            target = action.target_note_id
+            if target is None:
+                continue
+            by_target.setdefault(target, set()).add(action.action_type)
+
+        for target_id, action_types in by_target.items():
+            assert not ({"EXTEND_NOTE", "SPLIT_NOTE"} <= action_types)
+            if target_id.startswith("repair_missing_"):
+                assert "SPLIT_NOTE" not in action_types
+
+        assert inserted_ids.isdisjoint(
+            {
+                action.target_note_id
+                for action in artifact.repair_plan.actions
+                if action.action_type == "SPLIT_NOTE" and action.target_note_id is not None
+            }
+        )
+
+
 def test_stable_region_freeze_marks_stable_notes(tmp_path: Path) -> None:
     audio_doc = _build_audio_document(
         duration_sec=2.0,

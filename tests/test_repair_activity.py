@@ -10,6 +10,7 @@ from midi_cleaner.dsp.models import DspAudioFeatureDocument, DspAudioFrame
 from midi_cleaner.pitch.models import BassPitchContourDocument, BassPitchContourReport, BassPitchFrame
 from midi_cleaner.repair.activity import (
     ActivityRepairParameters,
+    _MutableNote,
     _ActivityFrame,
     _build_audio_activity_regions,
     repair_activity,
@@ -518,6 +519,134 @@ def test_weak_internal_onset_does_not_split(tmp_path: Path) -> None:
     )
 
     assert report.split_count == 0
+
+
+def test_extend_split_same_note_conflict_prefers_extend_for_bass(tmp_path: Path) -> None:
+    audio_doc = _build_audio_document(
+        duration_sec=2.0,
+        frame_step_sec=0.01,
+        rms_fn=lambda t: 0.08 if 0.2 <= t <= 1.2 else 0.0,
+        onset_fn=lambda t: (0.0 if 0.52 <= t <= 0.60 else (1.0 if abs(t - 0.62) < 1e-6 else 0.02)),
+    )
+    notes = [_refined_note("n1", 45, 0.2, 1.0)]
+    refined_path, audio_path, cleanup_path = _write_inputs(
+        tmp_path,
+        notes,
+        audio_doc,
+        [_cleanup_action("n1", "KEEP")],
+    )
+
+    repaired, plan, report = repair_activity(
+        refined_notes_file=refined_path,
+        audio_features_file=audio_path,
+        cleanup_plan_file=cleanup_path,
+        params=ActivityRepairParameters(audio_silence_hold_ms=0.0),
+    )
+
+    by_target: dict[str, set[str]] = {}
+    for action in plan.actions:
+        if action.target_note_id is None:
+            continue
+        if action.action_type in {"KEEP", "REVIEW_MANUAL"}:
+            continue
+        by_target.setdefault(action.target_note_id, set()).add(action.action_type)
+
+    assert "EXTEND_NOTE" in by_target.get("n1", set())
+    assert "SPLIT_NOTE" not in by_target.get("n1", set())
+    assert report.extend_count >= 1
+    assert report.split_count == 0
+    assert any("conflict-suppressed action" in warning for warning in report.warnings)
+    assert repaired.notes[0].refined_end_sec > 1.0
+
+
+def test_insert_split_same_pass_conflict_suppresses_split_on_inserted_note(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    audio_doc = _build_audio_document(
+        duration_sec=2.6,
+        frame_step_sec=0.01,
+        rms_fn=lambda t: 0.08 if (0.2 <= t <= 0.35 or 1.62 <= t <= 2.28) else 0.0,
+        onset_fn=lambda t: (0.0 if 1.96 <= t <= 2.04 else (1.0 if abs(t - 2.06) < 1e-6 else 0.02)),
+    )
+    notes = [
+        _refined_note("n1", 45, 0.2, 0.35),
+        _refined_note("n2", 45, 1.0, 1.05),
+    ]
+    refined_path, audio_path, cleanup_path = _write_inputs(
+        tmp_path,
+        notes,
+        audio_doc,
+        [_cleanup_action("n1", "KEEP"), _cleanup_action("n2", "KEEP")],
+    )
+
+    def _fake_closest_note(notes: list[_MutableNote], anchor_sec: float, search_sec: float) -> _MutableNote | None:
+        _ = anchor_sec
+        _ = search_sec
+        if not notes:
+            return None
+        return notes[0]
+
+    def _fake_prev_note(notes: list[_MutableNote], start_sec: float) -> _MutableNote | None:
+        _ = start_sec
+        return None
+
+    monkeypatch.setattr("midi_cleaner.repair.activity._closest_note", _fake_closest_note)
+    monkeypatch.setattr("midi_cleaner.repair.activity._find_prev_note", _fake_prev_note)
+
+    _repaired, plan, report = repair_activity(
+        refined_notes_file=refined_path,
+        audio_features_file=audio_path,
+        cleanup_plan_file=cleanup_path,
+        params=ActivityRepairParameters(
+            audio_silence_hold_ms=0.0,
+            context_pitch_search_ms=800.0,
+            max_extend_for_gap_ms=150.0,
+        ),
+    )
+
+    inserted_ids = {
+        action.new_note_id
+        for action in plan.actions
+        if action.action_type == "INSERT_MISSING_NOTE" and action.new_note_id is not None
+    }
+    split_targets = {
+        action.target_note_id
+        for action in plan.actions
+        if action.action_type == "SPLIT_NOTE" and action.target_note_id is not None
+    }
+
+    assert inserted_ids
+    assert inserted_ids.isdisjoint(split_targets)
+    assert any("inserted_note_same_pass" in warning for warning in report.warnings)
+
+
+def test_split_count_excludes_conflict_suppressed_splits(tmp_path: Path) -> None:
+    audio_doc = _build_audio_document(
+        duration_sec=2.0,
+        frame_step_sec=0.01,
+        rms_fn=lambda t: 0.08 if 0.2 <= t <= 1.2 else 0.0,
+        onset_fn=lambda t: (0.0 if 0.52 <= t <= 0.60 else (1.0 if abs(t - 0.62) < 1e-6 else 0.02)),
+    )
+    notes = [_refined_note("n1", 45, 0.2, 1.0)]
+    refined_path, audio_path, cleanup_path = _write_inputs(
+        tmp_path,
+        notes,
+        audio_doc,
+        [_cleanup_action("n1", "KEEP")],
+    )
+
+    repaired, plan, report = repair_activity(
+        refined_notes_file=refined_path,
+        audio_features_file=audio_path,
+        cleanup_plan_file=cleanup_path,
+        params=ActivityRepairParameters(audio_silence_hold_ms=0.0),
+    )
+
+    applied_splits = [action for action in plan.actions if action.action_type == "SPLIT_NOTE"]
+    assert len(applied_splits) == report.split_count
+    assert report.split_count == 0
+    assert any("suppressed_conflict_action_count=" in warning for warning in report.warnings)
     assert len(repaired.notes) == 1
 
 

@@ -738,11 +738,15 @@ def repair_activity(
     shorten_rejected_count = 0
     audio_gap_count = 0
     midi_overhang_count = 0
+    conflict_resolved_count = 0
+    suppressed_conflict_action_count = 0
 
     missing_min_sec = params.missing_gap_min_ms / 1000.0
     max_extend_sec = params.max_extend_for_gap_ms / 1000.0
     max_insert_sec = params.max_insert_missing_ms / 1000.0
     context_sec = params.context_pitch_search_ms / 1000.0
+    extended_note_ids_this_pass: set[str] = set()
+    inserted_note_ids_this_pass: set[str] = set()
 
     for region in audio_regions:
         overlap = 0.0
@@ -803,6 +807,7 @@ def repair_activity(
                 )
                 action_counter += 1
                 extend_count += 1
+                extended_note_ids_this_pass.add(prev_note.note_id)
                 continue
 
         if next_note is not None and region.start_sec < next_note.refined_start_sec:
@@ -903,6 +908,7 @@ def repair_activity(
                 )
                 action_counter += 1
                 insert_missing_count += 1
+                inserted_note_ids_this_pass.add(new_note_id)
             else:
                 actions.append(
                     RepairAction(
@@ -978,6 +984,7 @@ def repair_activity(
                 )
                 action_counter += 1
                 insert_missing_count += 1
+                inserted_note_ids_this_pass.add(new_note_id)
             else:
                 actions.append(
                     RepairAction(
@@ -1223,7 +1230,7 @@ def repair_activity(
     split_min_dur_sec = params.split_min_note_duration_ms / 1000.0
     split_edge_sec = params.split_min_distance_from_edges_ms / 1000.0
 
-    split_candidates: list[tuple[_MutableNote, float, float]] = []
+    split_candidates: list[tuple[_MutableNote, float, float, float, bool]] = []
     for note in selected_notes:
         if note.duration_sec() < split_min_dur_sec:
             continue
@@ -1249,11 +1256,19 @@ def repair_activity(
             continue
 
         pitch_change = 0.0
+        strong_independent_pitch_change = False
         if pitch_frames is not None:
             before = _pitch_window_summary(pitch_frames, inner_start, max(inner_start, onset_sec - 0.04))
             after = _pitch_window_summary(pitch_frames, min(inner_end, onset_sec + 0.04), inner_end)
             if before.dominant_pitch_midi is not None and after.dominant_pitch_midi is not None:
                 pitch_change = abs(float(after.dominant_pitch_midi - before.dominant_pitch_midi))
+            strong_independent_pitch_change = (
+                pitch_change >= max(1.5, params.split_pitch_change_semitones + 0.5)
+                and before.voiced_ratio >= 0.5
+                and after.voiced_ratio >= 0.5
+                and before.mean_confidence >= 0.7
+                and after.mean_confidence >= 0.7
+            )
             if pitch_change < params.split_pitch_change_semitones and valley_mean >= max(1e-6, onset_value * 0.02):
                 actions.append(
                     RepairAction(
@@ -1312,11 +1327,34 @@ def repair_activity(
             review_manual_count += 1
             continue
 
-        split_candidates.append((note, onset_sec, split_confidence))
+        split_candidates.append(
+            (note, onset_sec, split_confidence, pitch_change, strong_independent_pitch_change)
+        )
 
-    for note, split_sec, split_confidence in split_candidates:
+    is_bass_layer = refined_document.layer.lower() == "bass"
+    for note, split_sec, split_confidence, pitch_change, strong_pitch in split_candidates:
         if split_sec <= note.refined_start_sec or split_sec >= note.refined_end_sec:
             continue
+
+        if note.note_id in inserted_note_ids_this_pass:
+            warnings.append(
+                "conflict-suppressed action: "
+                f"SPLIT_NOTE target={note.note_id} reason=inserted_note_same_pass"
+            )
+            conflict_resolved_count += 1
+            suppressed_conflict_action_count += 1
+            continue
+
+        if note.note_id in extended_note_ids_this_pass and (is_bass_layer and not strong_pitch):
+            warnings.append(
+                "conflict-suppressed action: "
+                f"SPLIT_NOTE target={note.note_id} reason=extend_split_conflict "
+                f"pitch_change={pitch_change:.3f}"
+            )
+            conflict_resolved_count += 1
+            suppressed_conflict_action_count += 1
+            continue
+
         old_end = note.refined_end_sec
         new_note_id = _next_split_note_id(split_counter)
         split_counter += 1
@@ -1370,6 +1408,13 @@ def repair_activity(
         )
         action_counter += 1
         split_count += 1
+
+    if suppressed_conflict_action_count > 0:
+        warnings.append(
+            "activity repair conflict resolution: "
+            f"conflict_resolved_count={conflict_resolved_count}, "
+            f"suppressed_conflict_action_count={suppressed_conflict_action_count}"
+        )
 
     selected_notes.sort(key=lambda n: (n.refined_start_sec, n.refined_end_sec, n.note_id))
     close_gap_sec = params.close_gap_ms / 1000.0
