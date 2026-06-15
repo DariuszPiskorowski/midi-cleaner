@@ -4,7 +4,7 @@ import json
 
 
 def build_ai_completion_prompts(
-    pattern_pack: dict[str, object],
+    ai_request_pack: dict[str, object],
     max_completion_notes: int,
 ) -> tuple[str, str, str]:
     system_prompt = (
@@ -72,7 +72,7 @@ def build_ai_completion_prompts(
         "- risk must be one of low, medium, high.\n"
         f"- Do not add more than {max_completion_notes} notes.\n\n"
         "Pattern pack JSON:\n"
-        f"{json.dumps(pattern_pack, indent=2)}"
+        + json.dumps(ai_request_pack, separators=(",", ":"), ensure_ascii=False)
     )
 
     combined_prompt = (

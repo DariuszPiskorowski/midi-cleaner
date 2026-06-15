@@ -354,6 +354,9 @@ def process_stem_pipeline(
                     "pattern_pack_file": str(
                         analysis_dir / "ai_pattern_completion" / "pattern_pack.json"
                     ),
+                    "ai_request_pack_file": str(
+                        analysis_dir / "ai_pattern_completion" / "ai_request_pack.json"
+                    ),
                     "ai_completion_json_file": str(
                         analysis_dir / "ai_pattern_completion" / "bass_ai_completion.json"
                     ),
@@ -1181,6 +1184,7 @@ def process_stem_pipeline(
 
             ai_outputs = [
                 ai_report.pattern_pack_file,
+                ai_report.ai_request_pack_file,
                 ai_report.ai_prompt_file,
                 *([ai_report.ai_json_file] if ai_report.ai_json_file is not None else []),
                 *([ai_report.output_midi_file] if ai_report.output_midi_file is not None else []),
@@ -1188,6 +1192,7 @@ def process_stem_pipeline(
             ]
 
             output_files["ai_pattern_pack"] = ai_report.pattern_pack_file
+            output_files["ai_request_pack"] = ai_report.ai_request_pack_file
             output_files["ai_prompt"] = ai_report.ai_prompt_file
             if ai_report.ai_json_file is not None:
                 output_files["bass_ai_completion_json"] = ai_report.ai_json_file

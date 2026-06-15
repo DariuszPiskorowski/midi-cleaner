@@ -45,11 +45,18 @@ class AIPatternCompletionReport(BaseModel):
     layer: str
     model: str
     api_called: bool
+    api_key_source: Literal["env", "dotenv"]
     dry_run: bool
     pattern_pack_file: str
+    full_pattern_pack_file: str
+    ai_request_pack_file: str
     ai_prompt_file: str
+    full_pattern_pack_size_bytes: int
+    ai_request_pack_size_bytes: int
+    ai_prompt_size_bytes: int
     ai_json_file: str | None
     output_midi_file: str | None
+    output_midi_path: str | None = None
     proposed_note_count: int
     accepted_note_count: int
     rejected_note_count: int

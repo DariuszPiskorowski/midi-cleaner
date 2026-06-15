@@ -5,13 +5,18 @@ from pathlib import Path
 
 import mido
 import numpy as np
+import pytest
 import soundfile as sf
 
+from midi_cleaner.ai_completion.compact_pack import build_ai_request_pack
 from midi_cleaner.ai_completion.models import AIPatternCompletionReport
+from midi_cleaner.ai_completion.pattern_pack import BasePatternNote, PatternPackBuildResult
 from midi_cleaner.ai_completion.pattern_pack import build_pattern_pack
 from midi_cleaner.ai_completion.prompt import build_ai_completion_prompts
 from midi_cleaner.ai_completion.service import (
+    AIPatternCompletionError,
     AIPatternCompletionParameters,
+    _resolve_openai_api_key,
     complete_ai_pattern_completion,
 )
 from midi_cleaner.audio.models import (
@@ -237,7 +242,7 @@ def test_env_example_exists_and_dotenv_ignored() -> None:
 
 
 def test_prompt_builder_has_json_only_and_no_base_rewrite_instruction() -> None:
-    pattern_pack = {
+    ai_request_pack = {
         "version": "1.0",
         "track_role": "bass",
         "timeline": {"duration_sec": 1.0},
@@ -248,12 +253,286 @@ def test_prompt_builder_has_json_only_and_no_base_rewrite_instruction() -> None:
         "pattern_windows": [],
         "instructions_for_ai": {},
     }
-    system_prompt, user_prompt, _combined = build_ai_completion_prompts(pattern_pack, 64)
+    system_prompt, user_prompt, _combined = build_ai_completion_prompts(ai_request_pack, 64)
 
     assert "JSON only" in system_prompt
     assert "do not output a full bass transcription" in system_prompt
     assert "do not modify, delete, shorten, extend, or copy base MIDI notes" in system_prompt
     assert "Do not add more than 64 notes" in user_prompt
+
+    payload = user_prompt.split("Pattern pack JSON:\n", maxsplit=1)[1]
+    assert payload == json.dumps(ai_request_pack, separators=(",", ":"), ensure_ascii=False)
+
+
+def test_compact_request_pack_limits_and_metadata() -> None:
+    base_notes = [
+        {
+            "note_id": f"base_{index:04d}",
+            "start_sec": float(index) * 0.5,
+            "end_sec": (float(index) * 0.5) + 0.25,
+            "duration_sec": 0.25,
+            "pitch_midi": 36 + (index % 6),
+            "velocity": 90,
+            "confidence": 0.9,
+            "source": "ripx",
+            "reasons": [],
+        }
+        for index in range(420)
+    ]
+    activity_regions = [
+        {
+            "start_sec": float(index),
+            "end_sec": float(index) + 0.9,
+            "duration_sec": 0.9,
+            "rms_peak": 0.03 + (index * 0.0002),
+            "rms_mean": 0.01,
+            "onset_count": (index % 10),
+            "dominant_pitch_midi": 36 + (index % 7),
+            "pitch_confidence": 0.7,
+        }
+        for index in range(300)
+    ]
+    pitch_sections = [
+        {
+            "start_sec": float(index) * 0.5,
+            "end_sec": (float(index) * 0.5) + 0.5,
+            "dominant_pitch_midi": 36 + (index % 12),
+            "pitch_midi_mean": 40.0,
+            "voiced_ratio": 0.8,
+            "mean_confidence": 0.75,
+        }
+        for index in range(320)
+    ]
+    pattern_windows = [
+        {
+            "window_index": index,
+            "start_sec": float(index) * 4.0,
+            "end_sec": (float(index) * 4.0) + 4.0,
+            "base_notes": [f"base_{note:04d}" for note in range(index * 8, (index * 8) + 24)],
+            "rhythmic_summary": {
+                "note_onsets_sec": [float(i) / 8.0 for i in range(32)],
+                "intervals_sec": [0.125 for _ in range(32)],
+                "common_durations_sec": [0.25, 0.5],
+            },
+        }
+        for index in range(40)
+    ]
+
+    pattern_pack = {
+        "version": "1.0",
+        "track_role": "bass",
+        "timeline": {"duration_sec": 200.0},
+        "base_midi_summary": {"note_count": len(base_notes)},
+        "base_notes": base_notes,
+        "audio_activity_regions": activity_regions,
+        "pitch_contour_summary": pitch_sections,
+        "pattern_windows": pattern_windows,
+        "instructions_for_ai": {"goal": "fill missing patterns"},
+    }
+
+    compact = build_ai_request_pack(pattern_pack)
+
+    assert compact["compact_request"] is True
+    assert compact["source_pack_was_compacted"] is True
+    assert compact["original_counts"]["base_notes"] == 420
+    assert compact["included_counts"]["base_notes"] <= 180
+    assert compact["included_counts"]["audio_activity_regions"] <= 180
+    assert compact["included_counts"]["pitch_contour_summary"] <= 240
+
+
+def test_service_uses_compact_pack_for_prompt_and_writes_artifact(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project_dir = tmp_path / "project_compact"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    base_notes_records = [
+        {
+            "note_id": f"base_{index:04d}",
+            "start_sec": float(index) * 0.5,
+            "end_sec": (float(index) * 0.5) + 0.25,
+            "duration_sec": 0.25,
+            "pitch_midi": 36 + (index % 6),
+            "velocity": 96,
+            "confidence": 0.9,
+            "source": "ripx",
+            "reasons": [],
+        }
+        for index in range(360)
+    ]
+
+    pattern_windows = [
+        {
+            "window_index": index,
+            "start_sec": float(index) * 4.0,
+            "end_sec": (float(index) * 4.0) + 4.0,
+            "base_notes": [f"base_{note:04d}" for note in range(index * 6, (index * 6) + 24)],
+            "rhythmic_summary": {
+                "note_onsets_sec": [float(i) / 8.0 for i in range(32)],
+                "intervals_sec": [0.125 for _ in range(32)],
+                "common_durations_sec": [0.25, 0.5],
+            },
+        }
+        for index in range(32)
+    ]
+
+    pattern_pack = {
+        "version": "1.0",
+        "track_role": "bass",
+        "timeline": {
+            "duration_sec": 240.0,
+            "time_origin": "wav_seconds",
+            "ticks_per_beat": 480,
+            "tempo_bpm": 120.0,
+            "midi_source": "working.mid",
+        },
+        "base_midi_summary": {"note_count": len(base_notes_records)},
+        "base_notes": base_notes_records,
+        "audio_activity_regions": [
+            {
+                "start_sec": float(index),
+                "end_sec": float(index) + 0.75,
+                "duration_sec": 0.75,
+                "rms_peak": 0.03 + (index * 0.0002),
+                "rms_mean": 0.01,
+                "onset_count": index % 8,
+                "dominant_pitch_midi": 36 + (index % 8),
+                "pitch_confidence": 0.7,
+            }
+            for index in range(220)
+        ],
+        "pitch_contour_summary": [
+            {
+                "start_sec": float(index) * 0.5,
+                "end_sec": (float(index) * 0.5) + 0.5,
+                "dominant_pitch_midi": 36 + (index % 12),
+                "pitch_midi_mean": 40.0,
+                "voiced_ratio": 0.85,
+                "mean_confidence": 0.74,
+            }
+            for index in range(300)
+        ],
+        "pattern_windows": pattern_windows,
+        "instructions_for_ai": {"goal": "complete bass continuity"},
+    }
+
+    base_notes_for_validation = [
+        BasePatternNote(
+            note_id=str(item["note_id"]),
+            start_sec=float(item["start_sec"]),
+            end_sec=float(item["end_sec"]),
+            duration_sec=float(item["duration_sec"]),
+            pitch_midi=int(item["pitch_midi"]),
+            velocity=int(item["velocity"]),
+            confidence=float(item["confidence"]),
+            source="ripx",
+            reasons=[],
+        )
+        for item in base_notes_records
+    ]
+
+    monkeypatch.setattr(
+        "midi_cleaner.ai_completion.service.build_pattern_pack",
+        lambda project_dir, layer: PatternPackBuildResult(
+            pattern_pack=pattern_pack,
+            base_notes=base_notes_for_validation,
+            duration_sec=240.0,
+            ticks_per_beat=480,
+            tempo_us_per_beat=500000,
+            warnings=[],
+        ),
+    )
+
+    report = complete_ai_pattern_completion(
+        project_dir=project_dir,
+        params=AIPatternCompletionParameters(layer="bass", model="gpt-4o-mini"),
+        ai_client=_FakeAIClient(_valid_ai_payload()),
+    )
+
+    analysis_dir = project_dir / "analysis" / "ai_pattern_completion"
+    pattern_pack_path = analysis_dir / "pattern_pack.json"
+    ai_request_pack_path = analysis_dir / "ai_request_pack.json"
+    ai_prompt_path = analysis_dir / "ai_prompt.txt"
+
+    assert report.status == "ok"
+    assert ai_request_pack_path.exists()
+    assert pattern_pack_path.exists()
+    assert ai_prompt_path.exists()
+
+    full_size = pattern_pack_path.stat().st_size
+    compact_size = ai_request_pack_path.stat().st_size
+    assert compact_size < full_size
+    assert report.full_pattern_pack_size_bytes == full_size
+    assert report.ai_request_pack_size_bytes == compact_size
+
+    full_pack = json.loads(pattern_pack_path.read_text(encoding="utf-8"))
+    request_pack = json.loads(ai_request_pack_path.read_text(encoding="utf-8"))
+    prompt_text = ai_prompt_path.read_text(encoding="utf-8")
+    compact_payload = json.dumps(request_pack, separators=(",", ":"), ensure_ascii=False)
+    full_pretty_payload = json.dumps(full_pack, indent=2)
+
+    assert compact_payload in prompt_text
+    assert full_pretty_payload not in prompt_text
+    assert request_pack["included_counts"]["base_notes"] < request_pack["original_counts"]["base_notes"]
+
+    full_ids = {str(item["note_id"]) for item in full_pack["base_notes"]}
+    compact_ids = {str(item["note_id"]) for item in request_pack["base_notes"]}
+    removed_ids = sorted(full_ids - compact_ids)
+    assert removed_ids
+
+
+def test_dotenv_overrides_stale_process_key_for_ai_completion(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cwd_dir = tmp_path / "cwd"
+    project_dir = tmp_path / "project"
+    cwd_dir.mkdir(parents=True, exist_ok=True)
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    (cwd_dir / ".env").write_text('OPENAI_API_KEY="cwd-key"\n', encoding="utf-8")
+    (project_dir / ".env").write_text('OPENAI_API_KEY="project-key"\n', encoding="utf-8")
+
+    monkeypatch.chdir(cwd_dir)
+    monkeypatch.setenv("OPENAI_API_KEY", "stale-process-key")
+
+    api_key, source = _resolve_openai_api_key(project_dir)
+
+    assert api_key == "project-key"
+    assert source == "dotenv"
+
+
+def test_ai_completion_fails_fast_when_compact_prompt_is_too_large(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project_dir = tmp_path / "project_large_prompt"
+    _build_project_layout(project_dir)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    huge_prompt = "x" * 250_001
+    monkeypatch.setattr(
+        "midi_cleaner.ai_completion.service.build_ai_completion_prompts",
+        lambda ai_request_pack, max_completion_notes: ("system", huge_prompt, huge_prompt),
+    )
+
+    client = _FakeAIClient(_valid_ai_payload())
+    with pytest.raises(AIPatternCompletionError) as exc_info:
+        complete_ai_pattern_completion(
+            project_dir=project_dir,
+            params=AIPatternCompletionParameters(layer="bass", model="gpt-4o-mini"),
+            ai_client=client,
+        )
+
+    assert "AI request pack is too large for model context" in str(exc_info.value)
+    assert client.called is False
+
+    report_path = project_dir / "analysis" / "ai_pattern_completion" / "bass_ai_completion_report.json"
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "error"
+    assert "AI request pack is too large for model context" in payload["error"]
 
 
 def test_pattern_pack_builder_has_required_top_level_fields(tmp_path: Path) -> None:
@@ -409,6 +688,7 @@ def test_ai_completion_dry_run_writes_pattern_and_prompt_without_api_call(
     assert report.api_called is False
     assert client.called is False
     assert (project_dir / "analysis" / "ai_pattern_completion" / "pattern_pack.json").exists()
+    assert (project_dir / "analysis" / "ai_pattern_completion" / "ai_request_pack.json").exists()
     assert (project_dir / "analysis" / "ai_pattern_completion" / "ai_prompt.txt").exists()
     assert not (project_dir / "midi" / "ai" / "bass_ai_completion.mid").exists()
 
@@ -434,6 +714,7 @@ def test_pipeline_process_stem_flag_runs_ai_pattern_completion(
         analysis_dir = project_dir / "analysis" / "ai_pattern_completion"
         analysis_dir.mkdir(parents=True, exist_ok=True)
         (analysis_dir / "pattern_pack.json").write_text("{}\n", encoding="utf-8")
+        (analysis_dir / "ai_request_pack.json").write_text("{}\n", encoding="utf-8")
         (analysis_dir / "ai_prompt.txt").write_text("prompt\n", encoding="utf-8")
         (analysis_dir / "bass_ai_completion.json").write_text("{}\n", encoding="utf-8")
         (analysis_dir / "bass_ai_completion_report.json").write_text("{}\n", encoding="utf-8")
@@ -452,9 +733,15 @@ def test_pipeline_process_stem_flag_runs_ai_pattern_completion(
             layer="bass",
             model="gpt-4o-mini",
             api_called=False,
+            api_key_source="env",
             dry_run=False,
             pattern_pack_file=str(analysis_dir / "pattern_pack.json"),
+            full_pattern_pack_file=str(analysis_dir / "pattern_pack.json"),
+            ai_request_pack_file=str(analysis_dir / "ai_request_pack.json"),
             ai_prompt_file=str(analysis_dir / "ai_prompt.txt"),
+            full_pattern_pack_size_bytes=2,
+            ai_request_pack_size_bytes=2,
+            ai_prompt_size_bytes=7,
             ai_json_file=str(analysis_dir / "bass_ai_completion.json"),
             output_midi_file=str(ai_midi_path),
             proposed_note_count=1,
