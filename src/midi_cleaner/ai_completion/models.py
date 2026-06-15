@@ -58,11 +58,18 @@ class AIPatternCompletionReport(BaseModel):
     output_midi_file: str | None
     output_midi_path: str | None = None
     base_note_source: str | None = None
+    json_retry_count: int = 0
+    json_retry_reason: str | None = None
     retry_count: int = 0
     retry_reason: str | None = None
     first_pass_proposed_note_count: int = 0
     first_pass_rejected_reasons: dict[str, int] = Field(default_factory=dict)
     final_proposed_note_count: int = 0
+    raw_response_file: str | None = None
+    retry_raw_response_file: str | None = None
+    openai_response_status: str | None = None
+    openai_finish_reason: str | None = None
+    max_output_tokens_used: int = 0
     proposed_note_count: int
     accepted_note_count: int
     rejected_note_count: int

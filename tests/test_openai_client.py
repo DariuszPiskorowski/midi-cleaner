@@ -9,6 +9,7 @@ import pytest
 from midi_cleaner.ai_completion.openai_client import (
     OpenAIPatternCompletionClient,
     OpenAIPatternCompletionClientError,
+    calculate_max_output_tokens,
 )
 
 
@@ -31,7 +32,7 @@ def test_complete_pattern_uses_input_text_content_type(monkeypatch) -> None:
     _install_fake_openai(monkeypatch, _create)
 
     client = OpenAIPatternCompletionClient()
-    raw_text, parsed = client.complete_pattern(
+    result = client.complete_pattern(
         api_key="sk-test",
         model="gpt-4o-mini",
         system_prompt="system",
@@ -40,12 +41,14 @@ def test_complete_pattern_uses_input_text_content_type(monkeypatch) -> None:
         max_completion_notes=64,
     )
 
-    assert raw_text == json.dumps({"notes": []})
-    assert parsed == {"notes": []}
+    assert result.raw_response_text == json.dumps({"notes": []})
+    assert result.parsed_payload == {"notes": []}
+    assert result.max_output_tokens_used == 12000
 
     payload = captured["input"]
     assert isinstance(payload, list)
     assert [entry["content"][0]["type"] for entry in payload] == ["input_text", "input_text"]
+    assert captured["max_output_tokens"] == calculate_max_output_tokens(64)
 
 
 def test_complete_pattern_fallback_uses_input_text_content_type(monkeypatch) -> None:
@@ -60,7 +63,7 @@ def test_complete_pattern_fallback_uses_input_text_content_type(monkeypatch) -> 
     _install_fake_openai(monkeypatch, _create)
 
     client = OpenAIPatternCompletionClient()
-    raw_text, parsed = client.complete_pattern(
+    result = client.complete_pattern(
         api_key="sk-test",
         model="gpt-4o-mini",
         system_prompt="system",
@@ -69,8 +72,9 @@ def test_complete_pattern_fallback_uses_input_text_content_type(monkeypatch) -> 
         max_completion_notes=64,
     )
 
-    assert raw_text == json.dumps({"notes": []})
-    assert parsed == {"notes": []}
+    assert result.raw_response_text == json.dumps({"notes": []})
+    assert result.parsed_payload == {"notes": []}
+    assert result.max_output_tokens_used == 12000
     assert len(calls) == 2
     for call in calls:
         payload = call["input"]
@@ -79,6 +83,7 @@ def test_complete_pattern_fallback_uses_input_text_content_type(monkeypatch) -> 
             "input_text",
             "input_text",
         ]
+        assert call["max_output_tokens"] == calculate_max_output_tokens(64)
 
 
 def test_complete_pattern_wraps_and_sanitizes_openai_errors(monkeypatch) -> None:

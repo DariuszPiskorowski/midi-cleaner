@@ -21,6 +21,8 @@ from midi_cleaner.ai_completion.models import (
 from midi_cleaner.ai_completion.openai_client import (
     OpenAIPatternCompletionClient,
     OpenAIPatternCompletionClientError,
+    OpenAIPatternCompletionResult,
+    calculate_max_output_tokens,
 )
 from midi_cleaner.ai_completion.pattern_pack import PatternPackBuildError, build_pattern_pack
 from midi_cleaner.ai_completion.prompt import build_ai_completion_prompts
@@ -44,6 +46,15 @@ class AIPatternCompletionParameters:
 _MAX_AI_PROMPT_CHARS = 250_000
 
 
+@dataclass(frozen=True)
+class _AICompletionRequestResult:
+    raw_response_text: str
+    parsed_payload: dict[str, object]
+    ai_output: AIPatternCompletionOutput
+    response_debug: dict[str, object]
+    max_output_tokens_used: int
+
+
 def complete_ai_pattern_completion(
     project_dir: Path,
     params: AIPatternCompletionParameters,
@@ -61,6 +72,9 @@ def complete_ai_pattern_completion(
     ai_json_path = analysis_output_dir / "bass_ai_completion.json"
     report_path = analysis_output_dir / "bass_ai_completion_report.json"
     midi_path = midi_output_dir / "bass_ai_completion.mid"
+    raw_response_first_pass_path = analysis_output_dir / "openai_raw_response_first_pass.txt"
+    raw_response_retry_path = analysis_output_dir / "openai_raw_response_retry.txt"
+    openai_debug_path = analysis_output_dir / "openai_response_debug.json"
 
     model_name = _resolve_openai_model(params.model)
 
@@ -128,6 +142,13 @@ def complete_ai_pattern_completion(
             full_pattern_pack_size_bytes=full_pattern_pack_size_bytes,
             ai_request_pack_size_bytes=ai_request_pack_size_bytes,
             ai_prompt_size_bytes=ai_prompt_size_bytes,
+            json_retry_count=0,
+            json_retry_reason=None,
+            raw_response_file=str(raw_response_first_pass_path),
+            retry_raw_response_file=None,
+            openai_response_status=None,
+            openai_finish_reason=None,
+            max_output_tokens_used=calculate_max_output_tokens(params.max_completion_notes),
         )
         _write_report(report_path, report)
         raise AIPatternCompletionError(message)
@@ -152,11 +173,18 @@ def complete_ai_pattern_completion(
             output_midi_file=None,
             output_midi_path=None,
             base_note_source=pattern_pack_result.base_note_source,
+            json_retry_count=0,
+            json_retry_reason=None,
             retry_count=0,
             retry_reason=None,
             first_pass_proposed_note_count=0,
             first_pass_rejected_reasons={},
             final_proposed_note_count=0,
+            raw_response_file=None,
+            retry_raw_response_file=None,
+            openai_response_status=None,
+            openai_finish_reason=None,
+            max_output_tokens_used=calculate_max_output_tokens(params.max_completion_notes),
             proposed_note_count=0,
             accepted_note_count=0,
             rejected_note_count=0,
@@ -173,15 +201,29 @@ def complete_ai_pattern_completion(
     api_key, api_key_source = _resolve_openai_api_key(project_dir)
     completion_client = ai_client or OpenAIPatternCompletionClient()
 
+    max_output_tokens_used = calculate_max_output_tokens(params.max_completion_notes)
     raw_response_text: str | None = None
     parsed_payload: dict[str, object] | None = None
+    raw_response_file = str(raw_response_first_pass_path)
+    retry_raw_response_file: str | None = None
+    openai_response_status: str | None = None
+    openai_finish_reason: str | None = None
+    json_retry_count = 0
+    json_retry_reason: str | None = None
     first_pass_proposed_note_count = 0
     first_pass_rejected_reasons: dict[str, int] = {}
     retry_count = 0
     retry_reason: str | None = None
+    openai_response_debug: dict[str, object] = {
+        "attempts": [],
+        "max_completion_notes": int(params.max_completion_notes),
+        "temperature": float(params.temperature),
+    }
 
+    first_ai_output: AIPatternCompletionOutput
+    first_request: _AICompletionRequestResult
     try:
-        first_raw_response_text, first_parsed_payload, first_ai_output = _request_ai_completion(
+        first_request = _request_ai_completion(
             completion_client=completion_client,
             api_key=api_key,
             model_name=model_name,
@@ -190,28 +232,237 @@ def complete_ai_pattern_completion(
             temperature=params.temperature,
             max_completion_notes=params.max_completion_notes,
         )
-    except OpenAIPatternCompletionClientError as exc:
-        report = _error_report(
-            project_dir=project_dir,
-            layer=params.layer,
-            model_name=model_name,
-            pattern_pack_path=pattern_pack_path,
-            ai_request_pack_path=ai_request_pack_path,
-            prompt_path=prompt_path,
-            ai_json_path=ai_json_path,
-            midi_path=midi_path,
-            dry_run=False,
-            message=str(exc),
-            raw_response_text=raw_response_text,
-            warnings=warnings,
-            api_key_source=api_key_source,
-            base_note_source=pattern_pack_result.base_note_source,
-            full_pattern_pack_size_bytes=full_pattern_pack_size_bytes,
-            ai_request_pack_size_bytes=ai_request_pack_size_bytes,
-            ai_prompt_size_bytes=ai_prompt_size_bytes,
+        max_output_tokens_used = first_request.max_output_tokens_used
+        openai_response_status, openai_finish_reason = _extract_status_and_finish(
+            first_request.response_debug
         )
-        _write_report(report_path, report)
-        raise AIPatternCompletionError(str(exc)) from exc
+        _append_openai_debug_attempt(
+            openai_response_debug,
+            attempt_name="first_pass",
+            response_debug=first_request.response_debug,
+            max_output_tokens_used=first_request.max_output_tokens_used,
+            error=None,
+        )
+        _write_openai_response_debug(openai_debug_path, openai_response_debug)
+        _write_raw_response(raw_response_first_pass_path, first_request.raw_response_text)
+        raw_response_text = first_request.raw_response_text
+        parsed_payload = first_request.parsed_payload
+        first_ai_output = first_request.ai_output
+    except OpenAIPatternCompletionClientError as exc:
+        if exc.raw_response_text is not None:
+            raw_response_text = exc.raw_response_text
+            _write_raw_response(raw_response_first_pass_path, exc.raw_response_text)
+
+        error_max_output_tokens = _extract_max_output_tokens(exc.response_debug)
+        if error_max_output_tokens is not None:
+            max_output_tokens_used = error_max_output_tokens
+
+        error_status, error_finish = _extract_status_and_finish(exc.response_debug)
+        if error_status:
+            openai_response_status = error_status
+        if error_finish:
+            openai_finish_reason = error_finish
+
+        _append_openai_debug_attempt(
+            openai_response_debug,
+            attempt_name="first_pass",
+            response_debug=exc.response_debug,
+            max_output_tokens_used=error_max_output_tokens,
+            error=str(exc),
+        )
+        _write_openai_response_debug(openai_debug_path, openai_response_debug)
+
+        if exc.code != "invalid_json":
+            report = _error_report(
+                project_dir=project_dir,
+                layer=params.layer,
+                model_name=model_name,
+                pattern_pack_path=pattern_pack_path,
+                ai_request_pack_path=ai_request_pack_path,
+                prompt_path=prompt_path,
+                ai_json_path=ai_json_path,
+                midi_path=midi_path,
+                dry_run=False,
+                message=str(exc),
+                raw_response_text=raw_response_text,
+                warnings=warnings,
+                api_key_source=api_key_source,
+                base_note_source=pattern_pack_result.base_note_source,
+                full_pattern_pack_size_bytes=full_pattern_pack_size_bytes,
+                ai_request_pack_size_bytes=ai_request_pack_size_bytes,
+                ai_prompt_size_bytes=ai_prompt_size_bytes,
+                json_retry_count=json_retry_count,
+                json_retry_reason=json_retry_reason,
+                raw_response_file=raw_response_file,
+                retry_raw_response_file=retry_raw_response_file,
+                openai_response_status=openai_response_status,
+                openai_finish_reason=openai_finish_reason,
+                max_output_tokens_used=max_output_tokens_used,
+            )
+            _write_report(report_path, report)
+            raise AIPatternCompletionError(str(exc)) from exc
+
+        json_retry_count = 1
+        json_retry_reason = "First pass response was not valid JSON."
+        retry_raw_response_file = str(raw_response_retry_path)
+
+        feedback_context = _build_json_retry_feedback_context(raw_response_text=exc.raw_response_text)
+        system_prompt, user_prompt, combined_prompt = build_ai_completion_prompts(
+            ai_request_pack=ai_request_pack,
+            max_completion_notes=params.max_completion_notes,
+            feedback_context=feedback_context,
+        )
+        prompt_path.write_text(combined_prompt + "\n", encoding="utf-8")
+        ai_prompt_size_bytes = len(combined_prompt.encode("utf-8"))
+
+        if len(user_prompt) > _MAX_AI_PROMPT_CHARS or len(combined_prompt) > _MAX_AI_PROMPT_CHARS:
+            message = (
+                "AI request pack is too large for model context. "
+                f"Compact pack size: {ai_request_pack_size_bytes} bytes."
+            )
+            report = _error_report(
+                project_dir=project_dir,
+                layer=params.layer,
+                model_name=model_name,
+                pattern_pack_path=pattern_pack_path,
+                ai_request_pack_path=ai_request_pack_path,
+                prompt_path=prompt_path,
+                ai_json_path=ai_json_path,
+                midi_path=midi_path,
+                dry_run=False,
+                message=message,
+                raw_response_text=raw_response_text,
+                warnings=warnings,
+                api_key_source=api_key_source,
+                base_note_source=pattern_pack_result.base_note_source,
+                full_pattern_pack_size_bytes=full_pattern_pack_size_bytes,
+                ai_request_pack_size_bytes=ai_request_pack_size_bytes,
+                ai_prompt_size_bytes=ai_prompt_size_bytes,
+                json_retry_count=json_retry_count,
+                json_retry_reason=json_retry_reason,
+                raw_response_file=raw_response_file,
+                retry_raw_response_file=retry_raw_response_file,
+                openai_response_status=openai_response_status,
+                openai_finish_reason=openai_finish_reason,
+                max_output_tokens_used=max_output_tokens_used,
+            )
+            _write_report(report_path, report)
+            raise AIPatternCompletionError(message)
+
+        try:
+            first_request = _request_ai_completion(
+                completion_client=completion_client,
+                api_key=api_key,
+                model_name=model_name,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=params.temperature,
+                max_completion_notes=params.max_completion_notes,
+            )
+        except OpenAIPatternCompletionClientError as retry_exc:
+            if retry_exc.raw_response_text is not None:
+                raw_response_text = retry_exc.raw_response_text
+                _write_raw_response(raw_response_retry_path, retry_exc.raw_response_text)
+
+            retry_error_max_output_tokens = _extract_max_output_tokens(retry_exc.response_debug)
+            if retry_error_max_output_tokens is not None:
+                max_output_tokens_used = retry_error_max_output_tokens
+
+            retry_error_status, retry_error_finish = _extract_status_and_finish(retry_exc.response_debug)
+            if retry_error_status:
+                openai_response_status = retry_error_status
+            if retry_error_finish:
+                openai_finish_reason = retry_error_finish
+
+            _append_openai_debug_attempt(
+                openai_response_debug,
+                attempt_name="json_retry",
+                response_debug=retry_exc.response_debug,
+                max_output_tokens_used=retry_error_max_output_tokens,
+                error=str(retry_exc),
+            )
+            _write_openai_response_debug(openai_debug_path, openai_response_debug)
+
+            message = (
+                "OpenAI response was not valid JSON after one repair retry."
+                if retry_exc.code == "invalid_json"
+                else str(retry_exc)
+            )
+            report = _error_report(
+                project_dir=project_dir,
+                layer=params.layer,
+                model_name=model_name,
+                pattern_pack_path=pattern_pack_path,
+                ai_request_pack_path=ai_request_pack_path,
+                prompt_path=prompt_path,
+                ai_json_path=ai_json_path,
+                midi_path=midi_path,
+                dry_run=False,
+                message=message,
+                raw_response_text=raw_response_text,
+                warnings=warnings,
+                api_key_source=api_key_source,
+                base_note_source=pattern_pack_result.base_note_source,
+                full_pattern_pack_size_bytes=full_pattern_pack_size_bytes,
+                ai_request_pack_size_bytes=ai_request_pack_size_bytes,
+                ai_prompt_size_bytes=ai_prompt_size_bytes,
+                json_retry_count=json_retry_count,
+                json_retry_reason=json_retry_reason,
+                raw_response_file=raw_response_file,
+                retry_raw_response_file=retry_raw_response_file,
+                openai_response_status=openai_response_status,
+                openai_finish_reason=openai_finish_reason,
+                max_output_tokens_used=max_output_tokens_used,
+            )
+            _write_report(report_path, report)
+            raise AIPatternCompletionError(message) from retry_exc
+        except ValidationError as retry_exc:
+            message = f"AI JSON schema validation failed: {retry_exc.errors()[0]['msg']}"
+            report = _error_report(
+                project_dir=project_dir,
+                layer=params.layer,
+                model_name=model_name,
+                pattern_pack_path=pattern_pack_path,
+                ai_request_pack_path=ai_request_pack_path,
+                prompt_path=prompt_path,
+                ai_json_path=ai_json_path,
+                midi_path=midi_path,
+                dry_run=False,
+                message=message,
+                raw_response_text=raw_response_text,
+                warnings=warnings,
+                api_key_source=api_key_source,
+                base_note_source=pattern_pack_result.base_note_source,
+                full_pattern_pack_size_bytes=full_pattern_pack_size_bytes,
+                ai_request_pack_size_bytes=ai_request_pack_size_bytes,
+                ai_prompt_size_bytes=ai_prompt_size_bytes,
+                json_retry_count=json_retry_count,
+                json_retry_reason=json_retry_reason,
+                raw_response_file=raw_response_file,
+                retry_raw_response_file=retry_raw_response_file,
+                openai_response_status=openai_response_status,
+                openai_finish_reason=openai_finish_reason,
+                max_output_tokens_used=max_output_tokens_used,
+            )
+            _write_report(report_path, report)
+            raise AIPatternCompletionError(message) from retry_exc
+
+        max_output_tokens_used = first_request.max_output_tokens_used
+        openai_response_status, openai_finish_reason = _extract_status_and_finish(
+            first_request.response_debug
+        )
+        _append_openai_debug_attempt(
+            openai_response_debug,
+            attempt_name="json_retry",
+            response_debug=first_request.response_debug,
+            max_output_tokens_used=first_request.max_output_tokens_used,
+            error=None,
+        )
+        _write_openai_response_debug(openai_debug_path, openai_response_debug)
+        _write_raw_response(raw_response_retry_path, first_request.raw_response_text)
+        raw_response_text = first_request.raw_response_text
+        parsed_payload = first_request.parsed_payload
+        first_ai_output = first_request.ai_output
     except ValidationError as exc:
         message = f"AI JSON schema validation failed: {exc.errors()[0]['msg']}"
         report = _error_report(
@@ -232,6 +483,13 @@ def complete_ai_pattern_completion(
             full_pattern_pack_size_bytes=full_pattern_pack_size_bytes,
             ai_request_pack_size_bytes=ai_request_pack_size_bytes,
             ai_prompt_size_bytes=ai_prompt_size_bytes,
+            json_retry_count=json_retry_count,
+            json_retry_reason=json_retry_reason,
+            raw_response_file=raw_response_file,
+            retry_raw_response_file=retry_raw_response_file,
+            openai_response_status=openai_response_status,
+            openai_finish_reason=openai_finish_reason,
+            max_output_tokens_used=max_output_tokens_used,
         )
         _write_report(report_path, report)
         raise AIPatternCompletionError(message) from exc
@@ -247,10 +505,8 @@ def complete_ai_pattern_completion(
 
     final_ai_output = first_ai_output
     final_validation_result = first_validation_result
-    raw_response_text = first_raw_response_text
-    parsed_payload = first_parsed_payload
 
-    if _should_retry_duplicate_feedback(
+    if json_retry_count == 0 and _should_retry_duplicate_feedback(
         validation_result=first_validation_result,
         proposed_note_count=first_pass_proposed_note_count,
     ):
@@ -259,6 +515,7 @@ def complete_ai_pattern_completion(
             "First pass rejected notes were mostly duplicate_base_note_onset "
             "or duplicate_base_note_overlap."
         )
+        retry_raw_response_file = str(raw_response_retry_path)
 
         feedback_context = _build_retry_feedback_context(
             ai_output=first_ai_output,
@@ -295,17 +552,24 @@ def complete_ai_pattern_completion(
                 full_pattern_pack_size_bytes=full_pattern_pack_size_bytes,
                 ai_request_pack_size_bytes=ai_request_pack_size_bytes,
                 ai_prompt_size_bytes=ai_prompt_size_bytes,
+                json_retry_count=json_retry_count,
+                json_retry_reason=json_retry_reason,
                 retry_count=retry_count,
                 retry_reason=retry_reason,
                 first_pass_proposed_note_count=first_pass_proposed_note_count,
                 first_pass_rejected_reasons=first_pass_rejected_reasons,
                 final_proposed_note_count=first_pass_proposed_note_count,
+                raw_response_file=raw_response_file,
+                retry_raw_response_file=retry_raw_response_file,
+                openai_response_status=openai_response_status,
+                openai_finish_reason=openai_finish_reason,
+                max_output_tokens_used=max_output_tokens_used,
             )
             _write_report(report_path, report)
             raise AIPatternCompletionError(message)
 
         try:
-            retry_raw_response_text, retry_parsed_payload, retry_ai_output = _request_ai_completion(
+            retry_request = _request_ai_completion(
                 completion_client=completion_client,
                 api_key=api_key,
                 model_name=model_name,
@@ -315,6 +579,29 @@ def complete_ai_pattern_completion(
                 max_completion_notes=params.max_completion_notes,
             )
         except OpenAIPatternCompletionClientError as exc:
+            if exc.raw_response_text is not None:
+                raw_response_text = exc.raw_response_text
+                _write_raw_response(raw_response_retry_path, exc.raw_response_text)
+
+            retry_error_max_output_tokens = _extract_max_output_tokens(exc.response_debug)
+            if retry_error_max_output_tokens is not None:
+                max_output_tokens_used = retry_error_max_output_tokens
+
+            retry_error_status, retry_error_finish = _extract_status_and_finish(exc.response_debug)
+            if retry_error_status:
+                openai_response_status = retry_error_status
+            if retry_error_finish:
+                openai_finish_reason = retry_error_finish
+
+            _append_openai_debug_attempt(
+                openai_response_debug,
+                attempt_name="duplicate_retry",
+                response_debug=exc.response_debug,
+                max_output_tokens_used=retry_error_max_output_tokens,
+                error=str(exc),
+            )
+            _write_openai_response_debug(openai_debug_path, openai_response_debug)
+
             report = _error_report(
                 project_dir=project_dir,
                 layer=params.layer,
@@ -333,11 +620,18 @@ def complete_ai_pattern_completion(
                 full_pattern_pack_size_bytes=full_pattern_pack_size_bytes,
                 ai_request_pack_size_bytes=ai_request_pack_size_bytes,
                 ai_prompt_size_bytes=ai_prompt_size_bytes,
+                json_retry_count=json_retry_count,
+                json_retry_reason=json_retry_reason,
                 retry_count=retry_count,
                 retry_reason=retry_reason,
                 first_pass_proposed_note_count=first_pass_proposed_note_count,
                 first_pass_rejected_reasons=first_pass_rejected_reasons,
                 final_proposed_note_count=first_pass_proposed_note_count,
+                raw_response_file=raw_response_file,
+                retry_raw_response_file=retry_raw_response_file,
+                openai_response_status=openai_response_status,
+                openai_finish_reason=openai_finish_reason,
+                max_output_tokens_used=max_output_tokens_used,
             )
             _write_report(report_path, report)
             raise AIPatternCompletionError(str(exc)) from exc
@@ -361,26 +655,47 @@ def complete_ai_pattern_completion(
                 full_pattern_pack_size_bytes=full_pattern_pack_size_bytes,
                 ai_request_pack_size_bytes=ai_request_pack_size_bytes,
                 ai_prompt_size_bytes=ai_prompt_size_bytes,
+                json_retry_count=json_retry_count,
+                json_retry_reason=json_retry_reason,
                 retry_count=retry_count,
                 retry_reason=retry_reason,
                 first_pass_proposed_note_count=first_pass_proposed_note_count,
                 first_pass_rejected_reasons=first_pass_rejected_reasons,
                 final_proposed_note_count=first_pass_proposed_note_count,
+                raw_response_file=raw_response_file,
+                retry_raw_response_file=retry_raw_response_file,
+                openai_response_status=openai_response_status,
+                openai_finish_reason=openai_finish_reason,
+                max_output_tokens_used=max_output_tokens_used,
             )
             _write_report(report_path, report)
             raise AIPatternCompletionError(message) from exc
 
+        max_output_tokens_used = retry_request.max_output_tokens_used
+        openai_response_status, openai_finish_reason = _extract_status_and_finish(
+            retry_request.response_debug
+        )
+        _append_openai_debug_attempt(
+            openai_response_debug,
+            attempt_name="duplicate_retry",
+            response_debug=retry_request.response_debug,
+            max_output_tokens_used=retry_request.max_output_tokens_used,
+            error=None,
+        )
+        _write_openai_response_debug(openai_debug_path, openai_response_debug)
+        _write_raw_response(raw_response_retry_path, retry_request.raw_response_text)
+
         retry_validation_result = validate_ai_completion_notes(
-            ai_output=retry_ai_output,
+            ai_output=retry_request.ai_output,
             base_notes=pattern_pack_result.base_notes,
             project_duration_sec=pattern_pack_result.duration_sec,
             max_completion_notes=params.max_completion_notes,
         )
 
-        final_ai_output = retry_ai_output
+        final_ai_output = retry_request.ai_output
         final_validation_result = retry_validation_result
-        raw_response_text = retry_raw_response_text
-        parsed_payload = retry_parsed_payload
+        raw_response_text = retry_request.raw_response_text
+        parsed_payload = retry_request.parsed_payload
 
     if params.keep_ai_json and parsed_payload is not None:
         ai_json_path.write_text(json.dumps(parsed_payload, indent=2) + "\n", encoding="utf-8")
@@ -419,11 +734,18 @@ def complete_ai_pattern_completion(
         output_midi_file=str(midi_path),
         output_midi_path=str(midi_path),
         base_note_source=pattern_pack_result.base_note_source,
+        json_retry_count=json_retry_count,
+        json_retry_reason=json_retry_reason,
         retry_count=retry_count,
         retry_reason=retry_reason,
         first_pass_proposed_note_count=first_pass_proposed_note_count,
         first_pass_rejected_reasons=first_pass_rejected_reasons,
         final_proposed_note_count=len(final_ai_output.notes),
+        raw_response_file=raw_response_file,
+        retry_raw_response_file=retry_raw_response_file,
+        openai_response_status=openai_response_status,
+        openai_finish_reason=openai_finish_reason,
+        max_output_tokens_used=max_output_tokens_used,
         proposed_note_count=len(final_ai_output.notes),
         accepted_note_count=len(final_validation_result.accepted_notes),
         rejected_note_count=len(final_validation_result.rejected_notes),
@@ -512,8 +834,8 @@ def _request_ai_completion(
     user_prompt: str,
     temperature: float,
     max_completion_notes: int,
-) -> tuple[str, dict[str, object], AIPatternCompletionOutput]:
-    raw_response_text, parsed_payload = completion_client.complete_pattern(
+) -> _AICompletionRequestResult:
+    completion_result = completion_client.complete_pattern(
         api_key=api_key,
         model=model_name,
         system_prompt=system_prompt,
@@ -521,8 +843,14 @@ def _request_ai_completion(
         temperature=temperature,
         max_completion_notes=max_completion_notes,
     )
-    ai_output = AIPatternCompletionOutput.model_validate(parsed_payload)
-    return raw_response_text, parsed_payload, ai_output
+    ai_output = AIPatternCompletionOutput.model_validate(completion_result.parsed_payload)
+    return _AICompletionRequestResult(
+        raw_response_text=completion_result.raw_response_text,
+        parsed_payload=completion_result.parsed_payload,
+        ai_output=ai_output,
+        response_debug=completion_result.response_debug,
+        max_output_tokens_used=completion_result.max_output_tokens_used,
+    )
 
 
 def _should_retry_duplicate_feedback(
@@ -587,6 +915,71 @@ def _build_retry_feedback_context(
     return "\n".join(lines)
 
 
+def _build_json_retry_feedback_context(*, raw_response_text: str | None) -> str:
+    raw_snippet = (raw_response_text or "").strip()
+    if len(raw_snippet) > 2000:
+        raw_snippet = raw_snippet[:2000]
+
+    lines = [
+        "Your previous response was not valid JSON. Return JSON only matching the schema. No markdown, no comments, no prose.",
+        "Invalid response excerpt (max 2000 chars):",
+        raw_snippet,
+    ]
+    return "\n".join(lines)
+
+
+def _write_raw_response(path: Path, raw_response_text: str | None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text((raw_response_text or "") + "\n", encoding="utf-8")
+
+
+def _write_openai_response_debug(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _append_openai_debug_attempt(
+    debug_payload: dict[str, object],
+    *,
+    attempt_name: str,
+    response_debug: dict[str, object] | None,
+    max_output_tokens_used: int | None,
+    error: str | None,
+) -> None:
+    attempts_value = debug_payload.get("attempts")
+    if not isinstance(attempts_value, list):
+        attempts_value = []
+        debug_payload["attempts"] = attempts_value
+
+    attempt_payload: dict[str, object] = {
+        "attempt": attempt_name,
+        "max_output_tokens_used": int(max_output_tokens_used)
+        if isinstance(max_output_tokens_used, int)
+        else None,
+        "response_debug": dict(response_debug or {}),
+        "error": error,
+    }
+    attempts_value.append(attempt_payload)
+
+
+def _extract_status_and_finish(response_debug: dict[str, object] | None) -> tuple[str | None, str | None]:
+    payload = dict(response_debug or {})
+    status = payload.get("status")
+    finish_reason = payload.get("finish_reason")
+
+    status_value = status if isinstance(status, str) and status.strip() else None
+    finish_value = finish_reason if isinstance(finish_reason, str) and finish_reason.strip() else None
+    return status_value, finish_value
+
+
+def _extract_max_output_tokens(response_debug: dict[str, object] | None) -> int | None:
+    payload = dict(response_debug or {})
+    value = payload.get("max_output_tokens")
+    if isinstance(value, int):
+        return value
+    return None
+
+
 def _error_report(
     *,
     project_dir: Path,
@@ -606,11 +999,18 @@ def _error_report(
     full_pattern_pack_size_bytes: int = 0,
     ai_request_pack_size_bytes: int = 0,
     ai_prompt_size_bytes: int = 0,
+    json_retry_count: int = 0,
+    json_retry_reason: str | None = None,
     retry_count: int = 0,
     retry_reason: str | None = None,
     first_pass_proposed_note_count: int = 0,
     first_pass_rejected_reasons: dict[str, int] | None = None,
     final_proposed_note_count: int = 0,
+    raw_response_file: str | None = None,
+    retry_raw_response_file: str | None = None,
+    openai_response_status: str | None = None,
+    openai_finish_reason: str | None = None,
+    max_output_tokens_used: int = 0,
 ) -> AIPatternCompletionReport:
     warning_list = list(warnings or [])
     warning_list.append(message)
@@ -635,11 +1035,18 @@ def _error_report(
         output_midi_file=(str(midi_path) if midi_path.exists() else None),
         output_midi_path=(str(midi_path) if midi_path.exists() else None),
         base_note_source=base_note_source,
+        json_retry_count=int(json_retry_count),
+        json_retry_reason=json_retry_reason,
         retry_count=int(retry_count),
         retry_reason=retry_reason,
         first_pass_proposed_note_count=int(first_pass_proposed_note_count),
         first_pass_rejected_reasons=first_pass_rejected,
         final_proposed_note_count=int(final_proposed_note_count),
+        raw_response_file=raw_response_file,
+        retry_raw_response_file=retry_raw_response_file,
+        openai_response_status=openai_response_status,
+        openai_finish_reason=openai_finish_reason,
+        max_output_tokens_used=int(max_output_tokens_used),
         proposed_note_count=int(final_proposed_note_count),
         accepted_note_count=0,
         rejected_note_count=0,

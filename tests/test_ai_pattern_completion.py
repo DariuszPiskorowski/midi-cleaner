@@ -10,12 +10,17 @@ import soundfile as sf
 
 from midi_cleaner.ai_completion.compact_pack import build_ai_request_pack
 from midi_cleaner.ai_completion.models import AIPatternCompletionReport
+from midi_cleaner.ai_completion.openai_client import (
+    OpenAIPatternCompletionResult,
+    calculate_max_output_tokens,
+)
 from midi_cleaner.ai_completion.pattern_pack import BasePatternNote, PatternPackBuildResult
 from midi_cleaner.ai_completion.pattern_pack import build_pattern_pack
 from midi_cleaner.ai_completion.prompt import build_ai_completion_prompts
 from midi_cleaner.ai_completion.service import (
     AIPatternCompletionError,
     AIPatternCompletionParameters,
+    _build_json_retry_feedback_context,
     _resolve_openai_api_key,
     complete_ai_pattern_completion,
 )
@@ -45,8 +50,8 @@ class _FakeAIClient:
         user_prompt: str,
         temperature: float,
         max_completion_notes: int,
-        max_output_tokens: int = 4000,
-    ) -> tuple[str, dict[str, object]]:
+        max_output_tokens: int | None = None,
+    ) -> OpenAIPatternCompletionResult:
         _ = (
             api_key,
             model,
@@ -57,7 +62,16 @@ class _FakeAIClient:
             max_output_tokens,
         )
         self.called = True
-        return json.dumps(self.payload), self.payload
+        return OpenAIPatternCompletionResult(
+            raw_response_text=json.dumps(self.payload),
+            parsed_payload=self.payload,
+            response_debug={
+                "status": "completed",
+                "finish_reason": "stop",
+                "max_output_tokens": int(max_output_tokens or 4000),
+            },
+            max_output_tokens_used=int(max_output_tokens or 4000),
+        )
 
 
 class _SequenceAIClient:
@@ -74,8 +88,8 @@ class _SequenceAIClient:
         user_prompt: str,
         temperature: float,
         max_completion_notes: int,
-        max_output_tokens: int = 4000,
-    ) -> tuple[str, dict[str, object]]:
+        max_output_tokens: int | None = None,
+    ) -> OpenAIPatternCompletionResult:
         _ = (
             api_key,
             model,
@@ -87,7 +101,16 @@ class _SequenceAIClient:
         )
         payload = self.payloads[min(self.call_count, len(self.payloads) - 1)]
         self.call_count += 1
-        return json.dumps(payload), payload
+        return OpenAIPatternCompletionResult(
+            raw_response_text=json.dumps(payload),
+            parsed_payload=payload,
+            response_debug={
+                "status": "completed",
+                "finish_reason": "stop",
+                "max_output_tokens": int(max_output_tokens or 4000),
+            },
+            max_output_tokens_used=int(max_output_tokens or 4000),
+        )
 
 
 def _write_candidate_midi(path: Path) -> None:
@@ -296,6 +319,25 @@ def test_prompt_builder_has_json_only_and_no_base_rewrite_instruction() -> None:
 
     payload = user_prompt.split("Pattern pack JSON:\n", maxsplit=1)[1]
     assert payload == json.dumps(ai_request_pack, separators=(",", ":"), ensure_ascii=False)
+
+
+def test_calculate_max_output_tokens_dynamic_budget() -> None:
+    assert calculate_max_output_tokens(1) == 4000
+    assert calculate_max_output_tokens(16) == 4520
+    assert calculate_max_output_tokens(64) == 12000
+    assert calculate_max_output_tokens(120) == 12000
+
+
+def test_json_retry_feedback_context_is_strict_and_truncated() -> None:
+    invalid_raw = "{" + ("x" * 2100)
+    context = _build_json_retry_feedback_context(raw_response_text=invalid_raw)
+
+    assert (
+        "Your previous response was not valid JSON. Return JSON only matching the schema. "
+        "No markdown, no comments, no prose."
+    ) in context
+    excerpt = context.split("Invalid response excerpt (max 2000 chars):\n", maxsplit=1)[1]
+    assert len(excerpt) <= 2000
 
 
 def test_compact_request_pack_limits_and_metadata() -> None:
@@ -853,6 +895,20 @@ def test_pipeline_process_stem_flag_runs_ai_pattern_completion(
             ai_prompt_size_bytes=7,
             ai_json_file=str(analysis_dir / "bass_ai_completion.json"),
             output_midi_file=str(ai_midi_path),
+            output_midi_path=str(ai_midi_path),
+            base_note_source="working.mid",
+            json_retry_count=0,
+            json_retry_reason=None,
+            retry_count=0,
+            retry_reason=None,
+            first_pass_proposed_note_count=1,
+            first_pass_rejected_reasons={},
+            final_proposed_note_count=1,
+            raw_response_file=str(analysis_dir / "openai_raw_response_first_pass.txt"),
+            retry_raw_response_file=None,
+            openai_response_status="completed",
+            openai_finish_reason="stop",
+            max_output_tokens_used=4000,
             proposed_note_count=1,
             accepted_note_count=1,
             rejected_note_count=0,
