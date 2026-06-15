@@ -1244,25 +1244,56 @@ def _detect_bar_gap_candidates(
             direction=-1,
             family_by_bar=family_by_bar,
             family_by_id=family_by_id,
+            gap_start_bar=current_start,
+            gap_end_bar=end_index,
         )
         after_context = _collect_family_context(
             anchor_bar=end_index + 1,
             direction=1,
             family_by_bar=family_by_bar,
             family_by_id=family_by_id,
+            gap_start_bar=current_start,
+            gap_end_bar=end_index,
         )
+
+        audio_ratio = _activity_ratio_in_frames(audio_frames, start_sec=start_sec, end_sec=end_sec, key="onset_score")
+        pitch_ratio = _activity_ratio_in_frames(pitch_frames, start_sec=start_sec, end_sec=end_sec, key="voiced")
 
         before_ids = {item.pattern_family_id for item in before_context}
         after_ids = {item.pattern_family_id for item in after_context}
-        bridge_ids = sorted(before_ids.intersection(after_ids))
+        raw_bridge_ids = sorted(before_ids.intersection(after_ids))
+        bridge_ids: list[str] = []
+        weak_bridge_ids: list[str] = []
+
+        audio_strong = audio_ratio is not None and audio_ratio >= 0.35
+        pitch_strong = pitch_ratio is not None and pitch_ratio >= 0.35
+
+        for family_id in raw_bridge_ids:
+            family = family_by_id.get(family_id)
+            occurrence_count = int(family.occurrence_count) if family is not None else 0
+            before_distances = [item.distance_bars for item in before_context if item.pattern_family_id == family_id]
+            after_distances = [item.distance_bars for item in after_context if item.pattern_family_id == family_id]
+            near_gap = (
+                bool(before_distances)
+                and bool(after_distances)
+                and (min(before_distances) <= 1 or min(after_distances) <= 1)
+            )
+
+            if occurrence_count >= 2:
+                bridge_ids.append(family_id)
+                continue
+
+            if audio_strong and pitch_strong and not near_gap:
+                bridge_ids.append(family_id)
+                continue
+
+            weak_bridge_ids.append(family_id)
+
         same_bridge = bool(bridge_ids)
 
         compatible_bridge = False
         if not same_bridge and before_context and after_context:
             compatible_bridge = _has_compatible_bridge(before_context, after_context, family_by_id)
-
-        audio_ratio = _activity_ratio_in_frames(audio_frames, start_sec=start_sec, end_sec=end_sec, key="onset_score")
-        pitch_ratio = _activity_ratio_in_frames(pitch_frames, start_sec=start_sec, end_sec=end_sec, key="voiced")
 
         completion_readiness = "insufficient_context"
         completion_possible = False
@@ -1273,6 +1304,12 @@ def _detect_bar_gap_candidates(
             completion_possible = True
             reason = (
                 "Same pattern family appears before and after gap; deterministic bridge is extremely clear."
+            )
+        elif weak_bridge_ids:
+            completion_readiness = "unclear"
+            reason = (
+                "Bridge family overlap exists but evidence is weak (occurrence too low or only near-gap support): "
+                f"{', '.join(weak_bridge_ids)}."
             )
         elif compatible_bridge:
             completion_readiness = "unclear"
@@ -1338,23 +1375,29 @@ def _collect_family_context(
     direction: int,
     family_by_bar: dict[int, str],
     family_by_id: dict[str, PatternFamily],
+    gap_start_bar: int,
+    gap_end_bar: int,
     max_scan: int = 8,
 ) -> list[BarGapFamilyContext]:
     contexts: list[BarGapFamilyContext] = []
     seen: set[str] = set()
+    edge_bar = gap_start_bar if direction < 0 else gap_end_bar
     for offset in range(0, max_scan):
         bar_index = anchor_bar + (direction * offset)
+        if gap_start_bar <= int(bar_index) <= gap_end_bar:
+            continue
         family_id = family_by_bar.get(int(bar_index))
         if family_id is None or family_id in seen:
             continue
         seen.add(family_id)
         family = family_by_id.get(family_id)
         occurrence_count = family.occurrence_count if family is not None else None
+        distance_bars = abs(int(bar_index) - int(edge_bar))
         contexts.append(
             BarGapFamilyContext(
                 pattern_family_id=family_id,
                 bar_index=int(bar_index),
-                distance_bars=int(abs(offset)),
+                distance_bars=int(distance_bars),
                 occurrence_count=int(occurrence_count) if occurrence_count is not None else None,
             )
         )

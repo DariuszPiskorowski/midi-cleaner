@@ -445,6 +445,87 @@ def test_bar_gap_candidate_extremely_clear_bridge_flag(tmp_path: Path) -> None:
     assert any(item.get("completion_readiness") in {"extremely_clear", "unclear", "insufficient_context"} for item in gap_candidates)
 
 
+def test_bar_gap_context_excludes_inside_gap_bars(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="large_gap_missing")
+
+    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
+
+    assert report.status == "ok"
+    gap_candidates = json.loads(Path(report.bar_gap_candidates_file).read_text(encoding="utf-8"))
+    assert gap_candidates
+
+    for candidate in gap_candidates:
+        start_bar = int(candidate.get("start_bar_index"))
+        end_bar = int(candidate.get("end_bar_index"))
+
+        for context in candidate.get("families_before", []):
+            context_bar = int(context.get("bar_index"))
+            assert context_bar < start_bar
+
+        for context in candidate.get("families_after", []):
+            context_bar = int(context.get("bar_index"))
+            assert context_bar > end_bar
+
+
+def test_same_family_bridge_not_from_inside_gap_overlap(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="large_gap_missing")
+
+    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
+
+    assert report.status == "ok"
+    gap_candidates = json.loads(Path(report.bar_gap_candidates_file).read_text(encoding="utf-8"))
+    assert gap_candidates
+
+    for candidate in gap_candidates:
+        start_bar = int(candidate.get("start_bar_index"))
+        end_bar = int(candidate.get("end_bar_index"))
+        before_ids = {
+            item.get("pattern_family_id")
+            for item in candidate.get("families_before", [])
+            if int(item.get("bar_index")) < start_bar
+        }
+        after_ids = {
+            item.get("pattern_family_id")
+            for item in candidate.get("families_after", [])
+            if int(item.get("bar_index")) > end_bar
+        }
+        expected_overlap = sorted(before_ids.intersection(after_ids))
+        if candidate.get("same_family_bridge"):
+            assert candidate.get("bridge_family_ids") == expected_overlap
+
+
+def test_extremely_clear_requires_strong_external_bridge_evidence(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="large_gap_missing")
+
+    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
+
+    assert report.status == "ok"
+    gap_candidates = json.loads(Path(report.bar_gap_candidates_file).read_text(encoding="utf-8"))
+    assert gap_candidates
+
+    for candidate in gap_candidates:
+        if candidate.get("completion_readiness") != "extremely_clear":
+            continue
+
+        assert candidate.get("same_family_bridge") is True
+        bridge_ids = candidate.get("bridge_family_ids") or []
+        assert bridge_ids
+
+        before_context = candidate.get("families_before", [])
+        after_context = candidate.get("families_after", [])
+        for bridge_id in bridge_ids:
+            before_match = [item for item in before_context if item.get("pattern_family_id") == bridge_id]
+            after_match = [item for item in after_context if item.get("pattern_family_id") == bridge_id]
+            assert before_match and after_match
+            occurrence = max(
+                int(item.get("occurrence_count") or 0)
+                for item in before_match + after_match
+            )
+            min_before = min(int(item.get("distance_bars")) for item in before_match)
+            min_after = min(int(item.get("distance_bars")) for item in after_match)
+            assert occurrence >= 2 or (min_before > 1 and min_after > 1)
+
+
 def test_ambiguous_missing_expected_block_is_skipped(tmp_path: Path, monkeypatch) -> None:
     project_dir = _build_project(tmp_path, scenario="missing_empty")
 
