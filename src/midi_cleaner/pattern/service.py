@@ -72,6 +72,21 @@ class _FamilyPeriodEstimate:
     stability: float
 
 
+@dataclass
+class _CompletionStats:
+    rejected_micro_note_count: int = 0
+    rejected_polyphonic_stack_count: int = 0
+    rejected_low_confidence_count: int = 0
+    rejected_tiny_gap_count: int = 0
+
+
+@dataclass(frozen=True)
+class _LocalNoteThresholds:
+    min_duration_sec: float
+    min_velocity: int
+    median_velocity: int
+
+
 def complete_pattern_blocks(
     project_dir: Path,
     params: PatternCompletionParameters,
@@ -99,9 +114,12 @@ def complete_pattern_blocks(
         base_midi_path = _resolve_base_midi(project_dir)
         timing = _parse_midi_timing(base_midi_path)
         base_notes = _load_base_notes(base_midi_path, layer=params.layer)
+        stats = _CompletionStats()
 
         if not base_notes:
             raise PatternCompletionError(f"No base notes found in {base_midi_path}")
+
+        local_thresholds = _compute_local_note_thresholds(base_notes)
 
         blocks = _split_into_blocks(base_notes, timing=timing)
         families = _build_pattern_families(blocks)
@@ -125,6 +143,8 @@ def complete_pattern_blocks(
                 blocks_by_id=blocks_by_id,
                 families=families,
                 base_notes=base_notes,
+                local_thresholds=local_thresholds,
+                stats=stats,
             )
             incomplete_existing_reports.append(report)
             inserted_notes.extend(new_notes)
@@ -139,13 +159,15 @@ def complete_pattern_blocks(
             blocks_by_id=blocks_by_id,
             families=families,
             base_notes=base_notes,
+            local_thresholds=local_thresholds,
+            stats=stats,
         )
         missing_expected_reports.extend(missing_reports)
         inserted_notes.extend(missing_inserted_notes)
 
         all_reports = list(incomplete_existing_reports) + list(missing_expected_reports)
 
-        deduped_inserted_notes = _dedupe_inserted_notes(inserted_notes)
+        deduped_inserted_notes = _dedupe_inserted_notes(inserted_notes, stats=stats)
 
         _write_json(pattern_blocks_path, [item.model_dump(mode="json") for item in enriched_blocks])
         _write_json(pattern_families_path, [item.model_dump(mode="json") for item in families])
@@ -220,6 +242,10 @@ def complete_pattern_blocks(
             skipped_block_count=skipped_block_count,
             skipped_ambiguous_count=skipped_ambiguous_count,
             skipped_no_clear_family_count=skipped_no_clear_family_count,
+            rejected_micro_note_count=stats.rejected_micro_note_count,
+            rejected_polyphonic_stack_count=stats.rejected_polyphonic_stack_count,
+            rejected_low_confidence_count=stats.rejected_low_confidence_count,
+            rejected_tiny_gap_count=stats.rejected_tiny_gap_count,
             inserted_note_count=len(deduped_inserted_notes),
             output_midi_path=str(output_midi_path),
             pattern_blocks_file=str(pattern_blocks_path),
@@ -253,6 +279,10 @@ def complete_pattern_blocks(
             skipped_block_count=0,
             skipped_ambiguous_count=0,
             skipped_no_clear_family_count=0,
+            rejected_micro_note_count=0,
+            rejected_polyphonic_stack_count=0,
+            rejected_low_confidence_count=0,
+            rejected_tiny_gap_count=0,
             inserted_note_count=0,
             output_midi_path=None,
             pattern_blocks_file=str(pattern_blocks_path),
@@ -341,6 +371,30 @@ def _load_base_notes(base_midi_path: Path, layer: str) -> list[_BaseNote]:
     return notes
 
 
+def _compute_local_note_thresholds(base_notes: list[_BaseNote]) -> _LocalNoteThresholds:
+    if not base_notes:
+        return _LocalNoteThresholds(
+            min_duration_sec=0.12,
+            min_velocity=48,
+            median_velocity=90,
+        )
+
+    durations = [max(1e-6, float(note.duration_sec)) for note in base_notes]
+    velocities = [int(note.velocity) for note in base_notes]
+
+    median_duration = float(statistics.median(durations))
+    median_velocity = int(round(float(statistics.median(velocities))))
+
+    min_duration_sec = max(0.10, min(0.15, median_duration * 0.45))
+    min_velocity = max(35, int(round(median_velocity * 0.45)))
+
+    return _LocalNoteThresholds(
+        min_duration_sec=round(min_duration_sec, 6),
+        min_velocity=min_velocity,
+        median_velocity=median_velocity,
+    )
+
+
 def _split_into_blocks(
     notes: list[_BaseNote],
     *,
@@ -382,6 +436,7 @@ def _split_into_blocks(
         pitches: list[int] = []
         pitch_names: list[str] = []
         occupied_slots: set[int] = set()
+        onset_slots: list[int] = []
 
         for note in block_notes:
             onset_rel_beat = max(0.0, float(note.start_beat - start_beat))
@@ -413,6 +468,7 @@ def _split_into_blocks(
                     channel=note.channel,
                 )
             )
+            onset_slots.append(onset_slot)
             relative_onsets_beat.append(round(onset_rel_beat, 6))
             relative_durations_beat.append(round(duration_beat, 6))
             relative_onsets_sec.append(round(note.start_sec - start_sec, 6))
@@ -421,6 +477,7 @@ def _split_into_blocks(
             pitch_names.append(note.pitch_name)
 
         occupied_slots_sorted = sorted(occupied_slots)
+        onset_slots_sorted = sorted(set(onset_slots))
         empty_slots = [slot for slot in range(total_slots) if slot not in occupied_slots]
         intervals = [
             int(pitches[item + 1] - pitches[item])
@@ -443,6 +500,7 @@ def _split_into_blocks(
                 duration_sec=round(max(0.0, end_sec - start_sec), 6),
                 time_signature=time_signature,
                 grid_resolution=grid_resolution,
+                onset_slots=onset_slots_sorted,
                 occupied_slots=occupied_slots_sorted,
                 empty_slots=empty_slots,
                 note_count=len(block_notes),
@@ -495,13 +553,18 @@ def _build_pattern_families(
         list[PatternBlock],
     ] = defaultdict(list)
 
+    normalized_by_block_id: dict[str, PatternBlock] = {}
+
     for block in complete_candidates:
-        onset_slots = tuple(int(note.onset_slot or 0) for note in block.notes)
-        duration_slots = tuple(int(note.duration_slots or 1) for note in block.notes)
-        rhythm_quantized = tuple(int(round(value * 1000.0)) for value in block.rhythm_signature)
-        pitch_signature = tuple(block.pitch_sequence)
-        interval_signature = tuple(block.interval_sequence)
-        pitch_set_signature = tuple(block.pitch_set)
+        normalized = _monophonic_block_view(block)
+        normalized_by_block_id[block.block_id] = normalized
+
+        onset_slots = tuple(int(note.onset_slot or 0) for note in normalized.notes)
+        duration_slots = tuple(int(note.duration_slots or 1) for note in normalized.notes)
+        rhythm_quantized = tuple(int(round(value * 1000.0)) for value in normalized.rhythm_signature)
+        pitch_signature = tuple(normalized.pitch_sequence)
+        interval_signature = tuple(normalized.interval_sequence)
+        pitch_set_signature = tuple(normalized.pitch_set)
         signature = (
             onset_slots,
             duration_slots,
@@ -529,25 +592,26 @@ def _build_pattern_families(
 
         representative = max(
             grouped_blocks,
-            key=lambda item: (item.note_count, item.duration_sec),
+            key=lambda item: (normalized_by_block_id[item.block_id].note_count, item.duration_sec),
         )
+        normalized_representative = normalized_by_block_id[representative.block_id]
 
         families.append(
             PatternFamily(
                 pattern_family_id=family_id,
-                block_length_beats=float(representative.block_length_beats),
-                time_signature=representative.time_signature,
-                grid_resolution=representative.grid_resolution,
-                representative_onset_slots=[int(note.onset_slot or 0) for note in representative.notes],
-                representative_duration_slots=[int(note.duration_slots or 1) for note in representative.notes],
-                representative_relative_onsets_beat=list(representative.relative_onsets_beat),
-                representative_relative_durations_beat=list(representative.relative_durations_beat),
-                representative_pitch_sequence=list(representative.pitch_sequence),
-                representative_interval_sequence=list(representative.interval_sequence),
-                representative_relative_onsets_sec=list(representative.relative_onsets_sec),
-                representative_durations_sec=list(representative.relative_durations_sec),
-                representative_pitch_set=list(representative.pitch_set),
-                representative_note_count=representative.note_count,
+                block_length_beats=float(normalized_representative.block_length_beats),
+                time_signature=normalized_representative.time_signature,
+                grid_resolution=normalized_representative.grid_resolution,
+                representative_onset_slots=[int(note.onset_slot or 0) for note in normalized_representative.notes],
+                representative_duration_slots=[int(note.duration_slots or 1) for note in normalized_representative.notes],
+                representative_relative_onsets_beat=list(normalized_representative.relative_onsets_beat),
+                representative_relative_durations_beat=list(normalized_representative.relative_durations_beat),
+                representative_pitch_sequence=list(normalized_representative.pitch_sequence),
+                representative_interval_sequence=list(normalized_representative.interval_sequence),
+                representative_relative_onsets_sec=list(normalized_representative.relative_onsets_sec),
+                representative_durations_sec=list(normalized_representative.relative_durations_sec),
+                representative_pitch_set=list(normalized_representative.pitch_set),
+                representative_note_count=normalized_representative.note_count,
                 occurrence_count=len(grouped_blocks),
                 occurrence_bars=[item.bar_index for item in sorted(grouped_blocks, key=lambda item: item.bar_index)],
                 occurrences=[item.block_id for item in sorted(grouped_blocks, key=lambda item: item.start_sec)],
@@ -618,6 +682,68 @@ def _classify_block(
     )
 
 
+def _monophonic_block_view(block: PatternBlock) -> PatternBlock:
+    if not block.notes:
+        return block
+
+    by_slot: dict[int, list[PatternBlockNote]] = defaultdict(list)
+    for note in block.notes:
+        by_slot[int(note.onset_slot or 0)].append(note)
+
+    collapsed: list[PatternBlockNote] = []
+    for slot in sorted(by_slot.keys()):
+        candidates = by_slot[slot]
+        selected = min(
+            candidates,
+            key=lambda item: (
+                int(item.pitch_midi),
+                -int(item.duration_slots or 1),
+                -int(item.velocity),
+            ),
+        )
+        collapsed.append(selected)
+
+    relative_onsets_beat = [
+        round(float(int(note.onset_slot or 0) / max(1, _grid_division_from_text(block.grid_resolution))), 6)
+        for note in collapsed
+    ]
+    relative_durations_beat = [
+        round(float(int(note.duration_slots or 1) / max(1, _grid_division_from_text(block.grid_resolution))), 6)
+        for note in collapsed
+    ]
+    relative_onsets_sec = [
+        round(float(value * (block.duration_sec / max(1e-6, block.block_length_beats))), 6)
+        for value in relative_onsets_beat
+    ]
+    relative_durations_sec = [
+        round(float(value * (block.duration_sec / max(1e-6, block.block_length_beats))), 6)
+        for value in relative_durations_beat
+    ]
+    pitches = [int(note.pitch_midi) for note in collapsed]
+    intervals = [int(pitches[index + 1] - pitches[index]) for index in range(len(pitches) - 1)]
+    rhythm_signature = [
+        round(relative_onsets_beat[index + 1] - relative_onsets_beat[index], 6)
+        for index in range(len(relative_onsets_beat) - 1)
+    ]
+
+    return block.model_copy(
+        update={
+            "notes": collapsed,
+            "note_count": len(collapsed),
+            "onset_slots": sorted(set(int(note.onset_slot or 0) for note in collapsed)),
+            "relative_onsets_beat": relative_onsets_beat,
+            "relative_durations_beat": relative_durations_beat,
+            "relative_onsets_sec": relative_onsets_sec,
+            "relative_durations_sec": relative_durations_sec,
+            "pitch_sequence": pitches,
+            "pitch_names": [str(note.pitch_name) for note in collapsed],
+            "interval_sequence": intervals,
+            "rhythm_signature": rhythm_signature,
+            "pitch_set": sorted(set(pitches)),
+        }
+    )
+
+
 def _is_exact_family_match(*, block: PatternBlock, family: PatternFamily) -> bool:
     if len(block.notes) != len(family.representative_onset_slots):
         return False
@@ -642,11 +768,14 @@ def _complete_incomplete_block(
     blocks_by_id: dict[str, PatternBlock],
     families: list[PatternFamily],
     base_notes: list[_BaseNote],
+    local_thresholds: _LocalNoteThresholds,
+    stats: _CompletionStats,
 ) -> tuple[IncompleteBlockReport, list[ProposedCompletionNote]]:
+    monophonic_block = _monophonic_block_view(incomplete_block)
     possible_matches: list[_CandidateFamilyMatch] = []
 
     for family in families:
-        candidate = _score_family_match(incomplete_block=incomplete_block, family=family)
+        candidate = _score_family_match(incomplete_block=monophonic_block, family=family)
         if candidate is not None:
             possible_matches.append(candidate)
 
@@ -666,12 +795,17 @@ def _complete_incomplete_block(
             block_type="incomplete_existing_block",
             incomplete_block_id=incomplete_block.block_id,
             target_bar_index=incomplete_block.bar_index,
+            target_start_sec=incomplete_block.start_sec,
+            target_end_sec=incomplete_block.end_sec,
             start_sec=incomplete_block.start_sec,
             end_sec=incomplete_block.end_sec,
             start_beat=incomplete_block.start_beat,
             end_beat=incomplete_block.end_beat,
             observed_slots=list(incomplete_block.occupied_slots),
             missing_slots=[],
+            onset_slots_observed=list(monophonic_block.onset_slots),
+            onset_slots_expected=[],
+            onset_slots_missing=[],
             observed_pitch_sequence=list(incomplete_block.pitch_sequence),
             observed_relative_onsets_sec=list(incomplete_block.relative_onsets_sec),
             possible_matches=[],
@@ -692,12 +826,17 @@ def _complete_incomplete_block(
             block_type="incomplete_existing_block",
             incomplete_block_id=incomplete_block.block_id,
             target_bar_index=incomplete_block.bar_index,
+            target_start_sec=incomplete_block.start_sec,
+            target_end_sec=incomplete_block.end_sec,
             start_sec=incomplete_block.start_sec,
             end_sec=incomplete_block.end_sec,
             start_beat=incomplete_block.start_beat,
             end_beat=incomplete_block.end_beat,
             observed_slots=list(incomplete_block.occupied_slots),
             missing_slots=[],
+            onset_slots_observed=list(monophonic_block.onset_slots),
+            onset_slots_expected=[int(slot) for slot in best.family.representative_onset_slots],
+            onset_slots_missing=[],
             observed_pitch_sequence=list(incomplete_block.pitch_sequence),
             observed_relative_onsets_sec=list(incomplete_block.relative_onsets_sec),
             possible_matches=match_models,
@@ -713,18 +852,64 @@ def _complete_incomplete_block(
         )
         return report, []
 
+    if best.score < 0.85:
+        stats.rejected_low_confidence_count += 1
+        report = IncompleteBlockReport(
+            block_type="incomplete_existing_block",
+            incomplete_block_id=incomplete_block.block_id,
+            target_bar_index=incomplete_block.bar_index,
+            target_start_sec=incomplete_block.start_sec,
+            target_end_sec=incomplete_block.end_sec,
+            start_sec=incomplete_block.start_sec,
+            end_sec=incomplete_block.end_sec,
+            start_beat=incomplete_block.start_beat,
+            end_beat=incomplete_block.end_beat,
+            observed_slots=list(incomplete_block.occupied_slots),
+            missing_slots=[
+                slot
+                for slot in best.family.representative_onset_slots
+                if int(slot) not in set(monophonic_block.onset_slots)
+            ],
+            onset_slots_observed=list(monophonic_block.onset_slots),
+            onset_slots_expected=[int(slot) for slot in best.family.representative_onset_slots],
+            onset_slots_missing=[
+                int(slot)
+                for slot in best.family.representative_onset_slots
+                if int(slot) not in set(monophonic_block.onset_slots)
+            ],
+            observed_pitch_sequence=list(incomplete_block.pitch_sequence),
+            observed_relative_onsets_sec=list(incomplete_block.relative_onsets_sec),
+            possible_matches=match_models,
+            best_match_pattern_family_id=best.family.pattern_family_id,
+            source_pattern_family_id=best.family.pattern_family_id,
+            source_family_occurrence_count=best.family.occurrence_count,
+            reason="no_clear_family",
+            match_reason="Low confidence deterministic match; only high confidence completions are allowed.",
+            missing_notes_to_insert=[],
+            inserted_notes=[],
+            rejected_candidate_notes=[{"note_id": incomplete_block.block_id, "reason": "low_confidence"}],
+            confidence_level=_confidence_from_score(best.score),
+            action="skipped",
+        )
+        return report, []
+
     exemplar_block = _find_exemplar_block(best.family, blocks_by_id)
     if exemplar_block is None:
         report = IncompleteBlockReport(
             block_type="incomplete_existing_block",
             incomplete_block_id=incomplete_block.block_id,
             target_bar_index=incomplete_block.bar_index,
+            target_start_sec=incomplete_block.start_sec,
+            target_end_sec=incomplete_block.end_sec,
             start_sec=incomplete_block.start_sec,
             end_sec=incomplete_block.end_sec,
             start_beat=incomplete_block.start_beat,
             end_beat=incomplete_block.end_beat,
             observed_slots=list(incomplete_block.occupied_slots),
             missing_slots=[],
+            onset_slots_observed=list(monophonic_block.onset_slots),
+            onset_slots_expected=[int(slot) for slot in best.family.representative_onset_slots],
+            onset_slots_missing=[],
             observed_pitch_sequence=list(incomplete_block.pitch_sequence),
             observed_relative_onsets_sec=list(incomplete_block.relative_onsets_sec),
             possible_matches=match_models,
@@ -738,30 +923,46 @@ def _complete_incomplete_block(
         return report, []
 
     proposed = _propose_missing_notes(
-        incomplete_block=incomplete_block,
+        incomplete_block=monophonic_block,
         family=best.family,
         exemplar_block=exemplar_block,
+        local_thresholds=local_thresholds,
     )
 
     validated: list[ProposedCompletionNote] = []
     rejected_count = 0
+    rejected_candidates: list[dict[str, object]] = []
     for note in proposed:
         reason = _validate_proposed_note(
             note=note,
-            incomplete_block=incomplete_block,
+            incomplete_block=monophonic_block,
             family=best.family,
             base_notes=base_notes,
+            local_thresholds=local_thresholds,
+            stats=stats,
+            accepted_notes=validated,
         )
         if reason is None:
             validated.append(note)
         else:
             rejected_count += 1
+            rejected_candidates.append(
+                {
+                    "note_id": note.note_id,
+                    "pitch_midi": note.pitch_midi,
+                    "start_sec": note.start_sec,
+                    "end_sec": note.end_sec,
+                    "reason": reason,
+                }
+            )
 
     if not validated:
         report = IncompleteBlockReport(
             block_type="incomplete_existing_block",
             incomplete_block_id=incomplete_block.block_id,
             target_bar_index=incomplete_block.bar_index,
+            target_start_sec=incomplete_block.start_sec,
+            target_end_sec=incomplete_block.end_sec,
             start_sec=incomplete_block.start_sec,
             end_sec=incomplete_block.end_sec,
             start_beat=incomplete_block.start_beat,
@@ -770,7 +971,14 @@ def _complete_incomplete_block(
             missing_slots=[
                 slot
                 for slot in best.family.representative_onset_slots
-                if slot not in set(incomplete_block.occupied_slots)
+                if slot not in set(monophonic_block.onset_slots)
+            ],
+            onset_slots_observed=list(monophonic_block.onset_slots),
+            onset_slots_expected=[int(slot) for slot in best.family.representative_onset_slots],
+            onset_slots_missing=[
+                int(slot)
+                for slot in best.family.representative_onset_slots
+                if int(slot) not in set(monophonic_block.onset_slots)
             ],
             observed_pitch_sequence=list(incomplete_block.pitch_sequence),
             observed_relative_onsets_sec=list(incomplete_block.relative_onsets_sec),
@@ -779,6 +987,8 @@ def _complete_incomplete_block(
             reason="rejected_validation",
             match_reason=f"{best.reason}. All proposed notes rejected during validation.",
             missing_notes_to_insert=[],
+            inserted_notes=[],
+            rejected_candidate_notes=rejected_candidates,
             confidence_level=_confidence_from_score(best.score),
             action="skipped",
         )
@@ -788,6 +998,8 @@ def _complete_incomplete_block(
         block_type="incomplete_existing_block",
         incomplete_block_id=incomplete_block.block_id,
         target_bar_index=incomplete_block.bar_index,
+        target_start_sec=incomplete_block.start_sec,
+        target_end_sec=incomplete_block.end_sec,
         start_sec=incomplete_block.start_sec,
         end_sec=incomplete_block.end_sec,
         start_beat=incomplete_block.start_beat,
@@ -796,17 +1008,28 @@ def _complete_incomplete_block(
         missing_slots=[
             slot
             for slot in best.family.representative_onset_slots
-            if slot not in set(incomplete_block.occupied_slots)
+            if slot not in set(monophonic_block.onset_slots)
+        ],
+        onset_slots_observed=list(monophonic_block.onset_slots),
+        onset_slots_expected=[int(slot) for slot in best.family.representative_onset_slots],
+        onset_slots_missing=[
+            int(slot)
+            for slot in best.family.representative_onset_slots
+            if int(slot) not in set(monophonic_block.onset_slots)
         ],
         observed_pitch_sequence=list(incomplete_block.pitch_sequence),
         observed_relative_onsets_sec=list(incomplete_block.relative_onsets_sec),
         possible_matches=match_models,
         best_match_pattern_family_id=best.family.pattern_family_id,
+        source_pattern_family_id=best.family.pattern_family_id,
+        source_family_occurrence_count=best.family.occurrence_count,
         reason="completed",
         match_reason=(
             f"{best.reason}. Proposed={len(proposed)} accepted={len(validated)} rejected={rejected_count}."
         ),
         missing_notes_to_insert=validated,
+        inserted_notes=validated,
+        rejected_candidate_notes=rejected_candidates,
         confidence_level=_confidence_from_score(best.score),
         action="completed",
     )
@@ -866,32 +1089,46 @@ def _detect_missing_expected_blocks(
                 if block.note_count > sparse_threshold:
                     continue
 
-                observed_slots = list(block.occupied_slots)
+                observed_slots = list(block.onset_slots)
+                expected_slots = [int(slot) for slot in family.representative_onset_slots]
                 missing_slots = [
                     slot
-                    for slot in family.representative_onset_slots
+                    for slot in expected_slots
                     if slot not in set(observed_slots)
                 ]
                 if not missing_slots:
                     continue
 
+                required_missing = max(1, int(math.ceil(len(expected_slots) * 0.5)))
+                if len(missing_slots) < required_missing:
+                    continue
+
                 sparsity_score = 1.0 - min(1.0, block.note_count / float(sparse_threshold + 1))
+                missing_coverage = len(missing_slots) / float(max(1, len(expected_slots)))
+                gap_strength = min(1.0, float(max(0, bar_gap - 1)) / max(1.0, typical_period))
+                empty_bonus = 0.10 if block.note_count == 0 else 0.0
                 confidence_score = max(
                     0.0,
                     min(
                         1.0,
-                        0.35
-                        + (0.20 * min(1.0, family.occurrence_count / 5.0))
-                        + (0.25 * stability)
-                        + (0.20 * sparsity_score),
+                        0.45
+                        + (0.20 * min(1.0, family.occurrence_count / 4.0))
+                        + (0.15 * stability)
+                        + (0.15 * missing_coverage)
+                        + (0.10 * sparsity_score)
+                        + (0.10 * gap_strength)
+                        + empty_bonus,
                     ),
                 )
+
+                before_block = blocks_by_bar.get(before_bar)
+                after_block = blocks_by_bar.get(after_bar)
 
                 candidate_counter += 1
                 reason = (
                     "missing_expected_pattern_occurrence; "
                     f"bar_gap={bar_gap} period={typical_period:.2f} stability={stability:.2f} "
-                    f"notes_in_bar={block.note_count}"
+                    f"notes_in_bar={block.note_count} missing_onsets={len(missing_slots)}/{len(expected_slots)}"
                 )
                 candidates.append(
                     MissingExpectedBlock(
@@ -906,8 +1143,8 @@ def _detect_missing_expected_blocks(
                         expected_duration_beat=round(block.block_length_beats, 6),
                         observed_slots=observed_slots,
                         missing_slots=missing_slots,
-                        evidence_before_occurrences=[f"bar_{before_bar + 1:04d}"],
-                        evidence_after_occurrences=[f"bar_{after_bar + 1:04d}"],
+                        evidence_before_occurrences=[before_block.block_id] if before_block is not None else [],
+                        evidence_after_occurrences=[after_block.block_id] if after_block is not None else [],
                         detected_note_count_in_region=block.note_count,
                         confidence_score=round(confidence_score, 6),
                         possible_matches=[
@@ -940,6 +1177,8 @@ def _complete_missing_expected_blocks(
     blocks_by_id: dict[str, PatternBlock],
     families: list[PatternFamily],
     base_notes: list[_BaseNote],
+    local_thresholds: _LocalNoteThresholds,
+    stats: _CompletionStats,
 ) -> tuple[list[IncompleteBlockReport], list[ProposedCompletionNote]]:
     if not missing_expected_blocks:
         return [], []
@@ -995,6 +1234,8 @@ def _complete_missing_expected_blocks(
                     block_type="missing_expected_block",
                     missing_block_id=best.missing_block_id,
                     target_bar_index=best.target_bar_index,
+                    target_start_sec=best.write_start_sec,
+                    target_end_sec=best.write_end_sec,
                     expected_pattern_family_id=None,
                     start_sec=best.write_start_sec,
                     end_sec=best.write_end_sec,
@@ -1009,6 +1250,9 @@ def _complete_missing_expected_blocks(
                     evidence_before_occurrences=list(best.evidence_before_occurrences),
                     evidence_after_occurrences=list(best.evidence_after_occurrences),
                     observed_note_count_in_region=best.detected_note_count_in_region,
+                    onset_slots_observed=list(best.observed_slots),
+                    onset_slots_expected=[],
+                    onset_slots_missing=list(best.missing_slots),
                     observed_slots=list(best.observed_slots),
                     missing_slots=list(best.missing_slots),
                     possible_matches=possible_matches,
@@ -1020,18 +1264,23 @@ def _complete_missing_expected_blocks(
                         f"{second.expected_pattern_family_id}={second.confidence_score:.3f}"
                     ),
                     missing_notes_to_insert=[],
+                    inserted_notes=[],
+                    rejected_candidate_notes=[],
                     confidence_level="low",
                     action="skipped",
                 )
             )
             continue
 
-        if best.expected_pattern_family_id is None or best.confidence_score < 0.62:
+        if best.expected_pattern_family_id is None or best.confidence_score < 0.85:
+            stats.rejected_low_confidence_count += 1
             reports.append(
                 IncompleteBlockReport(
                     block_type="missing_expected_block",
                     missing_block_id=best.missing_block_id,
                     target_bar_index=best.target_bar_index,
+                    target_start_sec=best.write_start_sec,
+                    target_end_sec=best.write_end_sec,
                     expected_pattern_family_id=best.expected_pattern_family_id,
                     start_sec=best.write_start_sec,
                     end_sec=best.write_end_sec,
@@ -1046,13 +1295,24 @@ def _complete_missing_expected_blocks(
                     evidence_before_occurrences=list(best.evidence_before_occurrences),
                     evidence_after_occurrences=list(best.evidence_after_occurrences),
                     observed_note_count_in_region=best.detected_note_count_in_region,
+                    onset_slots_observed=list(best.observed_slots),
+                    onset_slots_expected=[],
+                    onset_slots_missing=list(best.missing_slots),
                     observed_slots=list(best.observed_slots),
                     missing_slots=list(best.missing_slots),
                     possible_matches=possible_matches,
                     best_match_pattern_family_id=best.expected_pattern_family_id,
+                    source_pattern_family_id=best.expected_pattern_family_id,
                     reason="no_clear_family",
-                    match_reason="No clear deterministic family evidence for missing expected block.",
+                    match_reason="Low confidence deterministic candidate; only high confidence completions are allowed.",
                     missing_notes_to_insert=[],
+                    inserted_notes=[],
+                    rejected_candidate_notes=[
+                        {
+                            "note_id": best.missing_block_id,
+                            "reason": "low_confidence",
+                        }
+                    ],
                     confidence_level="low",
                     action="skipped",
                 )
@@ -1087,6 +1347,8 @@ def _complete_missing_expected_blocks(
                     block_type="missing_expected_block",
                     missing_block_id=best.missing_block_id,
                     target_bar_index=best.target_bar_index,
+                    target_start_sec=best.write_start_sec,
+                    target_end_sec=best.write_end_sec,
                     expected_pattern_family_id=best.expected_pattern_family_id,
                     start_sec=best.write_start_sec,
                     end_sec=best.write_end_sec,
@@ -1101,13 +1363,105 @@ def _complete_missing_expected_blocks(
                     evidence_before_occurrences=list(best.evidence_before_occurrences),
                     evidence_after_occurrences=list(best.evidence_after_occurrences),
                     observed_note_count_in_region=best.detected_note_count_in_region,
+                    onset_slots_observed=list(best.observed_slots),
+                    onset_slots_expected=[],
+                    onset_slots_missing=list(best.missing_slots),
                     observed_slots=list(best.observed_slots),
                     missing_slots=list(best.missing_slots),
                     possible_matches=possible_matches,
                     best_match_pattern_family_id=best.expected_pattern_family_id,
+                    source_pattern_family_id=best.expected_pattern_family_id,
                     reason="no_clear_family",
                     match_reason="No clear deterministic family payload for missing expected block.",
                     missing_notes_to_insert=[],
+                    inserted_notes=[],
+                    rejected_candidate_notes=[],
+                    confidence_level="low",
+                    action="skipped",
+                )
+            )
+            continue
+
+        if family.occurrence_count < 2:
+            stats.rejected_low_confidence_count += 1
+            reports.append(
+                IncompleteBlockReport(
+                    block_type="missing_expected_block",
+                    missing_block_id=best.missing_block_id,
+                    target_bar_index=best.target_bar_index,
+                    target_start_sec=best.write_start_sec,
+                    target_end_sec=best.write_end_sec,
+                    expected_pattern_family_id=best.expected_pattern_family_id,
+                    source_pattern_family_id=family.pattern_family_id,
+                    source_family_occurrence_count=family.occurrence_count,
+                    start_sec=best.write_start_sec,
+                    end_sec=best.write_end_sec,
+                    start_beat=best.write_start_beat,
+                    end_beat=best.write_end_beat,
+                    write_start_sec=best.write_start_sec,
+                    write_end_sec=best.write_end_sec,
+                    write_start_beat=best.write_start_beat,
+                    write_end_beat=best.write_end_beat,
+                    expected_duration_sec=best.expected_duration_sec,
+                    expected_duration_beat=best.expected_duration_beat,
+                    evidence_before_occurrences=list(best.evidence_before_occurrences),
+                    evidence_after_occurrences=list(best.evidence_after_occurrences),
+                    observed_note_count_in_region=best.detected_note_count_in_region,
+                    onset_slots_observed=list(best.observed_slots),
+                    onset_slots_expected=[int(slot) for slot in family.representative_onset_slots],
+                    onset_slots_missing=list(best.missing_slots),
+                    observed_slots=list(best.observed_slots),
+                    missing_slots=list(best.missing_slots),
+                    possible_matches=possible_matches,
+                    best_match_pattern_family_id=family.pattern_family_id,
+                    reason="no_clear_family",
+                    match_reason="Family occurrence evidence too weak for missing-expected completion.",
+                    missing_notes_to_insert=[],
+                    inserted_notes=[],
+                    rejected_candidate_notes=[{"note_id": best.missing_block_id, "reason": "insufficient_family_evidence"}],
+                    confidence_level="low",
+                    action="skipped",
+                )
+            )
+            continue
+
+        if (best.write_end_sec - best.write_start_sec) < max(0.25, local_thresholds.min_duration_sec * 1.5):
+            stats.rejected_tiny_gap_count += 1
+            reports.append(
+                IncompleteBlockReport(
+                    block_type="missing_expected_block",
+                    missing_block_id=best.missing_block_id,
+                    target_bar_index=best.target_bar_index,
+                    target_start_sec=best.write_start_sec,
+                    target_end_sec=best.write_end_sec,
+                    expected_pattern_family_id=best.expected_pattern_family_id,
+                    source_pattern_family_id=family.pattern_family_id,
+                    source_family_occurrence_count=family.occurrence_count,
+                    start_sec=best.write_start_sec,
+                    end_sec=best.write_end_sec,
+                    start_beat=best.write_start_beat,
+                    end_beat=best.write_end_beat,
+                    write_start_sec=best.write_start_sec,
+                    write_end_sec=best.write_end_sec,
+                    write_start_beat=best.write_start_beat,
+                    write_end_beat=best.write_end_beat,
+                    expected_duration_sec=best.expected_duration_sec,
+                    expected_duration_beat=best.expected_duration_beat,
+                    evidence_before_occurrences=list(best.evidence_before_occurrences),
+                    evidence_after_occurrences=list(best.evidence_after_occurrences),
+                    observed_note_count_in_region=best.detected_note_count_in_region,
+                    onset_slots_observed=list(best.observed_slots),
+                    onset_slots_expected=[int(slot) for slot in family.representative_onset_slots],
+                    onset_slots_missing=list(best.missing_slots),
+                    observed_slots=list(best.observed_slots),
+                    missing_slots=list(best.missing_slots),
+                    possible_matches=possible_matches,
+                    best_match_pattern_family_id=family.pattern_family_id,
+                    reason="rejected_tiny_gap",
+                    match_reason="Target write region too tiny for meaningful completion.",
+                    missing_notes_to_insert=[],
+                    inserted_notes=[],
+                    rejected_candidate_notes=[{"note_id": best.missing_block_id, "reason": "tiny_gap"}],
                     confidence_level="low",
                     action="skipped",
                 )
@@ -1120,6 +1474,8 @@ def _complete_missing_expected_blocks(
             blocks_by_id=blocks_by_id,
             base_notes=base_notes,
             possible_matches=possible_matches,
+            local_thresholds=local_thresholds,
+            stats=stats,
         )
         reports.append(report)
         inserted_notes.extend(notes)
@@ -1134,6 +1490,8 @@ def _complete_missing_expected_block(
     blocks_by_id: dict[str, PatternBlock],
     base_notes: list[_BaseNote],
     possible_matches: list[IncompleteBlockMatch],
+    local_thresholds: _LocalNoteThresholds,
+    stats: _CompletionStats,
 ) -> tuple[IncompleteBlockReport, list[ProposedCompletionNote]]:
     exemplar_block = _find_exemplar_block(family, blocks_by_id)
     if exemplar_block is None:
@@ -1141,7 +1499,11 @@ def _complete_missing_expected_block(
             block_type="missing_expected_block",
             missing_block_id=missing_expected_block.missing_block_id,
             target_bar_index=missing_expected_block.target_bar_index,
+            target_start_sec=missing_expected_block.write_start_sec,
+            target_end_sec=missing_expected_block.write_end_sec,
             expected_pattern_family_id=family.pattern_family_id,
+            source_pattern_family_id=family.pattern_family_id,
+            source_family_occurrence_count=family.occurrence_count,
             start_sec=missing_expected_block.write_start_sec,
             end_sec=missing_expected_block.write_end_sec,
             start_beat=missing_expected_block.write_start_beat,
@@ -1155,6 +1517,9 @@ def _complete_missing_expected_block(
             evidence_before_occurrences=list(missing_expected_block.evidence_before_occurrences),
             evidence_after_occurrences=list(missing_expected_block.evidence_after_occurrences),
             observed_note_count_in_region=missing_expected_block.detected_note_count_in_region,
+            onset_slots_observed=list(missing_expected_block.observed_slots),
+            onset_slots_expected=[int(slot) for slot in family.representative_onset_slots],
+            onset_slots_missing=list(missing_expected_block.missing_slots),
             observed_slots=list(missing_expected_block.observed_slots),
             missing_slots=list(missing_expected_block.missing_slots),
             possible_matches=possible_matches,
@@ -1162,6 +1527,8 @@ def _complete_missing_expected_block(
             reason="no_clear_family",
             match_reason="No clear deterministic family payload for missing expected block.",
             missing_notes_to_insert=[],
+            inserted_notes=[],
+            rejected_candidate_notes=[],
             confidence_level="low",
             action="skipped",
         )
@@ -1171,28 +1538,46 @@ def _complete_missing_expected_block(
         missing_expected_block=missing_expected_block,
         family=family,
         exemplar_block=exemplar_block,
+        local_thresholds=local_thresholds,
     )
 
     validated: list[ProposedCompletionNote] = []
     rejected_count = 0
+    rejected_candidates: list[dict[str, object]] = []
     for note in proposed:
         reason = _validate_missing_expected_note(
             note=note,
             missing_expected_block=missing_expected_block,
             family=family,
             base_notes=base_notes,
+            local_thresholds=local_thresholds,
+            stats=stats,
+            accepted_notes=validated,
         )
         if reason is None:
             validated.append(note)
         else:
             rejected_count += 1
+            rejected_candidates.append(
+                {
+                    "note_id": note.note_id,
+                    "pitch_midi": note.pitch_midi,
+                    "start_sec": note.start_sec,
+                    "end_sec": note.end_sec,
+                    "reason": reason,
+                }
+            )
 
     if not validated:
         report = IncompleteBlockReport(
             block_type="missing_expected_block",
             missing_block_id=missing_expected_block.missing_block_id,
             target_bar_index=missing_expected_block.target_bar_index,
+            target_start_sec=missing_expected_block.write_start_sec,
+            target_end_sec=missing_expected_block.write_end_sec,
             expected_pattern_family_id=family.pattern_family_id,
+            source_pattern_family_id=family.pattern_family_id,
+            source_family_occurrence_count=family.occurrence_count,
             start_sec=missing_expected_block.write_start_sec,
             end_sec=missing_expected_block.write_end_sec,
             start_beat=missing_expected_block.write_start_beat,
@@ -1206,6 +1591,9 @@ def _complete_missing_expected_block(
             evidence_before_occurrences=list(missing_expected_block.evidence_before_occurrences),
             evidence_after_occurrences=list(missing_expected_block.evidence_after_occurrences),
             observed_note_count_in_region=missing_expected_block.detected_note_count_in_region,
+            onset_slots_observed=list(missing_expected_block.observed_slots),
+            onset_slots_expected=[int(slot) for slot in family.representative_onset_slots],
+            onset_slots_missing=list(missing_expected_block.missing_slots),
             observed_slots=list(missing_expected_block.observed_slots),
             missing_slots=list(missing_expected_block.missing_slots),
             possible_matches=possible_matches,
@@ -1216,6 +1604,8 @@ def _complete_missing_expected_block(
                 f"All proposed notes rejected during validation (rejected={rejected_count})."
             ),
             missing_notes_to_insert=[],
+            inserted_notes=[],
+            rejected_candidate_notes=rejected_candidates,
             confidence_level=_confidence_from_score(missing_expected_block.confidence_score),
             action="skipped",
         )
@@ -1225,7 +1615,11 @@ def _complete_missing_expected_block(
         block_type="missing_expected_block",
         missing_block_id=missing_expected_block.missing_block_id,
         target_bar_index=missing_expected_block.target_bar_index,
+        target_start_sec=missing_expected_block.write_start_sec,
+        target_end_sec=missing_expected_block.write_end_sec,
         expected_pattern_family_id=family.pattern_family_id,
+        source_pattern_family_id=family.pattern_family_id,
+        source_family_occurrence_count=family.occurrence_count,
         start_sec=missing_expected_block.write_start_sec,
         end_sec=missing_expected_block.write_end_sec,
         start_beat=missing_expected_block.write_start_beat,
@@ -1239,6 +1633,9 @@ def _complete_missing_expected_block(
         evidence_before_occurrences=list(missing_expected_block.evidence_before_occurrences),
         evidence_after_occurrences=list(missing_expected_block.evidence_after_occurrences),
         observed_note_count_in_region=missing_expected_block.detected_note_count_in_region,
+        onset_slots_observed=list(missing_expected_block.observed_slots),
+        onset_slots_expected=[int(slot) for slot in family.representative_onset_slots],
+        onset_slots_missing=list(missing_expected_block.missing_slots),
         observed_slots=list(missing_expected_block.observed_slots),
         missing_slots=list(missing_expected_block.missing_slots),
         possible_matches=possible_matches,
@@ -1249,6 +1646,8 @@ def _complete_missing_expected_block(
             f"Proposed={len(proposed)} accepted={len(validated)} rejected={rejected_count}."
         ),
         missing_notes_to_insert=validated,
+        inserted_notes=validated,
+        rejected_candidate_notes=rejected_candidates,
         confidence_level=_confidence_from_score(missing_expected_block.confidence_score),
         action="completed",
     )
@@ -1260,12 +1659,15 @@ def _propose_missing_expected_notes(
     missing_expected_block: MissingExpectedBlock,
     family: PatternFamily,
     exemplar_block: PatternBlock,
+    local_thresholds: _LocalNoteThresholds,
 ) -> list[ProposedCompletionNote]:
-    exemplar_notes = exemplar_block.notes
+    exemplar_notes = _monophonic_block_view(exemplar_block).notes
     if not exemplar_notes:
         return []
 
     reference_velocity = int(statistics.median(note.velocity for note in exemplar_notes)) if exemplar_notes else 90
+    normalized_velocity = int(round((reference_velocity + local_thresholds.median_velocity) / 2.0))
+    normalized_velocity = max(local_thresholds.min_velocity, min(127, normalized_velocity))
     reference_channel = exemplar_notes[0].channel if exemplar_notes else 0
 
     grid_division = _grid_division_from_text(family.grid_resolution)
@@ -1323,7 +1725,7 @@ def _propose_missing_expected_notes(
                 duration_sec=round(max(1e-6, end_sec - start_sec), 6),
                 pitch_midi=int(exemplar_note.pitch_midi),
                 pitch_name=exemplar_note.pitch_name,
-                velocity=int(reference_velocity),
+                velocity=int(normalized_velocity),
                 channel=reference_channel,
             )
         )
@@ -1338,6 +1740,9 @@ def _validate_missing_expected_note(
     missing_expected_block: MissingExpectedBlock,
     family: PatternFamily,
     base_notes: list[_BaseNote],
+    local_thresholds: _LocalNoteThresholds,
+    stats: _CompletionStats,
+    accepted_notes: list[ProposedCompletionNote],
 ) -> str | None:
     if note.end_sec <= note.start_sec:
         return "invalid_duration"
@@ -1362,14 +1767,28 @@ def _validate_missing_expected_note(
     if note.pitch_midi < min(family.representative_pitch_set) or note.pitch_midi > max(family.representative_pitch_set):
         return "outside_pattern_pitch_range"
 
-    if note.duration_sec <= 0.01:
-        return "timing_not_matching_pattern"
+    if note.duration_sec < local_thresholds.min_duration_sec:
+        stats.rejected_micro_note_count += 1
+        return "micro_note"
+
+    if note.velocity < local_thresholds.min_velocity:
+        return "artifact_low_velocity"
 
     family_durations = family.representative_durations_sec
     if family_durations:
         median_duration = statistics.median(family_durations)
         if note.duration_sec > max(0.35, median_duration * 1.8):
             return "timing_not_matching_pattern"
+
+    for existing in accepted_notes:
+        onset_delta = abs(existing.start_sec - note.start_sec)
+        overlap = min(existing.end_sec, note.end_sec) - max(existing.start_sec, note.start_sec)
+        if onset_delta <= 0.03:
+            stats.rejected_polyphonic_stack_count += 1
+            return "polyphonic_stack"
+        if overlap > 0.0:
+            stats.rejected_polyphonic_stack_count += 1
+            return "polyphonic_overlap"
 
     return _collision_with_base_notes(note=note, base_notes=base_notes)
 
@@ -1397,26 +1816,27 @@ def _compatible_group_key(block: PatternBlock) -> tuple[int, tuple[int, ...], tu
 
 
 def _family_from_block(*, block: PatternBlock, family_id: str) -> PatternFamily:
+    mono = _monophonic_block_view(block)
     return PatternFamily(
         pattern_family_id=family_id,
-        block_length_beats=float(block.block_length_beats),
-        time_signature=block.time_signature,
-        grid_resolution=block.grid_resolution,
-        representative_onset_slots=[int(note.onset_slot or 0) for note in block.notes],
-        representative_duration_slots=[int(note.duration_slots or 1) for note in block.notes],
-        representative_relative_onsets_beat=list(block.relative_onsets_beat),
-        representative_relative_durations_beat=list(block.relative_durations_beat),
-        representative_pitch_sequence=list(block.pitch_sequence),
-        representative_interval_sequence=list(block.interval_sequence),
-        representative_relative_onsets_sec=list(block.relative_onsets_sec),
-        representative_durations_sec=list(block.relative_durations_sec),
-        representative_pitch_set=list(block.pitch_set),
-        representative_note_count=block.note_count,
+        block_length_beats=float(mono.block_length_beats),
+        time_signature=mono.time_signature,
+        grid_resolution=mono.grid_resolution,
+        representative_onset_slots=[int(note.onset_slot or 0) for note in mono.notes],
+        representative_duration_slots=[int(note.duration_slots or 1) for note in mono.notes],
+        representative_relative_onsets_beat=list(mono.relative_onsets_beat),
+        representative_relative_durations_beat=list(mono.relative_durations_beat),
+        representative_pitch_sequence=list(mono.pitch_sequence),
+        representative_interval_sequence=list(mono.interval_sequence),
+        representative_relative_onsets_sec=list(mono.relative_onsets_sec),
+        representative_durations_sec=list(mono.relative_durations_sec),
+        representative_pitch_set=list(mono.pitch_set),
+        representative_note_count=mono.note_count,
         occurrence_count=1,
-        occurrence_bars=[block.bar_index],
-        occurrences=[block.block_id],
-        first_seen_sec=block.start_sec,
-        last_seen_sec=block.end_sec,
+        occurrence_bars=[mono.bar_index],
+        occurrences=[mono.block_id],
+        first_seen_sec=mono.start_sec,
+        last_seen_sec=mono.end_sec,
     )
 
 
@@ -1575,6 +1995,7 @@ def _propose_missing_notes(
     incomplete_block: PatternBlock,
     family: PatternFamily,
     exemplar_block: PatternBlock,
+    local_thresholds: _LocalNoteThresholds,
 ) -> list[ProposedCompletionNote]:
     observed_count = len(incomplete_block.pitch_sequence)
     family_count = len(family.representative_pitch_sequence)
@@ -1608,11 +2029,17 @@ def _propose_missing_notes(
             if not aligned:
                 missing_indices.append(index)
 
-    exemplar_notes = exemplar_block.notes
+    exemplar_notes = _monophonic_block_view(exemplar_block).notes
     if not exemplar_notes:
         return proposals
 
-    reference_velocity = int(statistics.median(note.velocity for note in incomplete_block.notes)) if incomplete_block.notes else 90
+    reference_velocity = (
+        int(statistics.median(note.velocity for note in incomplete_block.notes))
+        if incomplete_block.notes
+        else int(statistics.median(note.velocity for note in exemplar_notes))
+    )
+    normalized_velocity = int(round((reference_velocity + local_thresholds.median_velocity) / 2.0))
+    normalized_velocity = max(local_thresholds.min_velocity, min(127, normalized_velocity))
     reference_channel = incomplete_block.notes[0].channel if incomplete_block.notes else 0
 
     for missing_index in missing_indices:
@@ -1654,7 +2081,7 @@ def _propose_missing_notes(
                 duration_sec=round(max(1e-6, end_sec - start_sec), 6),
                 pitch_midi=int(exemplar_note.pitch_midi),
                 pitch_name=exemplar_note.pitch_name,
-                velocity=int(reference_velocity),
+                velocity=int(normalized_velocity),
                 channel=reference_channel,
             )
         )
@@ -1700,6 +2127,9 @@ def _validate_proposed_note(
     incomplete_block: PatternBlock,
     family: PatternFamily,
     base_notes: list[_BaseNote],
+    local_thresholds: _LocalNoteThresholds,
+    stats: _CompletionStats,
+    accepted_notes: list[ProposedCompletionNote],
 ) -> str | None:
     if note.end_sec <= note.start_sec:
         return "invalid_duration"
@@ -1721,11 +2151,28 @@ def _validate_proposed_note(
     if note.pitch_midi < min(family.representative_pitch_set) or note.pitch_midi > max(family.representative_pitch_set):
         return "outside_pattern_pitch_range"
 
+    if note.duration_sec < local_thresholds.min_duration_sec:
+        stats.rejected_micro_note_count += 1
+        return "micro_note"
+
+    if note.velocity < local_thresholds.min_velocity:
+        return "artifact_low_velocity"
+
     family_durations = family.representative_durations_sec
     if family_durations:
         median_duration = statistics.median(family_durations)
         if note.duration_sec <= 0.01 or abs(note.duration_sec - median_duration) > max(0.25, median_duration * 0.85):
             return "timing_not_matching_pattern"
+
+    for existing in accepted_notes:
+        onset_delta = abs(existing.start_sec - note.start_sec)
+        overlap = min(existing.end_sec, note.end_sec) - max(existing.start_sec, note.start_sec)
+        if onset_delta <= 0.03:
+            stats.rejected_polyphonic_stack_count += 1
+            return "polyphonic_stack"
+        if overlap > 0.0:
+            stats.rejected_polyphonic_stack_count += 1
+            return "polyphonic_overlap"
 
     return _collision_with_base_notes(note=note, base_notes=base_notes)
 
@@ -1755,7 +2202,30 @@ def _confidence_from_score(score: float) -> str:
     return "low"
 
 
-def _dedupe_inserted_notes(notes: list[ProposedCompletionNote]) -> list[ProposedCompletionNote]:
+def _prefer_monophonic_note(
+    left: ProposedCompletionNote,
+    right: ProposedCompletionNote,
+) -> ProposedCompletionNote:
+    left_key = (
+        int(left.pitch_midi),
+        -float(left.duration_sec),
+        -int(left.velocity),
+        str(left.source_pattern_family_id),
+    )
+    right_key = (
+        int(right.pitch_midi),
+        -float(right.duration_sec),
+        -int(right.velocity),
+        str(right.source_pattern_family_id),
+    )
+    return left if left_key <= right_key else right
+
+
+def _dedupe_inserted_notes(
+    notes: list[ProposedCompletionNote],
+    *,
+    stats: _CompletionStats | None = None,
+) -> list[ProposedCompletionNote]:
     deduped: dict[tuple[int, int, int], ProposedCompletionNote] = {}
     for note in notes:
         key = (
@@ -1771,7 +2241,29 @@ def _dedupe_inserted_notes(notes: list[ProposedCompletionNote]) -> list[Proposed
         if note.source_pattern_family_id < existing.source_pattern_family_id:
             deduped[key] = note
 
-    return sorted(deduped.values(), key=lambda item: (item.start_sec, item.end_sec, item.pitch_midi))
+    ordered = sorted(deduped.values(), key=lambda item: (item.start_sec, item.end_sec, item.pitch_midi))
+    monophonic: list[ProposedCompletionNote] = []
+    for note in ordered:
+        replacement_index: int | None = None
+        for index, existing in enumerate(monophonic):
+            onset_delta = abs(float(existing.start_sec) - float(note.start_sec))
+            overlap = min(float(existing.end_sec), float(note.end_sec)) - max(float(existing.start_sec), float(note.start_sec))
+            if onset_delta <= 0.03 or overlap > 0.0:
+                replacement_index = index
+                break
+
+        if replacement_index is None:
+            monophonic.append(note)
+            continue
+
+        chosen = _prefer_monophonic_note(monophonic[replacement_index], note)
+        if chosen is not monophonic[replacement_index] and stats is not None:
+            stats.rejected_polyphonic_stack_count += 1
+        elif stats is not None:
+            stats.rejected_polyphonic_stack_count += 1
+        monophonic[replacement_index] = chosen
+
+    return sorted(monophonic, key=lambda item: (item.start_sec, item.end_sec, item.pitch_midi))
 
 
 def _write_completion_midi(

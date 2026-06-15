@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 
 import mido
+import pytest
 
+import midi_cleaner.pattern.service as pattern_service
 from midi_cleaner.pattern import (
     PatternCompletionParameters,
     complete_pattern_blocks,
@@ -16,6 +18,34 @@ _TPB = 480
 _BEATS_PER_BAR = 4
 _BAR_TICKS = _TPB * _BEATS_PER_BAR
 _PATTERN_A = [36, 33, 38, 31]
+_TEMPO_US = 500000
+
+
+def _append_note_event(
+    events: list[tuple[int, int, mido.Message]],
+    *,
+    bar_index: int,
+    start_beat: float,
+    duration_beat: float,
+    pitch: int,
+    velocity: int = 96,
+) -> None:
+    start_tick = int(round((bar_index * _BAR_TICKS) + (start_beat * _TPB)))
+    end_tick = start_tick + max(1, int(round(duration_beat * _TPB)))
+    events.append(
+        (
+            start_tick,
+            1,
+            mido.Message("note_on", note=int(pitch), velocity=int(velocity), channel=0, time=0),
+        )
+    )
+    events.append(
+        (
+            end_tick,
+            0,
+            mido.Message("note_off", note=int(pitch), velocity=0, channel=0, time=0),
+        )
+    )
 
 
 def _append_pattern_events(
@@ -25,25 +55,29 @@ def _append_pattern_events(
     pattern: list[int],
     note_count: int | None = None,
     velocity: int = 96,
+    durations_beat: float | list[float] = 0.5,
+    stacked_intervals: list[int] | None = None,
 ) -> None:
     count = len(pattern) if note_count is None else max(0, min(note_count, len(pattern)))
     for index, pitch in enumerate(pattern[:count]):
-        start_tick = (bar_index * _BAR_TICKS) + (index * _TPB)
-        end_tick = start_tick + (_TPB // 2)
-        events.append(
-            (
-                start_tick,
-                1,
-                mido.Message("note_on", note=int(pitch), velocity=int(velocity), channel=0, time=0),
-            )
+        duration_beat = durations_beat[index] if isinstance(durations_beat, list) else durations_beat
+        _append_note_event(
+            events,
+            bar_index=bar_index,
+            start_beat=float(index),
+            duration_beat=float(duration_beat),
+            pitch=int(pitch),
+            velocity=velocity,
         )
-        events.append(
-            (
-                end_tick,
-                0,
-                mido.Message("note_off", note=int(pitch), velocity=0, channel=0, time=0),
+        for interval in stacked_intervals or []:
+            _append_note_event(
+                events,
+                bar_index=bar_index,
+                start_beat=float(index),
+                duration_beat=float(duration_beat),
+                pitch=int(pitch + interval),
+                velocity=max(1, int(velocity - 12)),
             )
-        )
 
 
 def _append_collision_note(
@@ -52,10 +86,14 @@ def _append_collision_note(
     bar_index: int,
     pitch: int,
 ) -> None:
-    start_tick = (bar_index * _BAR_TICKS) + (2 * _TPB)
-    end_tick = start_tick + (_TPB // 2)
-    events.append((start_tick, 1, mido.Message("note_on", note=pitch, velocity=72, channel=0, time=0)))
-    events.append((end_tick, 0, mido.Message("note_off", note=pitch, velocity=0, channel=0, time=0)))
+    _append_note_event(
+        events,
+        bar_index=bar_index,
+        start_beat=2.0,
+        duration_beat=0.5,
+        pitch=pitch,
+        velocity=72,
+    )
 
 
 def _write_working_midi(path: Path, *, scenario: str) -> None:
@@ -64,7 +102,7 @@ def _write_working_midi(path: Path, *, scenario: str) -> None:
     midi = mido.MidiFile(ticks_per_beat=_TPB)
     track = mido.MidiTrack()
     midi.tracks.append(track)
-    track.append(mido.MetaMessage("set_tempo", tempo=500000, time=0))
+    track.append(mido.MetaMessage("set_tempo", tempo=_TEMPO_US, time=0))
     track.append(mido.MetaMessage("time_signature", numerator=4, denominator=4, time=0))
 
     events: list[tuple[int, int, mido.Message]] = []
@@ -76,10 +114,46 @@ def _write_working_midi(path: Path, *, scenario: str) -> None:
     elif scenario == "missing_empty":
         _append_pattern_events(events, bar_index=0, pattern=_PATTERN_A, note_count=4, velocity=96)
         _append_pattern_events(events, bar_index=2, pattern=_PATTERN_A, note_count=4, velocity=94)
+    elif scenario == "missing_sparse":
+        _append_pattern_events(events, bar_index=0, pattern=_PATTERN_A, note_count=4, velocity=96)
+        _append_note_event(events, bar_index=1, start_beat=1.0, duration_beat=0.5, pitch=29, velocity=70)
+        _append_pattern_events(events, bar_index=2, pattern=_PATTERN_A, note_count=4, velocity=94)
     elif scenario == "missing_collision":
         _append_pattern_events(events, bar_index=0, pattern=_PATTERN_A, note_count=4, velocity=96)
         _append_collision_note(events, bar_index=1, pitch=38)
         _append_pattern_events(events, bar_index=2, pattern=_PATTERN_A, note_count=4, velocity=94)
+    elif scenario == "sustained_onset":
+        _append_note_event(events, bar_index=0, start_beat=0.0, duration_beat=3.0, pitch=36, velocity=94)
+        _append_note_event(events, bar_index=0, start_beat=3.0, duration_beat=0.5, pitch=33, velocity=90)
+        _append_pattern_events(events, bar_index=1, pattern=_PATTERN_A, note_count=4, velocity=92)
+    elif scenario == "stacked_source":
+        _append_pattern_events(
+            events,
+            bar_index=0,
+            pattern=_PATTERN_A,
+            note_count=4,
+            velocity=96,
+            stacked_intervals=[12],
+        )
+        _append_pattern_events(events, bar_index=1, pattern=_PATTERN_A, note_count=2, velocity=92)
+        _append_pattern_events(
+            events,
+            bar_index=2,
+            pattern=_PATTERN_A,
+            note_count=4,
+            velocity=94,
+            stacked_intervals=[12],
+        )
+    elif scenario == "micro_candidate":
+        durations = [1.0, 1.0, 1.0, 0.125]
+        _append_pattern_events(events, bar_index=0, pattern=_PATTERN_A, note_count=4, velocity=96, durations_beat=durations)
+        _append_pattern_events(events, bar_index=1, pattern=_PATTERN_A, note_count=3, velocity=90, durations_beat=durations)
+        _append_pattern_events(events, bar_index=2, pattern=_PATTERN_A, note_count=4, velocity=94, durations_beat=durations)
+    elif scenario == "large_gap_missing":
+        _append_pattern_events(events, bar_index=0, pattern=_PATTERN_A, note_count=4, velocity=96)
+        _append_pattern_events(events, bar_index=1, pattern=_PATTERN_A, note_count=4, velocity=94)
+        _append_pattern_events(events, bar_index=4, pattern=_PATTERN_A, note_count=4, velocity=95)
+        _append_pattern_events(events, bar_index=5, pattern=_PATTERN_A, note_count=4, velocity=93)
     else:
         raise AssertionError(f"Unsupported scenario: {scenario}")
 
@@ -111,6 +185,30 @@ def _read_midi_note_count(path: Path) -> int:
     )
 
 
+def _read_midi_note_events(path: Path) -> list[tuple[int, int, int]]:
+    midi = mido.MidiFile(str(path))
+    ticks_per_second = (float(midi.ticks_per_beat) * 1_000_000.0) / float(_TEMPO_US)
+    events: list[tuple[int, int, int]] = []
+    for track in midi.tracks:
+        absolute_tick = 0
+        active: dict[int, list[int]] = {}
+        for msg in track:
+            absolute_tick += int(msg.time)
+            if msg.type == "note_on" and int(msg.velocity) > 0:
+                active.setdefault(int(msg.note), []).append(absolute_tick)
+                continue
+            if msg.type in {"note_off", "note_on"} and int(getattr(msg, "velocity", 0)) == 0:
+                note = int(msg.note)
+                starts = active.get(note) or []
+                if not starts:
+                    continue
+                start_tick = starts.pop(0)
+                start_ms = int(round((start_tick / ticks_per_second) * 1000.0))
+                end_ms = int(round((absolute_tick / ticks_per_second) * 1000.0))
+                events.append((start_ms, end_ms, note))
+    return sorted(events)
+
+
 def test_bar_aligned_block_detection_and_grid_fields(tmp_path: Path) -> None:
     project_dir = _build_project(tmp_path, scenario="incomplete_tail")
 
@@ -123,6 +221,7 @@ def test_bar_aligned_block_detection_and_grid_fields(tmp_path: Path) -> None:
 
     blocks = json.loads(Path(report.pattern_blocks_file).read_text(encoding="utf-8"))
     assert all("bar_index" in item for item in blocks)
+    assert all("onset_slots" in item for item in blocks)
     assert all("occupied_slots" in item for item in blocks)
     assert all("empty_slots" in item for item in blocks)
     assert all(item.get("grid_resolution") == "1/16" for item in blocks)
@@ -146,6 +245,7 @@ def test_incomplete_existing_block_completed_and_working_unchanged(tmp_path: Pat
     target = existing[0]
     assert target.get("target_bar_index") == 1
     assert target.get("best_match_pattern_family_id") is not None
+    assert "onset_slots_observed" in target
     assert target.get("observed_slots")
     assert target.get("missing_slots")
     assert target.get("action") in {"completed", "skipped"}
@@ -172,7 +272,20 @@ def test_missing_expected_block_detected_for_empty_middle_bar(tmp_path: Path) ->
     assert candidate.get("block_type") == "missing_expected_block"
     assert candidate.get("target_bar_index") == 1
     assert candidate.get("observed_slots") == []
+    assert candidate.get("onset_slots_observed") == []
     assert candidate.get("best_match_pattern_family_id") is not None
+
+
+def test_missing_expected_detects_sparse_middle_bar(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="missing_sparse")
+
+    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
+
+    assert report.status == "ok"
+    assert report.missing_expected_block_count >= 1
+
+    missing_reports = json.loads(Path(report.missing_expected_blocks_file).read_text(encoding="utf-8"))
+    assert any(item.get("target_bar_index") == 1 for item in missing_reports)
 
 
 def test_missing_expected_block_completion_writes_only_uzupelnienie(tmp_path: Path) -> None:
@@ -192,6 +305,99 @@ def test_missing_expected_block_completion_writes_only_uzupelnienie(tmp_path: Pa
     assert _read_midi_note_count(output_midi) == report.inserted_note_count
 
     assert working_path.read_bytes() == before_bytes
+
+
+def test_sustained_note_uses_onset_slots_not_duration_occupancy(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="sustained_onset")
+
+    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
+
+    assert report.status == "ok"
+    blocks = json.loads(Path(report.pattern_blocks_file).read_text(encoding="utf-8"))
+    first_bar = next(item for item in blocks if int(item.get("bar_index")) == 0)
+    assert len(first_bar.get("onset_slots", [])) <= 2
+    assert len(first_bar.get("occupied_slots", [])) > len(first_bar.get("onset_slots", []))
+
+
+def test_same_onset_source_collapses_to_monophonic_insertions(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="stacked_source")
+
+    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
+
+    assert report.status == "ok"
+    incomplete_reports = json.loads(Path(report.incomplete_blocks_file).read_text(encoding="utf-8"))
+    bar_one = [
+        item
+        for item in incomplete_reports
+        if item.get("block_type") == "incomplete_existing_block" and int(item.get("target_bar_index", -1)) == 1
+    ]
+    assert bar_one
+    inserted = bar_one[0].get("inserted_notes", [])
+    assert inserted
+    start_ms = [int(round(float(item["start_sec"]) * 1000.0)) for item in inserted]
+    assert len(start_ms) == len(set(start_ms))
+    assert all(int(item["pitch_midi"]) in set(_PATTERN_A) for item in inserted)
+
+
+def test_output_midi_is_monophonic_no_stacked_note_starts(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="stacked_source")
+
+    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
+
+    assert report.status == "ok"
+    note_events = _read_midi_note_events(Path(report.output_midi_path))
+    start_times = [item[0] for item in note_events]
+    assert len(start_times) == len(set(start_times))
+
+
+def test_micro_note_candidates_are_rejected(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="micro_candidate")
+
+    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
+
+    assert report.status == "ok"
+    assert report.rejected_micro_note_count >= 1
+    all_reports = json.loads(Path(report.incomplete_blocks_file).read_text(encoding="utf-8"))
+    rejected_reasons = [
+        item.get("reason")
+        for item in all_reports
+        if item.get("action") == "skipped"
+    ]
+    assert "rejected_validation" in rejected_reasons
+
+
+def test_low_confidence_completion_is_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project_dir = _build_project(tmp_path, scenario="incomplete_tail")
+    original = pattern_service._score_family_match
+
+    def _force_low_confidence(*, incomplete_block, family):
+        candidate = original(incomplete_block=incomplete_block, family=family)
+        if candidate is None:
+            return None
+        return pattern_service._CandidateFamilyMatch(
+            family=candidate.family,
+            score=0.78,
+            reason=f"{candidate.reason} (forced_low_confidence)",
+        )
+
+    monkeypatch.setattr(pattern_service, "_score_family_match", _force_low_confidence)
+
+    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
+
+    assert report.status == "ok"
+    assert report.rejected_low_confidence_count >= 1
+    assert report.completed_incomplete_existing_block_count == 0
+
+
+def test_large_expected_missing_gap_completed_from_strong_family(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="large_gap_missing")
+
+    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
+
+    assert report.status == "ok"
+    assert report.missing_expected_block_count >= 1
+    assert report.completed_missing_expected_block_count >= 1
+    assert report.inserted_note_count >= len(_PATTERN_A)
 
 
 def test_ambiguous_missing_expected_block_is_skipped(tmp_path: Path, monkeypatch) -> None:
@@ -288,24 +494,8 @@ def test_output_midi_contains_only_reported_inserted_notes(tmp_path: Path) -> No
             )
 
     actual = set()
-    midi = mido.MidiFile(str(output_midi))
-    ticks_per_second = (float(midi.ticks_per_beat) * 1_000_000.0) / 500000.0
-    for track in midi.tracks:
-        absolute_tick = 0
-        active: dict[int, list[int]] = {}
-        for msg in track:
-            absolute_tick += int(msg.time)
-            if msg.type == "note_on" and int(msg.velocity) > 0:
-                active.setdefault(int(msg.note), []).append(absolute_tick)
-            if msg.type in {"note_off", "note_on"} and int(getattr(msg, "velocity", 0)) == 0:
-                note = int(msg.note)
-                starts = active.get(note) or []
-                if not starts:
-                    continue
-                start_tick = starts.pop(0)
-                start_ms = int(round((start_tick / ticks_per_second) * 1000.0))
-                end_ms = int(round((absolute_tick / ticks_per_second) * 1000.0))
-                actual.add((start_ms, end_ms, note))
+    for start_ms, end_ms, note in _read_midi_note_events(output_midi):
+        actual.add((start_ms, end_ms, note))
 
     assert actual.issubset(expected)
 

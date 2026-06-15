@@ -34,6 +34,7 @@ class PatternBlock(BaseModel):
     duration_sec: float
     time_signature: str = "4/4"
     grid_resolution: str = "1/16"
+    onset_slots: list[int] = Field(default_factory=list)
     occupied_slots: list[int] = Field(default_factory=list)
     empty_slots: list[int] = Field(default_factory=list)
     note_count: int
@@ -117,7 +118,11 @@ class IncompleteBlockReport(BaseModel):
     incomplete_block_id: str | None = None
     missing_block_id: str | None = None
     target_bar_index: int | None = None
+    target_start_sec: float | None = None
+    target_end_sec: float | None = None
     expected_pattern_family_id: str | None = None
+    source_pattern_family_id: str | None = None
+    source_family_occurrence_count: int | None = None
     start_sec: float
     end_sec: float
     start_beat: float | None = None
@@ -131,6 +136,9 @@ class IncompleteBlockReport(BaseModel):
     evidence_before_occurrences: list[str] = Field(default_factory=list)
     evidence_after_occurrences: list[str] = Field(default_factory=list)
     observed_note_count_in_region: int | None = None
+    onset_slots_observed: list[int] = Field(default_factory=list)
+    onset_slots_expected: list[int] = Field(default_factory=list)
+    onset_slots_missing: list[int] = Field(default_factory=list)
     observed_slots: list[int] = Field(default_factory=list)
     missing_slots: list[int] = Field(default_factory=list)
     observed_pitch_sequence: list[int] = Field(default_factory=list)
@@ -140,6 +148,8 @@ class IncompleteBlockReport(BaseModel):
     reason: str | None = None
     match_reason: str
     missing_notes_to_insert: list[ProposedCompletionNote] = Field(default_factory=list)
+    inserted_notes: list[ProposedCompletionNote] = Field(default_factory=list)
+    rejected_candidate_notes: list[dict[str, object]] = Field(default_factory=list)
     confidence_level: Literal["high", "medium", "low"]
     action: Literal["completed", "skipped"]
 
@@ -162,6 +172,10 @@ class PatternCompletionReport(BaseModel):
     skipped_block_count: int
     skipped_ambiguous_count: int
     skipped_no_clear_family_count: int
+    rejected_micro_note_count: int
+    rejected_polyphonic_stack_count: int
+    rejected_low_confidence_count: int
+    rejected_tiny_gap_count: int
     inserted_note_count: int
     output_midi_path: str | None
     pattern_blocks_file: str | None
