@@ -71,6 +71,7 @@ def complete_ai_pattern_completion(
     prompt_path = analysis_output_dir / "ai_prompt.txt"
     ai_json_path = analysis_output_dir / "bass_ai_completion.json"
     report_path = analysis_output_dir / "bass_ai_completion_report.json"
+    allowed_regions_path = analysis_output_dir / "allowed_completion_regions.json"
     midi_path = midi_output_dir / "bass_ai_completion.mid"
     raw_response_first_pass_path = analysis_output_dir / "openai_raw_response_first_pass.txt"
     raw_response_retry_path = analysis_output_dir / "openai_raw_response_retry.txt"
@@ -102,6 +103,14 @@ def complete_ai_pattern_completion(
         json.dumps(pattern_pack_result.pattern_pack, indent=2) + "\n",
         encoding="utf-8",
     )
+    allowed_regions_payload = pattern_pack_result.pattern_pack.get("allowed_completion_regions")
+    if isinstance(allowed_regions_payload, list):
+        allowed_regions_path.write_text(
+            json.dumps(allowed_regions_payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        allowed_regions_path.write_text("[]\n", encoding="utf-8")
 
     ai_request_pack = build_ai_request_pack(pattern_pack_result.pattern_pack)
     ai_request_pack_path.write_text(
@@ -173,6 +182,9 @@ def complete_ai_pattern_completion(
             output_midi_file=None,
             output_midi_path=None,
             base_note_source=pattern_pack_result.base_note_source,
+            allowed_completion_region_count=len(pattern_pack_result.allowed_completion_regions),
+            allowed_completion_regions_file=str(allowed_regions_path),
+            notes_by_region={},
             json_retry_count=0,
             json_retry_reason=None,
             retry_count=0,
@@ -500,6 +512,7 @@ def complete_ai_pattern_completion(
         base_notes=pattern_pack_result.base_notes,
         project_duration_sec=pattern_pack_result.duration_sec,
         max_completion_notes=params.max_completion_notes,
+        allowed_completion_regions=pattern_pack_result.allowed_completion_regions,
     )
     first_pass_rejected_reasons = dict(first_validation_result.rejected_reason_counts)
 
@@ -690,6 +703,7 @@ def complete_ai_pattern_completion(
             base_notes=pattern_pack_result.base_notes,
             project_duration_sec=pattern_pack_result.duration_sec,
             max_completion_notes=params.max_completion_notes,
+            allowed_completion_regions=pattern_pack_result.allowed_completion_regions,
         )
 
         final_ai_output = retry_request.ai_output
@@ -704,6 +718,10 @@ def complete_ai_pattern_completion(
         warnings.append(
             "Triggered duplicate-feedback retry because first pass mostly duplicated base MIDI notes."
         )
+    if len(pattern_pack_result.allowed_completion_regions) == 0:
+        warnings.append("No allowed completion regions were detected.")
+    if final_validation_result.rejected_reason_counts.get("outside_allowed_completion_region", 0) > 0:
+        warnings.append("AI attempted to place notes outside allowed completion regions.")
     warnings.extend(final_validation_result.warnings)
     if retry_count == 1 and not final_validation_result.accepted_notes:
         warnings.append("AI completion produced no accepted notes after duplicate-feedback retry.")
@@ -734,6 +752,9 @@ def complete_ai_pattern_completion(
         output_midi_file=str(midi_path),
         output_midi_path=str(midi_path),
         base_note_source=pattern_pack_result.base_note_source,
+        allowed_completion_region_count=len(pattern_pack_result.allowed_completion_regions),
+        allowed_completion_regions_file=str(allowed_regions_path),
+        notes_by_region=final_validation_result.accepted_note_count_by_region,
         json_retry_count=json_retry_count,
         json_retry_reason=json_retry_reason,
         retry_count=retry_count,
@@ -996,6 +1017,9 @@ def _error_report(
     warnings: list[str] | None = None,
     api_key_source: str = "env",
     base_note_source: str | None = None,
+    allowed_completion_region_count: int = 0,
+    allowed_completion_regions_file: str | None = None,
+    notes_by_region: dict[str, int] | None = None,
     full_pattern_pack_size_bytes: int = 0,
     ai_request_pack_size_bytes: int = 0,
     ai_prompt_size_bytes: int = 0,
@@ -1035,6 +1059,9 @@ def _error_report(
         output_midi_file=(str(midi_path) if midi_path.exists() else None),
         output_midi_path=(str(midi_path) if midi_path.exists() else None),
         base_note_source=base_note_source,
+        allowed_completion_region_count=int(allowed_completion_region_count),
+        allowed_completion_regions_file=allowed_completion_regions_file,
+        notes_by_region=dict(notes_by_region or {}),
         json_retry_count=int(json_retry_count),
         json_retry_reason=json_retry_reason,
         retry_count=int(retry_count),

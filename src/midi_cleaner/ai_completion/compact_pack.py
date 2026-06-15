@@ -14,6 +14,7 @@ def build_ai_request_pack(
     audio_activity_regions = _as_dict_list(pattern_pack.get("audio_activity_regions"))
     pitch_contour_summary = _as_dict_list(pattern_pack.get("pitch_contour_summary"))
     pattern_windows = _as_dict_list(pattern_pack.get("pattern_windows"))
+    allowed_completion_regions = _as_dict_list(pattern_pack.get("allowed_completion_regions"))
 
     selected_base_notes = _select_base_notes(
         base_notes=base_notes,
@@ -41,6 +42,14 @@ def build_ai_request_pack(
         "timeline": pattern_pack.get("timeline", {}),
         "base_midi_summary": pattern_pack.get("base_midi_summary", {}),
         "instructions_for_ai": pattern_pack.get("instructions_for_ai", {}),
+        "completion_scope": "target_regions_only",
+        "max_completion_notes_is_upper_bound_not_target": True,
+        "reject_notes_outside_allowed_regions": True,
+        "timeline_sync": {
+            "time_origin": "wav_seconds",
+            "must_align_with": "working.mid",
+            "output_is_additive_layer": True,
+        },
         "base_notes_are_occupied": True,
         "base_occupancy_rules": {
             "do_not_place_ai_note_on_base_onset_within_ms": 30,
@@ -51,6 +60,9 @@ def build_ai_request_pack(
         "audio_activity_regions": selected_activity_regions,
         "pitch_contour_summary": selected_pitch_sections,
         "pattern_windows": summarized_windows,
+        "allowed_completion_regions": _compact_allowed_completion_regions(
+            allowed_completion_regions=allowed_completion_regions
+        ),
         "compact_request": True,
         "source_pack_was_compacted": True,
         "original_counts": {
@@ -58,12 +70,14 @@ def build_ai_request_pack(
             "audio_activity_regions": len(audio_activity_regions),
             "pitch_contour_summary": len(pitch_contour_summary),
             "pattern_windows": len(pattern_windows),
+            "allowed_completion_regions": len(allowed_completion_regions),
         },
         "included_counts": {
             "base_notes": len(selected_base_notes),
             "audio_activity_regions": len(selected_activity_regions),
             "pitch_contour_summary": len(selected_pitch_sections),
             "pattern_windows": len(summarized_windows),
+            "allowed_completion_regions": len(allowed_completion_regions),
         },
     }
 
@@ -392,6 +406,93 @@ def _compact_pitch_section(section: dict[str, Any]) -> dict[str, object]:
         "voiced_ratio": _rounded(section.get("voiced_ratio")),
         "mean_confidence": _rounded(section.get("mean_confidence")),
     }
+
+
+def _compact_allowed_completion_regions(
+    *,
+    allowed_completion_regions: list[dict[str, Any]],
+) -> list[dict[str, object]]:
+    compacted: list[dict[str, object]] = []
+    for region in allowed_completion_regions:
+        allowed_pitch_range = region.get("allowed_pitch_range")
+        local_pitch_range = region.get("local_pitch_range")
+        rhythmic_summary = region.get("rhythmic_pattern_summary")
+
+        compacted.append(
+            {
+                "region_id": str(region.get("region_id", "")),
+                "start_sec": _rounded(region.get("start_sec")),
+                "end_sec": _rounded(region.get("end_sec")),
+                "reason": str(region.get("reason", "")),
+                "context_before_start_sec": _rounded(region.get("context_before_start_sec")),
+                "context_after_end_sec": _rounded(region.get("context_after_end_sec")),
+                "context_window_before_sec": _rounded(region.get("context_window_before_sec")),
+                "context_window_after_sec": _rounded(region.get("context_window_after_sec")),
+                "reference_notes_before": [
+                    str(item)
+                    for item in _as_list(region.get("reference_notes_before"))[:48]
+                    if isinstance(item, str)
+                ],
+                "reference_notes_after": [
+                    str(item)
+                    for item in _as_list(region.get("reference_notes_after"))[:48]
+                    if isinstance(item, str)
+                ],
+                "local_pitch_range": {
+                    "min": _to_int(
+                        (local_pitch_range.get("min") if isinstance(local_pitch_range, dict) else None),
+                        0,
+                    ),
+                    "max": _to_int(
+                        (local_pitch_range.get("max") if isinstance(local_pitch_range, dict) else None),
+                        127,
+                    ),
+                },
+                "allowed_pitch_range": {
+                    "min": _to_int(
+                        (allowed_pitch_range.get("min") if isinstance(allowed_pitch_range, dict) else None),
+                        0,
+                    ),
+                    "max": _to_int(
+                        (allowed_pitch_range.get("max") if isinstance(allowed_pitch_range, dict) else None),
+                        127,
+                    ),
+                },
+                "preferred_pitches": [
+                    _to_int(value, 0)
+                    for value in _as_list(region.get("preferred_pitches"))[:16]
+                    if isinstance(value, (int, float, str))
+                ],
+                "forbidden_pitches": [
+                    _to_int(value, 0)
+                    for value in _as_list(region.get("forbidden_pitches"))[:16]
+                    if isinstance(value, (int, float, str))
+                ],
+                "estimated_key_or_scale": str(region.get("estimated_key_or_scale", "unknown")),
+                "rhythmic_pattern_summary": {
+                    "note_onsets_sec": _float_list(
+                        rhythmic_summary.get("note_onsets_sec") if isinstance(rhythmic_summary, dict) else None,
+                        24,
+                    ),
+                    "intervals_sec": _float_list(
+                        rhythmic_summary.get("intervals_sec") if isinstance(rhythmic_summary, dict) else None,
+                        24,
+                    ),
+                    "common_durations_sec": _float_list(
+                        rhythmic_summary.get("common_durations_sec") if isinstance(rhythmic_summary, dict) else None,
+                        16,
+                    ),
+                },
+                "expected_note_count_min": _to_int(region.get("expected_note_count_min"), 0),
+                "expected_note_count_max": _to_int(region.get("expected_note_count_max"), 0),
+                "density_limit_notes_per_sec": _rounded(region.get("density_limit_notes_per_sec")),
+                "min_note_duration_sec": _rounded(region.get("min_note_duration_sec")),
+                "max_note_duration_sec": _rounded(region.get("max_note_duration_sec")),
+                "no_notes_outside_region": bool(region.get("no_notes_outside_region", True)),
+            }
+        )
+
+    return compacted
 
 
 def _note_indices_overlapping(

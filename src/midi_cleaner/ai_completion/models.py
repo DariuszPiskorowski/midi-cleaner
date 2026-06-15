@@ -58,6 +58,9 @@ class AIPatternCompletionReport(BaseModel):
     output_midi_file: str | None
     output_midi_path: str | None = None
     base_note_source: str | None = None
+    allowed_completion_region_count: int = 0
+    allowed_completion_regions_file: str | None = None
+    notes_by_region: dict[str, int] = Field(default_factory=dict)
     json_retry_count: int = 0
     json_retry_reason: str | None = None
     retry_count: int = 0

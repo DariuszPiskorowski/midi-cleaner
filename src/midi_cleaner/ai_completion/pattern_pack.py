@@ -4,6 +4,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 import math
+import statistics
 
 import mido
 
@@ -33,6 +34,32 @@ class BasePatternNote:
 
 
 @dataclass(frozen=True)
+class AllowedCompletionRegion:
+    region_id: str
+    start_sec: float
+    end_sec: float
+    reason: str
+    context_before_start_sec: float
+    context_after_end_sec: float
+    context_window_before_sec: float
+    context_window_after_sec: float
+    reference_notes_before: list[str]
+    reference_notes_after: list[str]
+    local_pitch_range: dict[str, int]
+    allowed_pitch_range: dict[str, int]
+    preferred_pitches: list[int]
+    forbidden_pitches: list[int]
+    estimated_key_or_scale: str
+    rhythmic_pattern_summary: dict[str, object]
+    expected_note_count_min: int
+    expected_note_count_max: int
+    density_limit_notes_per_sec: float
+    min_note_duration_sec: float
+    max_note_duration_sec: float
+    no_notes_outside_region: bool
+
+
+@dataclass(frozen=True)
 class PatternPackBuildResult:
     pattern_pack: dict[str, object]
     base_notes: list[BasePatternNote]
@@ -40,6 +67,7 @@ class PatternPackBuildResult:
     ticks_per_beat: int
     tempo_us_per_beat: int
     base_note_source: str
+    allowed_completion_regions: list[AllowedCompletionRegion]
     warnings: list[str]
 
 
@@ -94,6 +122,17 @@ def build_pattern_pack(project_dir: Path, layer: str = "bass") -> PatternPackBui
         audio_activity_regions=audio_activity_regions,
         pitch_contour_summary=pitch_contour_summary,
     )
+    allowed_completion_regions = _detect_allowed_completion_regions(
+        base_notes=base_notes,
+        audio_activity_regions=audio_activity_regions,
+        pitch_contour_summary=pitch_contour_summary,
+        duration_sec=duration_sec,
+    )
+
+    if not allowed_completion_regions:
+        warnings.append(
+            "No allowed completion regions were detected. AI completion should return zero notes."
+        )
 
     pattern_pack: dict[str, object] = {
         "version": "1.0",
@@ -111,6 +150,9 @@ def build_pattern_pack(project_dir: Path, layer: str = "bass") -> PatternPackBui
         "audio_activity_regions": audio_activity_regions,
         "pitch_contour_summary": pitch_contour_summary,
         "pattern_windows": pattern_windows,
+        "allowed_completion_regions": [
+            _allowed_region_record(region) for region in allowed_completion_regions
+        ],
         "instructions_for_ai": {
             "goal": (
                 "Generate an additional synchronized bass MIDI completion track that adds "
@@ -132,6 +174,7 @@ def build_pattern_pack(project_dir: Path, layer: str = "bass") -> PatternPackBui
         ticks_per_beat=ticks_per_beat,
         tempo_us_per_beat=tempo_us_per_beat,
         base_note_source=base_note_source,
+        allowed_completion_regions=allowed_completion_regions,
         warnings=warnings,
     )
 
@@ -610,3 +653,428 @@ def _build_pattern_windows(
         window_index += 1
 
     return windows
+
+
+def _allowed_region_record(region: AllowedCompletionRegion) -> dict[str, object]:
+    return {
+        "region_id": region.region_id,
+        "start_sec": round(region.start_sec, 6),
+        "end_sec": round(region.end_sec, 6),
+        "reason": region.reason,
+        "context_before_start_sec": round(region.context_before_start_sec, 6),
+        "context_after_end_sec": round(region.context_after_end_sec, 6),
+        "context_window_before_sec": round(region.context_window_before_sec, 6),
+        "context_window_after_sec": round(region.context_window_after_sec, 6),
+        "reference_notes_before": list(region.reference_notes_before),
+        "reference_notes_after": list(region.reference_notes_after),
+        "local_pitch_range": {
+            "min": int(region.local_pitch_range["min"]),
+            "max": int(region.local_pitch_range["max"]),
+        },
+        "allowed_pitch_range": {
+            "min": int(region.allowed_pitch_range["min"]),
+            "max": int(region.allowed_pitch_range["max"]),
+        },
+        "preferred_pitches": [int(value) for value in region.preferred_pitches],
+        "forbidden_pitches": [int(value) for value in region.forbidden_pitches],
+        "estimated_key_or_scale": region.estimated_key_or_scale,
+        "rhythmic_pattern_summary": dict(region.rhythmic_pattern_summary),
+        "expected_note_count_min": int(region.expected_note_count_min),
+        "expected_note_count_max": int(region.expected_note_count_max),
+        "density_limit_notes_per_sec": round(region.density_limit_notes_per_sec, 6),
+        "min_note_duration_sec": round(region.min_note_duration_sec, 6),
+        "max_note_duration_sec": round(region.max_note_duration_sec, 6),
+        "no_notes_outside_region": bool(region.no_notes_outside_region),
+    }
+
+
+def _detect_allowed_completion_regions(
+    *,
+    base_notes: list[BasePatternNote],
+    audio_activity_regions: list[dict[str, object]],
+    pitch_contour_summary: list[dict[str, object]],
+    duration_sec: float,
+) -> list[AllowedCompletionRegion]:
+    if len(base_notes) < 2:
+        return []
+
+    ordered_notes = sorted(
+        base_notes,
+        key=lambda item: (float(item.start_sec), float(item.end_sec), int(item.pitch_midi)),
+    )
+
+    note_durations = [float(item.duration_sec) for item in ordered_notes if float(item.duration_sec) > 0.0]
+    onset_deltas = [
+        float(ordered_notes[index + 1].start_sec) - float(ordered_notes[index].start_sec)
+        for index in range(len(ordered_notes) - 1)
+        if float(ordered_notes[index + 1].start_sec) > float(ordered_notes[index].start_sec)
+    ]
+
+    median_duration = statistics.median(note_durations) if note_durations else 0.25
+    median_onset_delta = statistics.median(onset_deltas) if onset_deltas else median_duration
+    long_gap_threshold = max(0.14, median_duration * 0.75, median_onset_delta * 0.9)
+    max_region_duration = max(0.75, min(10.0, median_onset_delta * 12.0))
+
+    candidate_regions: list[dict[str, float | int | str]] = []
+    for index in range(len(ordered_notes) - 1):
+        previous_note = ordered_notes[index]
+        next_note = ordered_notes[index + 1]
+
+        gap_start = float(previous_note.end_sec)
+        gap_end = float(next_note.start_sec)
+        gap_duration = gap_end - gap_start
+
+        if gap_duration < long_gap_threshold:
+            continue
+
+        evidence = _activity_gap_evidence(
+            gap_start=gap_start,
+            gap_end=gap_end,
+            audio_activity_regions=audio_activity_regions,
+            pitch_contour_summary=pitch_contour_summary,
+        )
+        if not evidence["has_evidence"]:
+            continue
+
+        evidence_start = float(evidence["active_start"])
+        evidence_end = float(evidence["active_end"])
+
+        region_start = max(gap_start, evidence_start)
+        region_end = min(gap_end, evidence_end)
+        if region_end <= region_start + 0.04:
+            region_start = gap_start
+            region_end = gap_end
+
+        region_end = min(region_end, region_start + max_region_duration)
+        if region_end <= region_start + 0.08:
+            continue
+
+        candidate_regions.append(
+            {
+                "start_sec": region_start,
+                "end_sec": region_end,
+                "reason": str(evidence["reason"]),
+                "onset_count": int(evidence["onset_count"]),
+            }
+        )
+
+    # Consider trailing missing sections after the last base note where audio/pitch still indicate bass activity.
+    last_note_end = float(ordered_notes[-1].end_sec)
+    tail_gap_start = last_note_end
+    tail_gap_end = float(duration_sec)
+    tail_gap_duration = tail_gap_end - tail_gap_start
+    if tail_gap_duration >= long_gap_threshold:
+        tail_evidence = _activity_gap_evidence(
+            gap_start=tail_gap_start,
+            gap_end=tail_gap_end,
+            audio_activity_regions=audio_activity_regions,
+            pitch_contour_summary=pitch_contour_summary,
+        )
+        if tail_evidence["has_evidence"]:
+            tail_region_start = max(tail_gap_start, float(tail_evidence["active_start"]))
+            tail_region_end = min(tail_gap_end, float(tail_evidence["active_end"]))
+            if tail_region_end <= tail_region_start + 0.04:
+                tail_region_start = tail_gap_start
+                tail_region_end = tail_gap_end
+
+            tail_region_end = min(tail_region_end, tail_region_start + max_region_duration)
+            if tail_region_end > tail_region_start + 0.08:
+                candidate_regions.append(
+                    {
+                        "start_sec": tail_region_start,
+                        "end_sec": tail_region_end,
+                        "reason": str(tail_evidence["reason"]),
+                        "onset_count": int(tail_evidence["onset_count"]),
+                    }
+                )
+
+    merged_candidates = _merge_candidate_regions(candidate_regions)
+    if not merged_candidates:
+        return []
+
+    global_pitch_min = min(int(item.pitch_midi) for item in ordered_notes)
+    global_pitch_max = max(int(item.pitch_midi) for item in ordered_notes)
+
+    detected_regions: list[AllowedCompletionRegion] = []
+    for region_index, candidate in enumerate(merged_candidates, start=1):
+        start_sec = max(0.0, float(candidate["start_sec"]))
+        end_sec = min(float(duration_sec), float(candidate["end_sec"]))
+        if end_sec <= start_sec + 0.08:
+            continue
+
+        context_before_start_sec = max(0.0, start_sec - 5.0)
+        context_after_end_sec = min(float(duration_sec), end_sec + 5.0)
+
+        before_notes = [
+            note
+            for note in ordered_notes
+            if float(note.end_sec) <= start_sec and float(note.end_sec) >= context_before_start_sec
+        ]
+        after_notes = [
+            note
+            for note in ordered_notes
+            if float(note.start_sec) >= end_sec and float(note.start_sec) <= context_after_end_sec
+        ]
+
+        before_notes = sorted(before_notes, key=lambda note: float(note.end_sec))[-24:]
+        after_notes = sorted(after_notes, key=lambda note: float(note.start_sec))[:24]
+
+        local_notes = before_notes[-32:] + after_notes[:32]
+        if not local_notes:
+            local_notes = _nearest_context_notes(
+                ordered_notes=ordered_notes,
+                region_start=start_sec,
+                region_end=end_sec,
+                limit=24,
+            )
+
+        local_pitches = [int(item.pitch_midi) for item in local_notes]
+        if local_pitches:
+            local_pitch_min = min(local_pitches)
+            local_pitch_max = max(local_pitches)
+        else:
+            local_pitch_min = global_pitch_min
+            local_pitch_max = global_pitch_max
+
+        allowed_pitch_min = max(0, local_pitch_min - 2)
+        allowed_pitch_max = min(127, local_pitch_max + 2)
+
+        preferred_pitches = [
+            int(pitch)
+            for pitch, _count in Counter(local_pitches).most_common(8)
+        ]
+
+        forbidden_pitches: list[int] = []
+        if allowed_pitch_min > 0:
+            forbidden_pitches.append(allowed_pitch_min - 1)
+        if allowed_pitch_max < 127:
+            forbidden_pitches.append(allowed_pitch_max + 1)
+
+        estimated_key_or_scale = _estimate_local_key_or_scale(local_pitches)
+
+        rhythmic_summary = _build_local_rhythmic_summary(local_notes)
+
+        local_durations = [float(item.duration_sec) for item in local_notes if float(item.duration_sec) > 0.0]
+        local_duration_median = statistics.median(local_durations) if local_durations else median_duration
+
+        min_note_duration_sec = max(0.05, min(0.5, local_duration_median * 0.45))
+        max_note_duration_sec = min(max(1.2, end_sec - start_sec), max(0.3, local_duration_median * 3.2))
+        if max_note_duration_sec <= min_note_duration_sec:
+            max_note_duration_sec = min_note_duration_sec + 0.1
+
+        density_window_start = max(0.0, start_sec - 3.0)
+        density_window_end = min(float(duration_sec), end_sec + 3.0)
+        density_window_sec = max(0.25, density_window_end - density_window_start)
+        local_density_notes = sum(
+            1
+            for note in ordered_notes
+            if float(note.start_sec) < density_window_end and float(note.end_sec) > density_window_start
+        )
+        local_density = float(local_density_notes) / density_window_sec
+
+        region_duration_sec = max(0.1, end_sec - start_sec)
+        expected_center = local_density * region_duration_sec
+        onset_hint = int(candidate.get("onset_count", 0))
+        if onset_hint > 0:
+            expected_center = max(expected_center, min(8.0, float(onset_hint)))
+
+        expected_note_count_min = int(max(0, math.floor(expected_center * 0.4)))
+        if expected_center >= 1.0 and expected_note_count_min == 0:
+            expected_note_count_min = 1
+        expected_note_count_max = int(
+            max(expected_note_count_min, min(24, math.ceil(expected_center * 1.8) + 1))
+        )
+
+        expected_density_ceiling = float(expected_note_count_max) / region_duration_sec
+        density_limit_notes_per_sec = max(
+            0.35,
+            min(
+                8.0,
+                max(
+                    (local_density * 1.7) if local_density > 0.0 else 0.0,
+                    expected_density_ceiling,
+                ),
+            ),
+        )
+
+        detected_regions.append(
+            AllowedCompletionRegion(
+                region_id=f"acr_{region_index:04d}",
+                start_sec=float(start_sec),
+                end_sec=float(end_sec),
+                reason=str(candidate["reason"]),
+                context_before_start_sec=float(context_before_start_sec),
+                context_after_end_sec=float(context_after_end_sec),
+                context_window_before_sec=float(start_sec - context_before_start_sec),
+                context_window_after_sec=float(context_after_end_sec - end_sec),
+                reference_notes_before=[item.note_id for item in before_notes],
+                reference_notes_after=[item.note_id for item in after_notes],
+                local_pitch_range={"min": int(local_pitch_min), "max": int(local_pitch_max)},
+                allowed_pitch_range={"min": int(allowed_pitch_min), "max": int(allowed_pitch_max)},
+                preferred_pitches=preferred_pitches,
+                forbidden_pitches=forbidden_pitches,
+                estimated_key_or_scale=estimated_key_or_scale,
+                rhythmic_pattern_summary=rhythmic_summary,
+                expected_note_count_min=expected_note_count_min,
+                expected_note_count_max=expected_note_count_max,
+                density_limit_notes_per_sec=float(density_limit_notes_per_sec),
+                min_note_duration_sec=float(min_note_duration_sec),
+                max_note_duration_sec=float(max_note_duration_sec),
+                no_notes_outside_region=True,
+            )
+        )
+
+    return detected_regions
+
+
+def _activity_gap_evidence(
+    *,
+    gap_start: float,
+    gap_end: float,
+    audio_activity_regions: list[dict[str, object]],
+    pitch_contour_summary: list[dict[str, object]],
+) -> dict[str, object]:
+    gap_duration = max(1e-6, gap_end - gap_start)
+    overlapping_regions = [
+        region
+        for region in audio_activity_regions
+        if float(region.get("start_sec", 0.0)) < gap_end
+        and float(region.get("end_sec", 0.0)) > gap_start
+    ]
+
+    overlap_duration = 0.0
+    onset_count = 0
+    active_start = gap_start
+    active_end = gap_end
+    if overlapping_regions:
+        start_values = []
+        end_values = []
+        for region in overlapping_regions:
+            region_start = max(gap_start, float(region.get("start_sec", gap_start)))
+            region_end = min(gap_end, float(region.get("end_sec", gap_end)))
+            if region_end <= region_start:
+                continue
+            overlap_duration += region_end - region_start
+            onset_count += int(region.get("onset_count", 0))
+            start_values.append(region_start)
+            end_values.append(region_end)
+        if start_values and end_values:
+            active_start = min(start_values)
+            active_end = max(end_values)
+
+    pitch_hits = sum(
+        1
+        for section in pitch_contour_summary
+        if float(section.get("start_sec", 0.0)) < gap_end
+        and float(section.get("end_sec", 0.0)) > gap_start
+        and section.get("dominant_pitch_midi") is not None
+        and float(section.get("voiced_ratio", 0.0)) >= 0.2
+    )
+
+    active_ratio = overlap_duration / gap_duration
+    has_evidence = active_ratio >= 0.18 or onset_count >= 1 or pitch_hits >= 2
+
+    reason = "long_gap_with_activity_evidence"
+    if active_ratio >= 0.4 and onset_count >= 1:
+        reason = "long_gap_with_strong_audio_activity"
+    elif onset_count >= 1:
+        reason = "long_gap_with_onset_evidence"
+    elif pitch_hits >= 2:
+        reason = "long_gap_with_pitch_contour_evidence"
+
+    return {
+        "has_evidence": has_evidence,
+        "active_start": active_start,
+        "active_end": active_end,
+        "onset_count": onset_count,
+        "reason": reason,
+    }
+
+
+def _merge_candidate_regions(candidates: list[dict[str, float | int | str]]) -> list[dict[str, float | int | str]]:
+    if not candidates:
+        return []
+
+    sorted_candidates = sorted(candidates, key=lambda item: float(item["start_sec"]))
+    merged: list[dict[str, float | int | str]] = []
+
+    for candidate in sorted_candidates:
+        if not merged:
+            merged.append(dict(candidate))
+            continue
+
+        previous = merged[-1]
+        previous_end = float(previous["end_sec"])
+        current_start = float(candidate["start_sec"])
+        if current_start - previous_end > 0.1:
+            merged.append(dict(candidate))
+            continue
+
+        previous["end_sec"] = max(float(previous["end_sec"]), float(candidate["end_sec"]))
+        previous["onset_count"] = int(previous.get("onset_count", 0)) + int(candidate.get("onset_count", 0))
+
+        previous_reason = str(previous.get("reason", ""))
+        current_reason = str(candidate.get("reason", ""))
+        if "strong" in current_reason and "strong" not in previous_reason:
+            previous["reason"] = current_reason
+
+    return merged
+
+
+def _nearest_context_notes(
+    *,
+    ordered_notes: list[BasePatternNote],
+    region_start: float,
+    region_end: float,
+    limit: int,
+) -> list[BasePatternNote]:
+    ranked = sorted(
+        ordered_notes,
+        key=lambda note: min(
+            abs(float(note.start_sec) - region_start),
+            abs(float(note.end_sec) - region_end),
+        ),
+    )
+    return ranked[: max(1, limit)]
+
+
+def _build_local_rhythmic_summary(local_notes: list[BasePatternNote]) -> dict[str, object]:
+    ordered = sorted(local_notes, key=lambda note: (float(note.start_sec), float(note.end_sec)))
+    onsets = [round(float(note.start_sec), 6) for note in ordered[:24]]
+    intervals: list[float] = []
+    for index in range(1, len(onsets)):
+        intervals.append(round(onsets[index] - onsets[index - 1], 6))
+
+    durations = [round(float(note.duration_sec), 6) for note in ordered]
+    common_durations = [
+        float(value)
+        for value, _count in Counter(durations).most_common(8)
+    ]
+
+    return {
+        "note_onsets_sec": onsets,
+        "intervals_sec": intervals[:24],
+        "common_durations_sec": common_durations,
+    }
+
+
+def _estimate_local_key_or_scale(local_pitches: list[int]) -> str:
+    if len(local_pitches) < 3:
+        return "unknown"
+
+    pitch_classes = [int(value) % 12 for value in local_pitches]
+    root_pc = Counter(pitch_classes).most_common(1)[0][0]
+
+    major_scale = {(root_pc + step) % 12 for step in (0, 2, 4, 5, 7, 9, 11)}
+    minor_scale = {(root_pc + step) % 12 for step in (0, 2, 3, 5, 7, 8, 10)}
+
+    unique_classes = set(pitch_classes)
+    major_score = len(unique_classes.intersection(major_scale))
+    minor_score = len(unique_classes.intersection(minor_scale))
+
+    root_name = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"][root_pc]
+    if minor_score > major_score:
+        return f"{root_name} minor (estimated)"
+    if major_score > minor_score:
+        return f"{root_name} major (estimated)"
+    return f"{root_name} modal (estimated)"
