@@ -117,3 +117,56 @@ def test_ai_complete_pattern_help_lists_required_options() -> None:
     assert "--max-completion-notes" in result.stdout
     assert "--temperature" in result.stdout
     assert "--keep-ai-json" in result.stdout
+
+
+def test_pattern_complete_blocks_help_lists_required_options() -> None:
+    result = runner.invoke(
+        app,
+        ["pattern", "complete-blocks", "--help"],
+        env={"COLUMNS": "240", "LINES": "120"},
+    )
+
+    assert result.exit_code == 0
+    assert "--project-dir" in result.stdout
+    assert "--layer" in result.stdout
+    assert "--write-debug-midi" in result.stdout
+    assert "--no-write-debug-midi" in result.stdout
+
+
+def test_pattern_complete_blocks_calls_deterministic_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_complete_pattern_blocks(*, project_dir, params):
+        captured["project_dir"] = project_dir
+        captured["params"] = params
+        return SimpleNamespace(
+            pattern_block_count=3,
+            pattern_family_count=1,
+            incomplete_block_count=1,
+            completed_block_count=1,
+            skipped_block_count=0,
+            inserted_note_count=2,
+            output_midi_path="projects/demo/midi/uzupelnienie.mid",
+            warning_count=0,
+        )
+
+    monkeypatch.setattr("midi_cleaner.cli.complete_pattern_blocks", _fake_complete_pattern_blocks)
+
+    result = runner.invoke(
+        app,
+        [
+            "pattern",
+            "complete-blocks",
+            "--project-dir",
+            "projects/demo",
+            "--layer",
+            "bass",
+            "--no-write-debug-midi",
+        ],
+    )
+
+    assert result.exit_code == 0
+    params = captured["params"]
+    assert params.layer == "bass"
+    assert params.write_debug_midi is False
+    assert "inserted_note_count=2" in result.stdout

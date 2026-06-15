@@ -47,6 +47,11 @@ from midi_cleaner.pipeline.process_stem import (
     PipelineProcessParameters,
     process_stem_pipeline,
 )
+from midi_cleaner.pattern import (
+    PatternCompletionError,
+    PatternCompletionParameters,
+    complete_pattern_blocks,
+)
 from midi_cleaner.pipeline.qa_report import (
     QAReportError,
     QAReportParameters,
@@ -90,6 +95,7 @@ repair_app = typer.Typer(help="Audio/MIDI activity repair tools.")
 pitch_app = typer.Typer(help="Bass pitch contour analysis tools.")
 pipeline_app = typer.Typer(help="End-to-end pipeline tools.")
 ai_app = typer.Typer(help="AI pattern completion tools.")
+pattern_app = typer.Typer(help="Deterministic pattern block tools.")
 console = Console()
 
 app.add_typer(midi_app, name="midi")
@@ -101,6 +107,7 @@ app.add_typer(repair_app, name="repair")
 app.add_typer(pitch_app, name="pitch")
 app.add_typer(pipeline_app, name="pipeline")
 app.add_typer(ai_app, name="ai")
+app.add_typer(pattern_app, name="pattern")
 
 
 def version_callback(value: bool) -> None:
@@ -1051,6 +1058,40 @@ def ai_complete_pattern_command(
         f"proposed={report.proposed_note_count}, "
         f"accepted={report.accepted_note_count}, "
         f"rejected={report.rejected_note_count}, "
+        f"warnings={report.warning_count}"
+    )
+
+
+@pattern_app.command("complete-blocks")
+def pattern_complete_blocks_command(
+    project_dir: Path = typer.Option(..., "--project-dir", help="Pipeline project directory."),
+    layer: str = typer.Option("bass", "--layer", help="Instrument layer to complete."),
+    write_debug_midi: bool = typer.Option(
+        True,
+        "--write-debug-midi/--no-write-debug-midi",
+        help="Write optional debug MIDI with family/incomplete channels.",
+    ),
+) -> None:
+    params = PatternCompletionParameters(
+        layer=layer,
+        write_debug_midi=write_debug_midi,
+    )
+
+    try:
+        report = complete_pattern_blocks(project_dir=project_dir, params=params)
+    except PatternCompletionError as exc:
+        typer.echo(f"Pattern block completion failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        "Pattern block completion complete: "
+        f"pattern_block_count={report.pattern_block_count}, "
+        f"pattern_family_count={report.pattern_family_count}, "
+        f"incomplete_block_count={report.incomplete_block_count}, "
+        f"completed_block_count={report.completed_block_count}, "
+        f"skipped_block_count={report.skipped_block_count}, "
+        f"inserted_note_count={report.inserted_note_count}, "
+        f"output_midi_path={report.output_midi_path}, "
         f"warnings={report.warning_count}"
     )
 
