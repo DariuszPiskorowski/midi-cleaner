@@ -6,7 +6,12 @@ import json
 def build_ai_completion_prompts(
     ai_request_pack: dict[str, object],
     max_completion_notes: int,
+    feedback_context: str | None = None,
 ) -> tuple[str, str, str]:
+    feedback_section = ""
+    if feedback_context:
+        feedback_section = f"Validation feedback from previous attempt:\n{feedback_context}\n\n"
+
     system_prompt = (
         "You are an expert MIDI bass pattern completion engine.\n\n"
         "You receive a JSON pattern pack generated from:\n"
@@ -21,6 +26,14 @@ def build_ai_completion_prompts(
         "- add only missing or musically implied continuation notes,\n"
         "- return a JSON patch for a separate synchronized AI completion MIDI track,\n"
         "- do not modify, delete, shorten, extend, or copy base MIDI notes,\n"
+        "- pattern_reference_note_ids are evidence/examples only, never notes to recreate,\n"
+        "- never create an AI completion note at the same start_sec as a base note,\n"
+        "- never copy a base note exact start/end/pitch tuple,\n"
+        "- add notes only where base MIDI is missing a continuation or implied fragment,\n"
+        "- if the base MIDI already represents the pattern in an area, output no note there,\n"
+        "- completion track must stay silent except for genuinely new additive notes,\n"
+        "- do not double, reinforce, layer, or thicken existing base notes,\n"
+        "- if unsure whether a note already exists in base MIDI, do not output it,\n"
         "- do not output a full bass transcription,\n"
         "- do not duplicate existing notes unless there is a clear musical reason and it will not "
         "cause doubled/flammed bass,\n"
@@ -70,8 +83,22 @@ def build_ai_completion_prompts(
         "- velocity must be 1-127.\n"
         "- confidence must be 0-1.\n"
         "- risk must be one of low, medium, high.\n"
+        "- pattern_reference_note_ids are references only; do not copy those notes.\n"
+        "- never place a completion note on the same onset as a base note.\n"
+        "- never output a note that matches base note start/end/pitch.\n"
+        "- do not use reasons like 'reinforcing existing motif' or 'maintaining harmonic structure' "
+        "when a note overlaps/copies base MIDI.\n"
         f"- Do not add more than {max_completion_notes} notes.\n\n"
-        "Pattern pack JSON:\n"
+        "Anti-duplicate examples:\n"
+        "Bad example (reject):\n"
+        "Base note: start=2.774785 end=3.240499 pitch=36\n"
+        "AI note: start=2.774785 end=3.240499 pitch=36\n"
+        "Reason: duplicate copy of occupied base note.\n\n"
+        "Good example (allowed):\n"
+        "Base pattern implies continuation after a base note ends.\n"
+        "AI note starts after base note end or inside a true gap, not at the same onset.\n\n"
+        + feedback_section
+        + "Pattern pack JSON:\n"
         + json.dumps(ai_request_pack, separators=(",", ":"), ensure_ascii=False)
     )
 

@@ -9,10 +9,12 @@ from pydantic import ValidationError
 
 from midi_cleaner.ai_completion.compact_pack import build_ai_request_pack
 from midi_cleaner.ai_completion.export import (
+    AICompletionValidationResult,
     export_ai_completion_midi,
     validate_ai_completion_notes,
 )
 from midi_cleaner.ai_completion.models import (
+    AIPatternCompletionNote,
     AIPatternCompletionOutput,
     AIPatternCompletionReport,
 )
@@ -77,6 +79,7 @@ def complete_ai_pattern_completion(
             dry_run=params.dry_run,
             message=str(exc),
             api_key_source="env",
+            base_note_source=None,
         )
         _write_report(report_path, report)
         raise AIPatternCompletionError(str(exc)) from exc
@@ -121,6 +124,7 @@ def complete_ai_pattern_completion(
             message=message,
             warnings=warnings,
             api_key_source="env",
+            base_note_source=pattern_pack_result.base_note_source,
             full_pattern_pack_size_bytes=full_pattern_pack_size_bytes,
             ai_request_pack_size_bytes=ai_request_pack_size_bytes,
             ai_prompt_size_bytes=ai_prompt_size_bytes,
@@ -147,6 +151,12 @@ def complete_ai_pattern_completion(
             ai_json_file=None,
             output_midi_file=None,
             output_midi_path=None,
+            base_note_source=pattern_pack_result.base_note_source,
+            retry_count=0,
+            retry_reason=None,
+            first_pass_proposed_note_count=0,
+            first_pass_rejected_reasons={},
+            final_proposed_note_count=0,
             proposed_note_count=0,
             accepted_note_count=0,
             rejected_note_count=0,
@@ -165,10 +175,16 @@ def complete_ai_pattern_completion(
 
     raw_response_text: str | None = None
     parsed_payload: dict[str, object] | None = None
+    first_pass_proposed_note_count = 0
+    first_pass_rejected_reasons: dict[str, int] = {}
+    retry_count = 0
+    retry_reason: str | None = None
+
     try:
-        raw_response_text, parsed_payload = completion_client.complete_pattern(
+        first_raw_response_text, first_parsed_payload, first_ai_output = _request_ai_completion(
+            completion_client=completion_client,
             api_key=api_key,
-            model=model_name,
+            model_name=model_name,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=params.temperature,
@@ -189,18 +205,14 @@ def complete_ai_pattern_completion(
             raw_response_text=raw_response_text,
             warnings=warnings,
             api_key_source=api_key_source,
+            base_note_source=pattern_pack_result.base_note_source,
             full_pattern_pack_size_bytes=full_pattern_pack_size_bytes,
             ai_request_pack_size_bytes=ai_request_pack_size_bytes,
             ai_prompt_size_bytes=ai_prompt_size_bytes,
         )
         _write_report(report_path, report)
         raise AIPatternCompletionError(str(exc)) from exc
-
-    try:
-        ai_output = AIPatternCompletionOutput.model_validate(parsed_payload)
     except ValidationError as exc:
-        if params.keep_ai_json and parsed_payload is not None:
-            ai_json_path.write_text(json.dumps(parsed_payload, indent=2) + "\n", encoding="utf-8")
         message = f"AI JSON schema validation failed: {exc.errors()[0]['msg']}"
         report = _error_report(
             project_dir=project_dir,
@@ -216,6 +228,7 @@ def complete_ai_pattern_completion(
             raw_response_text=raw_response_text,
             warnings=warnings,
             api_key_source=api_key_source,
+            base_note_source=pattern_pack_result.base_note_source,
             full_pattern_pack_size_bytes=full_pattern_pack_size_bytes,
             ai_request_pack_size_bytes=ai_request_pack_size_bytes,
             ai_prompt_size_bytes=ai_prompt_size_bytes,
@@ -223,20 +236,165 @@ def complete_ai_pattern_completion(
         _write_report(report_path, report)
         raise AIPatternCompletionError(message) from exc
 
-    if params.keep_ai_json and parsed_payload is not None:
-        ai_json_path.write_text(json.dumps(parsed_payload, indent=2) + "\n", encoding="utf-8")
-
-    validation_result = validate_ai_completion_notes(
-        ai_output=ai_output,
+    first_pass_proposed_note_count = len(first_ai_output.notes)
+    first_validation_result = validate_ai_completion_notes(
+        ai_output=first_ai_output,
         base_notes=pattern_pack_result.base_notes,
         project_duration_sec=pattern_pack_result.duration_sec,
         max_completion_notes=params.max_completion_notes,
     )
+    first_pass_rejected_reasons = dict(first_validation_result.rejected_reason_counts)
 
-    warnings.extend(validation_result.warnings)
+    final_ai_output = first_ai_output
+    final_validation_result = first_validation_result
+    raw_response_text = first_raw_response_text
+    parsed_payload = first_parsed_payload
+
+    if _should_retry_duplicate_feedback(
+        validation_result=first_validation_result,
+        proposed_note_count=first_pass_proposed_note_count,
+    ):
+        retry_count = 1
+        retry_reason = (
+            "First pass rejected notes were mostly duplicate_base_note_onset "
+            "or duplicate_base_note_overlap."
+        )
+
+        feedback_context = _build_retry_feedback_context(
+            ai_output=first_ai_output,
+            validation_result=first_validation_result,
+        )
+        system_prompt, user_prompt, combined_prompt = build_ai_completion_prompts(
+            ai_request_pack=ai_request_pack,
+            max_completion_notes=params.max_completion_notes,
+            feedback_context=feedback_context,
+        )
+        prompt_path.write_text(combined_prompt + "\n", encoding="utf-8")
+        ai_prompt_size_bytes = len(combined_prompt.encode("utf-8"))
+
+        if len(user_prompt) > _MAX_AI_PROMPT_CHARS or len(combined_prompt) > _MAX_AI_PROMPT_CHARS:
+            message = (
+                "AI request pack is too large for model context. "
+                f"Compact pack size: {ai_request_pack_size_bytes} bytes."
+            )
+            report = _error_report(
+                project_dir=project_dir,
+                layer=params.layer,
+                model_name=model_name,
+                pattern_pack_path=pattern_pack_path,
+                ai_request_pack_path=ai_request_pack_path,
+                prompt_path=prompt_path,
+                ai_json_path=ai_json_path,
+                midi_path=midi_path,
+                dry_run=False,
+                message=message,
+                raw_response_text=raw_response_text,
+                warnings=warnings,
+                api_key_source=api_key_source,
+                base_note_source=pattern_pack_result.base_note_source,
+                full_pattern_pack_size_bytes=full_pattern_pack_size_bytes,
+                ai_request_pack_size_bytes=ai_request_pack_size_bytes,
+                ai_prompt_size_bytes=ai_prompt_size_bytes,
+                retry_count=retry_count,
+                retry_reason=retry_reason,
+                first_pass_proposed_note_count=first_pass_proposed_note_count,
+                first_pass_rejected_reasons=first_pass_rejected_reasons,
+                final_proposed_note_count=first_pass_proposed_note_count,
+            )
+            _write_report(report_path, report)
+            raise AIPatternCompletionError(message)
+
+        try:
+            retry_raw_response_text, retry_parsed_payload, retry_ai_output = _request_ai_completion(
+                completion_client=completion_client,
+                api_key=api_key,
+                model_name=model_name,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=params.temperature,
+                max_completion_notes=params.max_completion_notes,
+            )
+        except OpenAIPatternCompletionClientError as exc:
+            report = _error_report(
+                project_dir=project_dir,
+                layer=params.layer,
+                model_name=model_name,
+                pattern_pack_path=pattern_pack_path,
+                ai_request_pack_path=ai_request_pack_path,
+                prompt_path=prompt_path,
+                ai_json_path=ai_json_path,
+                midi_path=midi_path,
+                dry_run=False,
+                message=str(exc),
+                raw_response_text=raw_response_text,
+                warnings=warnings,
+                api_key_source=api_key_source,
+                base_note_source=pattern_pack_result.base_note_source,
+                full_pattern_pack_size_bytes=full_pattern_pack_size_bytes,
+                ai_request_pack_size_bytes=ai_request_pack_size_bytes,
+                ai_prompt_size_bytes=ai_prompt_size_bytes,
+                retry_count=retry_count,
+                retry_reason=retry_reason,
+                first_pass_proposed_note_count=first_pass_proposed_note_count,
+                first_pass_rejected_reasons=first_pass_rejected_reasons,
+                final_proposed_note_count=first_pass_proposed_note_count,
+            )
+            _write_report(report_path, report)
+            raise AIPatternCompletionError(str(exc)) from exc
+        except ValidationError as exc:
+            message = f"AI JSON schema validation failed: {exc.errors()[0]['msg']}"
+            report = _error_report(
+                project_dir=project_dir,
+                layer=params.layer,
+                model_name=model_name,
+                pattern_pack_path=pattern_pack_path,
+                ai_request_pack_path=ai_request_pack_path,
+                prompt_path=prompt_path,
+                ai_json_path=ai_json_path,
+                midi_path=midi_path,
+                dry_run=False,
+                message=message,
+                raw_response_text=raw_response_text,
+                warnings=warnings,
+                api_key_source=api_key_source,
+                base_note_source=pattern_pack_result.base_note_source,
+                full_pattern_pack_size_bytes=full_pattern_pack_size_bytes,
+                ai_request_pack_size_bytes=ai_request_pack_size_bytes,
+                ai_prompt_size_bytes=ai_prompt_size_bytes,
+                retry_count=retry_count,
+                retry_reason=retry_reason,
+                first_pass_proposed_note_count=first_pass_proposed_note_count,
+                first_pass_rejected_reasons=first_pass_rejected_reasons,
+                final_proposed_note_count=first_pass_proposed_note_count,
+            )
+            _write_report(report_path, report)
+            raise AIPatternCompletionError(message) from exc
+
+        retry_validation_result = validate_ai_completion_notes(
+            ai_output=retry_ai_output,
+            base_notes=pattern_pack_result.base_notes,
+            project_duration_sec=pattern_pack_result.duration_sec,
+            max_completion_notes=params.max_completion_notes,
+        )
+
+        final_ai_output = retry_ai_output
+        final_validation_result = retry_validation_result
+        raw_response_text = retry_raw_response_text
+        parsed_payload = retry_parsed_payload
+
+    if params.keep_ai_json and parsed_payload is not None:
+        ai_json_path.write_text(json.dumps(parsed_payload, indent=2) + "\n", encoding="utf-8")
+
+    if retry_count == 1:
+        warnings.append(
+            "Triggered duplicate-feedback retry because first pass mostly duplicated base MIDI notes."
+        )
+    warnings.extend(final_validation_result.warnings)
+    if retry_count == 1 and not final_validation_result.accepted_notes:
+        warnings.append("AI completion produced no accepted notes after duplicate-feedback retry.")
 
     export_ai_completion_midi(
-        notes=validation_result.accepted_notes,
+        notes=final_validation_result.accepted_notes,
         output_midi_path=midi_path,
         ticks_per_beat=pattern_pack_result.ticks_per_beat,
         tempo_us_per_beat=pattern_pack_result.tempo_us_per_beat,
@@ -260,11 +418,17 @@ def complete_ai_pattern_completion(
         ai_json_file=(str(ai_json_path) if params.keep_ai_json else None),
         output_midi_file=str(midi_path),
         output_midi_path=str(midi_path),
-        proposed_note_count=len(ai_output.notes),
-        accepted_note_count=len(validation_result.accepted_notes),
-        rejected_note_count=len(validation_result.rejected_notes),
-        rejected_reasons=validation_result.rejected_reason_counts,
-        pitch_range_used=validation_result.pitch_range_used,
+        base_note_source=pattern_pack_result.base_note_source,
+        retry_count=retry_count,
+        retry_reason=retry_reason,
+        first_pass_proposed_note_count=first_pass_proposed_note_count,
+        first_pass_rejected_reasons=first_pass_rejected_reasons,
+        final_proposed_note_count=len(final_ai_output.notes),
+        proposed_note_count=len(final_ai_output.notes),
+        accepted_note_count=len(final_validation_result.accepted_notes),
+        rejected_note_count=len(final_validation_result.rejected_notes),
+        rejected_reasons=final_validation_result.rejected_reason_counts,
+        pitch_range_used=final_validation_result.pitch_range_used,
         warning_count=len(warnings),
         warnings=warnings,
         error=None,
@@ -339,6 +503,90 @@ def _load_dotenv_if_exists(path: Path) -> bool:
     return loaded
 
 
+def _request_ai_completion(
+    *,
+    completion_client: OpenAIPatternCompletionClient,
+    api_key: str,
+    model_name: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float,
+    max_completion_notes: int,
+) -> tuple[str, dict[str, object], AIPatternCompletionOutput]:
+    raw_response_text, parsed_payload = completion_client.complete_pattern(
+        api_key=api_key,
+        model=model_name,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=temperature,
+        max_completion_notes=max_completion_notes,
+    )
+    ai_output = AIPatternCompletionOutput.model_validate(parsed_payload)
+    return raw_response_text, parsed_payload, ai_output
+
+
+def _should_retry_duplicate_feedback(
+    *,
+    validation_result: AICompletionValidationResult,
+    proposed_note_count: int,
+) -> bool:
+    if proposed_note_count <= 0:
+        return False
+    if len(validation_result.accepted_notes) > 0:
+        return False
+
+    rejected_total = sum(validation_result.rejected_reason_counts.values())
+    if rejected_total <= 0:
+        return False
+
+    duplicate_count = (
+        validation_result.rejected_reason_counts.get("duplicate_base_note_onset", 0)
+        + validation_result.rejected_reason_counts.get("duplicate_base_note_overlap", 0)
+    )
+    if duplicate_count <= 0:
+        return False
+
+    return (float(duplicate_count) / float(rejected_total)) >= 0.6
+
+
+def _build_retry_feedback_context(
+    *,
+    ai_output: AIPatternCompletionOutput,
+    validation_result: AICompletionValidationResult,
+) -> str:
+    lines: list[str] = [
+        "The previous output was rejected during validation.",
+        "Rejected reasons summary: "
+        + json.dumps(validation_result.rejected_reason_counts, separators=(",", ":")),
+        (
+            "Regenerate the JSON. Do not place notes on existing base note onsets. "
+            "Do not copy referenced notes. Only add genuinely new missing/continuation notes "
+            "between existing base notes or after existing note endings."
+        ),
+        "Rejected note examples:",
+    ]
+
+    notes_by_id: dict[str, AIPatternCompletionNote] = {}
+    for note in ai_output.notes:
+        notes_by_id[note.note_id] = note
+
+    for rejected in validation_result.rejected_notes[:6]:
+        note = notes_by_id.get(rejected.note_id)
+        if note is None:
+            lines.append(f"- note_id={rejected.note_id}, reason={rejected.reason}")
+            continue
+        lines.append(
+            "- "
+            f"note_id={note.note_id}, "
+            f"start_sec={note.start_sec:.6f}, "
+            f"end_sec={note.end_sec:.6f}, "
+            f"pitch_midi={note.pitch_midi}, "
+            f"reason={rejected.reason}"
+        )
+
+    return "\n".join(lines)
+
+
 def _error_report(
     *,
     project_dir: Path,
@@ -354,12 +602,20 @@ def _error_report(
     raw_response_text: str | None = None,
     warnings: list[str] | None = None,
     api_key_source: str = "env",
+    base_note_source: str | None = None,
     full_pattern_pack_size_bytes: int = 0,
     ai_request_pack_size_bytes: int = 0,
     ai_prompt_size_bytes: int = 0,
+    retry_count: int = 0,
+    retry_reason: str | None = None,
+    first_pass_proposed_note_count: int = 0,
+    first_pass_rejected_reasons: dict[str, int] | None = None,
+    final_proposed_note_count: int = 0,
 ) -> AIPatternCompletionReport:
     warning_list = list(warnings or [])
     warning_list.append(message)
+    first_pass_rejected = dict(first_pass_rejected_reasons or {})
+
     return AIPatternCompletionReport(
         status="error",
         project_dir=str(project_dir),
@@ -378,7 +634,13 @@ def _error_report(
         ai_json_file=(str(ai_json_path) if ai_json_path.exists() else None),
         output_midi_file=(str(midi_path) if midi_path.exists() else None),
         output_midi_path=(str(midi_path) if midi_path.exists() else None),
-        proposed_note_count=0,
+        base_note_source=base_note_source,
+        retry_count=int(retry_count),
+        retry_reason=retry_reason,
+        first_pass_proposed_note_count=int(first_pass_proposed_note_count),
+        first_pass_rejected_reasons=first_pass_rejected,
+        final_proposed_note_count=int(final_proposed_note_count),
+        proposed_note_count=int(final_proposed_note_count),
         accepted_note_count=0,
         rejected_note_count=0,
         rejected_reasons={},

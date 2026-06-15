@@ -60,6 +60,36 @@ class _FakeAIClient:
         return json.dumps(self.payload), self.payload
 
 
+class _SequenceAIClient:
+    def __init__(self, payloads: list[dict[str, object]]) -> None:
+        self.payloads = payloads
+        self.call_count = 0
+
+    def complete_pattern(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        max_completion_notes: int,
+        max_output_tokens: int = 4000,
+    ) -> tuple[str, dict[str, object]]:
+        _ = (
+            api_key,
+            model,
+            system_prompt,
+            user_prompt,
+            temperature,
+            max_completion_notes,
+            max_output_tokens,
+        )
+        payload = self.payloads[min(self.call_count, len(self.payloads) - 1)]
+        self.call_count += 1
+        return json.dumps(payload), payload
+
+
 def _write_candidate_midi(path: Path) -> None:
     midi = mido.MidiFile(ticks_per_beat=480)
     track = mido.MidiTrack()
@@ -258,7 +288,11 @@ def test_prompt_builder_has_json_only_and_no_base_rewrite_instruction() -> None:
     assert "JSON only" in system_prompt
     assert "do not output a full bass transcription" in system_prompt
     assert "do not modify, delete, shorten, extend, or copy base MIDI notes" in system_prompt
+    assert "pattern_reference_note_ids are evidence/examples only" in system_prompt
+    assert "never create an AI completion note at the same start_sec as a base note" in system_prompt
     assert "Do not add more than 64 notes" in user_prompt
+    assert "Bad example (reject):" in user_prompt
+    assert "Good example (allowed):" in user_prompt
 
     payload = user_prompt.split("Pattern pack JSON:\n", maxsplit=1)[1]
     assert payload == json.dumps(ai_request_pack, separators=(",", ":"), ensure_ascii=False)
@@ -338,6 +372,10 @@ def test_compact_request_pack_limits_and_metadata() -> None:
     assert compact["included_counts"]["base_notes"] <= 180
     assert compact["included_counts"]["audio_activity_regions"] <= 180
     assert compact["included_counts"]["pitch_contour_summary"] <= 240
+    assert compact["base_occupancy_rules"]["do_not_place_ai_note_on_base_onset_within_ms"] == 30
+    assert compact["base_occupancy_rules"]["do_not_overlap_same_or_near_pitch_base_note_ratio"] == 0.7
+    assert compact["base_occupancy_rules"]["completion_track_role"] == "additive_missing_pattern_only"
+    assert all(bool(item.get("occupied")) for item in compact["base_notes"])
 
 
 def test_service_uses_compact_pack_for_prompt_and_writes_artifact(
@@ -441,6 +479,7 @@ def test_service_uses_compact_pack_for_prompt_and_writes_artifact(
             duration_sec=240.0,
             ticks_per_beat=480,
             tempo_us_per_beat=500000,
+            base_note_source="working.mid",
             warnings=[],
         ),
     )
@@ -551,6 +590,74 @@ def test_pattern_pack_builder_has_required_top_level_fields(tmp_path: Path) -> N
     assert "pitch_contour_summary" in pack
     assert "pattern_windows" in pack
     assert "instructions_for_ai" in pack
+    assert result.base_note_source.endswith("working.mid")
+
+
+def test_ai_completion_retries_once_when_first_pass_is_mostly_duplicate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project_dir = tmp_path / "project_retry"
+    _build_project_layout(project_dir)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    first_payload = {
+        "version": "1.0",
+        "track_role": "bass_ai_completion",
+        "timeline_reference": "wav_seconds",
+        "global_confidence": 0.7,
+        "notes": [
+            {
+                "note_id": "ai_bass_dup_000001",
+                "start_sec": 0.0,
+                "end_sec": 0.5,
+                "pitch_midi": 40,
+                "velocity": 80,
+                "confidence": 0.8,
+                "reason": "reinforcing existing motif",
+                "pattern_reference_note_ids": ["working_t00_ch00_p040_n000001"],
+                "risk": "low",
+            }
+        ],
+        "uncertain_regions": [],
+        "summary": "duplicate first pass",
+    }
+    second_payload = {
+        "version": "1.0",
+        "track_role": "bass_ai_completion",
+        "timeline_reference": "wav_seconds",
+        "global_confidence": 0.82,
+        "notes": [
+            {
+                "note_id": "ai_bass_new_000001",
+                "start_sec": 0.62,
+                "end_sec": 0.92,
+                "pitch_midi": 43,
+                "velocity": 92,
+                "confidence": 0.84,
+                "reason": "continuation after base note ending",
+                "pattern_reference_note_ids": ["working_t00_ch00_p040_n000001"],
+                "risk": "low",
+            }
+        ],
+        "uncertain_regions": [],
+        "summary": "new additive note",
+    }
+
+    sequence_client = _SequenceAIClient([first_payload, second_payload])
+    report = complete_ai_pattern_completion(
+        project_dir=project_dir,
+        params=AIPatternCompletionParameters(layer="bass", model="gpt-4o-mini"),
+        ai_client=sequence_client,
+    )
+
+    assert sequence_client.call_count == 2
+    assert report.retry_count == 1
+    assert report.retry_reason is not None
+    assert report.first_pass_proposed_note_count == 1
+    assert report.first_pass_rejected_reasons.get("duplicate_base_note_onset", 0) == 1
+    assert report.final_proposed_note_count == 1
+    assert report.accepted_note_count == 1
 
 
 def test_ai_completion_valid_notes_export_bass_ai_completion_midi(
@@ -666,7 +773,9 @@ def test_ai_completion_rejects_duplicate_overlap_with_base(
 
     assert report.status == "ok"
     assert report.accepted_note_count == 0
-    assert report.rejected_reasons.get("duplicate_base_note_onset", 0) == 1
+    duplicate_reject_count = report.rejected_reasons.get("duplicate_base_note_onset", 0)
+    duplicate_reject_count += report.rejected_reasons.get("duplicate_base_note_overlap", 0)
+    assert duplicate_reject_count == 1
 
 
 def test_ai_completion_dry_run_writes_pattern_and_prompt_without_api_call(

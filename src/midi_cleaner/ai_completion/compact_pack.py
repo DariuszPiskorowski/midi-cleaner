@@ -41,6 +41,12 @@ def build_ai_request_pack(
         "timeline": pattern_pack.get("timeline", {}),
         "base_midi_summary": pattern_pack.get("base_midi_summary", {}),
         "instructions_for_ai": pattern_pack.get("instructions_for_ai", {}),
+        "base_notes_are_occupied": True,
+        "base_occupancy_rules": {
+            "do_not_place_ai_note_on_base_onset_within_ms": 30,
+            "do_not_overlap_same_or_near_pitch_base_note_ratio": 0.7,
+            "completion_track_role": "additive_missing_pattern_only",
+        },
         "base_notes": selected_base_notes,
         "audio_activity_regions": selected_activity_regions,
         "pitch_contour_summary": selected_pitch_sections,
@@ -350,6 +356,7 @@ def _compact_note(note: dict[str, Any]) -> dict[str, object]:
         "pitch_midi": _to_int(note.get("pitch_midi"), 0),
         "velocity": _to_int(note.get("velocity"), 1),
         "confidence": _rounded(_to_float(note.get("confidence"), 0.0)),
+        "occupied": True,
     }
     source = note.get("source")
     if isinstance(source, str) and source:

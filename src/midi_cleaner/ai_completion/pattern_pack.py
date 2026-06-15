@@ -39,6 +39,7 @@ class PatternPackBuildResult:
     duration_sec: float
     ticks_per_beat: int
     tempo_us_per_beat: int
+    base_note_source: str
     warnings: list[str]
 
 
@@ -52,7 +53,7 @@ def build_pattern_pack(project_dir: Path, layer: str = "bass") -> PatternPackBui
     if not audio_features_path.exists() or not audio_features_path.is_file():
         raise PatternPackBuildError(f"Missing audio features: {audio_features_path}")
 
-    base_notes, base_note_source = _load_base_notes(analysis_dir)
+    base_notes, base_note_source = _load_base_notes(analysis_dir=analysis_dir, working_midi_path=working_midi_path)
     if not base_notes:
         raise PatternPackBuildError("Base note set is empty. Cannot build pattern_pack.json.")
 
@@ -71,6 +72,8 @@ def build_pattern_pack(project_dir: Path, layer: str = "bass") -> PatternPackBui
         warnings.append(
             "Pattern pack used note_events timing source because refined/repaired notes were unavailable."
         )
+    elif base_note_source.endswith("working.mid"):
+        warnings.append("Pattern pack used working.mid as canonical base note source.")
 
     base_notes_records = [_base_note_record(item) for item in base_notes]
     base_notes_records, trunc_warnings = _truncate_base_notes_if_needed(base_notes_records)
@@ -95,6 +98,7 @@ def build_pattern_pack(project_dir: Path, layer: str = "bass") -> PatternPackBui
     pattern_pack: dict[str, object] = {
         "version": "1.0",
         "track_role": layer,
+        "base_note_source": base_note_source,
         "timeline": {
             "duration_sec": round(duration_sec, 6),
             "time_origin": "wav_seconds",
@@ -127,12 +131,18 @@ def build_pattern_pack(project_dir: Path, layer: str = "bass") -> PatternPackBui
         duration_sec=duration_sec,
         ticks_per_beat=ticks_per_beat,
         tempo_us_per_beat=tempo_us_per_beat,
+        base_note_source=base_note_source,
         warnings=warnings,
     )
 
 
-def _load_base_notes(analysis_dir: Path) -> tuple[list[BasePatternNote], str]:
+def _load_base_notes(
+    *,
+    analysis_dir: Path,
+    working_midi_path: Path,
+) -> tuple[list[BasePatternNote], str]:
     source_candidates = [
+        working_midi_path,
         analysis_dir / "final_repaired_note_events.json",
         analysis_dir / "repaired_refined_note_events.json",
         analysis_dir / "refined_note_events.json",
@@ -142,6 +152,12 @@ def _load_base_notes(analysis_dir: Path) -> tuple[list[BasePatternNote], str]:
 
     for path in source_candidates:
         if not path.exists() or not path.is_file():
+            continue
+
+        if path.name == "working.mid":
+            notes = _load_base_notes_from_working_midi(path)
+            if notes:
+                return notes, str(path)
             continue
 
         if path.name.endswith("repaired_note_events.json") or path.name == "refined_note_events.json":
@@ -199,6 +215,75 @@ def _load_base_notes(analysis_dir: Path) -> tuple[list[BasePatternNote], str]:
             return notes, str(path)
 
     raise PatternPackBuildError("Missing note source in analysis directory.")
+
+
+def _load_base_notes_from_working_midi(path: Path) -> list[BasePatternNote]:
+    midi = mido.MidiFile(str(path))
+    ticks_per_beat = int(midi.ticks_per_beat)
+
+    tempo_us_per_beat = 500000
+    found_tempo = False
+    for track in midi.tracks:
+        for message in track:
+            if message.type == "set_tempo":
+                tempo_us_per_beat = int(message.tempo)
+                found_tempo = True
+                break
+        if found_tempo:
+            break
+
+    ticks_per_second = (float(ticks_per_beat) * 1_000_000.0) / float(tempo_us_per_beat)
+
+    active_notes: dict[tuple[int, int], list[tuple[float, int]]] = {}
+    emitted: list[BasePatternNote] = []
+    note_counter = 0
+
+    for track_index, track in enumerate(midi.tracks):
+        abs_tick = 0
+        for message in track:
+            abs_tick += int(message.time)
+
+            if message.type not in {"note_on", "note_off"}:
+                continue
+
+            note_value = int(getattr(message, "note", 0))
+            channel = int(getattr(message, "channel", 0))
+            velocity = int(getattr(message, "velocity", 0))
+            key = (note_value, channel)
+            current_sec = abs_tick / max(1e-9, ticks_per_second)
+
+            is_on = message.type == "note_on" and velocity > 0
+            if is_on:
+                active_notes.setdefault(key, []).append((current_sec, velocity))
+                continue
+
+            starts = active_notes.get(key)
+            if not starts:
+                continue
+
+            start_sec, start_velocity = starts.pop(0)
+            end_sec = max(start_sec + 1e-6, current_sec)
+            duration_sec = max(1e-6, end_sec - start_sec)
+            note_counter += 1
+            emitted.append(
+                BasePatternNote(
+                    note_id=(
+                        f"working_t{track_index:02d}"
+                        f"_ch{channel:02d}_p{note_value:03d}_n{note_counter:06d}"
+                    ),
+                    start_sec=float(start_sec),
+                    end_sec=float(end_sec),
+                    duration_sec=float(duration_sec),
+                    pitch_midi=note_value,
+                    velocity=max(1, min(127, int(start_velocity))),
+                    confidence=None,
+                    source="working.mid",
+                    reasons=[],
+                )
+            )
+
+    emitted.sort(key=lambda item: (item.start_sec, item.end_sec, item.pitch_midi))
+    return emitted
 
 
 def _load_optional_dsp(path: Path) -> DspAudioFeatureDocument | None:
