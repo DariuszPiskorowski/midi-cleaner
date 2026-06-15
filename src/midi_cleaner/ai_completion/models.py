@@ -61,6 +61,7 @@ class AIPatternCompletionReport(BaseModel):
     allowed_completion_region_count: int = 0
     allowed_completion_regions_file: str | None = None
     notes_by_region: dict[str, int] = Field(default_factory=dict)
+    region_reports: list[dict[str, object]] = Field(default_factory=list)
     json_retry_count: int = 0
     json_retry_reason: str | None = None
     retry_count: int = 0

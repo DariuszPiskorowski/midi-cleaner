@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 import json
@@ -163,6 +164,11 @@ def complete_ai_pattern_completion(
         raise AIPatternCompletionError(message)
 
     if params.dry_run:
+        region_reports = _build_region_reports(
+            allowed_completion_regions=pattern_pack_result.allowed_completion_regions,
+            ai_output=None,
+            validation_result=None,
+        )
         report = AIPatternCompletionReport(
             status="ok",
             project_dir=str(project_dir),
@@ -185,6 +191,7 @@ def complete_ai_pattern_completion(
             allowed_completion_region_count=len(pattern_pack_result.allowed_completion_regions),
             allowed_completion_regions_file=str(allowed_regions_path),
             notes_by_region={},
+            region_reports=region_reports,
             json_retry_count=0,
             json_retry_reason=None,
             retry_count=0,
@@ -718,6 +725,11 @@ def complete_ai_pattern_completion(
         warnings.append(
             "Triggered duplicate-feedback retry because first pass mostly duplicated base MIDI notes."
         )
+    region_reports = _build_region_reports(
+        allowed_completion_regions=pattern_pack_result.allowed_completion_regions,
+        ai_output=final_ai_output,
+        validation_result=final_validation_result,
+    )
     if len(pattern_pack_result.allowed_completion_regions) == 0:
         warnings.append("No allowed completion regions were detected.")
     if final_validation_result.rejected_reason_counts.get("outside_allowed_completion_region", 0) > 0:
@@ -755,6 +767,7 @@ def complete_ai_pattern_completion(
         allowed_completion_region_count=len(pattern_pack_result.allowed_completion_regions),
         allowed_completion_regions_file=str(allowed_regions_path),
         notes_by_region=final_validation_result.accepted_note_count_by_region,
+        region_reports=region_reports,
         json_retry_count=json_retry_count,
         json_retry_reason=json_retry_reason,
         retry_count=retry_count,
@@ -1020,6 +1033,7 @@ def _error_report(
     allowed_completion_region_count: int = 0,
     allowed_completion_regions_file: str | None = None,
     notes_by_region: dict[str, int] | None = None,
+    region_reports: list[dict[str, object]] | None = None,
     full_pattern_pack_size_bytes: int = 0,
     ai_request_pack_size_bytes: int = 0,
     ai_prompt_size_bytes: int = 0,
@@ -1062,6 +1076,7 @@ def _error_report(
         allowed_completion_region_count=int(allowed_completion_region_count),
         allowed_completion_regions_file=allowed_completion_regions_file,
         notes_by_region=dict(notes_by_region or {}),
+        region_reports=list(region_reports or []),
         json_retry_count=int(json_retry_count),
         json_retry_reason=json_retry_reason,
         retry_count=int(retry_count),
@@ -1089,3 +1104,96 @@ def _error_report(
 def _write_report(report_path: Path, report: AIPatternCompletionReport) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+
+def _build_region_reports(
+    *,
+    allowed_completion_regions,
+    ai_output: AIPatternCompletionOutput | None,
+    validation_result: AICompletionValidationResult | None,
+) -> list[dict[str, object]]:
+    if not allowed_completion_regions:
+        return []
+
+    proposed_by_region: dict[str, int] = defaultdict(int)
+    accepted_by_region: dict[str, int] = {}
+    rejected_by_region: dict[str, int] = defaultdict(int)
+
+    notes_by_id: dict[str, AIPatternCompletionNote] = {}
+    if ai_output is not None:
+        for note in ai_output.notes:
+            notes_by_id[note.note_id] = note
+            region_id = _find_region_id_for_timing(
+                start_sec=float(note.start_sec),
+                end_sec=float(note.end_sec),
+                allowed_completion_regions=allowed_completion_regions,
+            )
+            if region_id is not None:
+                proposed_by_region[region_id] += 1
+
+    if validation_result is not None:
+        accepted_by_region = dict(validation_result.accepted_note_count_by_region)
+        for rejected in validation_result.rejected_notes:
+            rejected_note = notes_by_id.get(rejected.note_id)
+            if rejected_note is None:
+                continue
+            region_id = _find_region_id_for_timing(
+                start_sec=float(rejected_note.start_sec),
+                end_sec=float(rejected_note.end_sec),
+                allowed_completion_regions=allowed_completion_regions,
+            )
+            if region_id is not None:
+                rejected_by_region[region_id] += 1
+
+    report_rows: list[dict[str, object]] = []
+    for region in allowed_completion_regions:
+        region_id = region.region_id
+        proposed_count = int(proposed_by_region.get(region_id, 0))
+        accepted_count = int(accepted_by_region.get(region_id, 0))
+        rejected_count = int(rejected_by_region.get(region_id, 0))
+
+        zero_reason: str | None = None
+        if accepted_count == 0:
+            if proposed_count == 0:
+                if bool(region.optional_region):
+                    zero_reason = "optional_or_low_confidence_region"
+                elif int(region.expected_note_count_min) > 0:
+                    zero_reason = "required_region_received_no_notes"
+                else:
+                    zero_reason = "no_notes_proposed"
+            else:
+                zero_reason = "all_region_notes_rejected"
+
+        report_rows.append(
+            {
+                "region_id": region_id,
+                "write_start_sec": round(float(region.write_start_sec), 6),
+                "write_end_sec": round(float(region.write_end_sec), 6),
+                "notes_before_count": len(region.notes_before),
+                "notes_after_count": len(region.notes_after),
+                "local_pitch_set": [int(value) for value in region.local_pitch_set],
+                "detected_local_motif": dict(region.detected_local_motif),
+                "motif_confidence": round(float(region.motif_confidence), 6),
+                "optional_region": bool(region.optional_region),
+                "ai_notes_proposed": proposed_count,
+                "ai_notes_accepted": accepted_count,
+                "ai_notes_rejected": rejected_count,
+                "reason_if_zero_notes": zero_reason,
+            }
+        )
+
+    return report_rows
+
+
+def _find_region_id_for_timing(
+    *,
+    start_sec: float,
+    end_sec: float,
+    allowed_completion_regions,
+) -> str | None:
+    for region in allowed_completion_regions:
+        write_start = float(getattr(region, "write_start_sec", region.start_sec))
+        write_end = float(getattr(region, "write_end_sec", region.end_sec))
+        if start_sec >= write_start and end_sec <= write_end:
+            return region.region_id
+    return None

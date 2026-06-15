@@ -50,6 +50,19 @@ def validate_ai_completion_notes(
     allowed_pitch_min = base_pitch_min - 12
     allowed_pitch_max = base_pitch_max + 12
 
+    if allowed_completion_regions:
+        region_mins = [
+            int(region.local_pitch_range.get("min", base_pitch_min))
+            for region in allowed_completion_regions
+        ]
+        region_maxs = [
+            int(region.local_pitch_range.get("max", base_pitch_max))
+            for region in allowed_completion_regions
+        ]
+        if region_mins and region_maxs:
+            allowed_pitch_min = min(region_mins)
+            allowed_pitch_max = max(region_maxs)
+
     if not allowed_completion_regions:
         for note in sorted(ai_output.notes, key=lambda item: (item.start_sec, item.end_sec)):
             reason = "outside_allowed_completion_region"
@@ -179,12 +192,17 @@ def _validate_note(
     if region is None:
         return "outside_allowed_completion_region"
 
-    if int(note.pitch_midi) < int(region.allowed_pitch_range["min"]):
+    if int(note.pitch_midi) < int(region.local_pitch_range["min"]):
         return "pitch_below_region_range"
-    if int(note.pitch_midi) > int(region.allowed_pitch_range["max"]):
+    if int(note.pitch_midi) > int(region.local_pitch_range["max"]):
         return "pitch_above_region_range"
-    if region.preferred_pitches and int(note.pitch_midi) not in set(int(value) for value in region.preferred_pitches):
-        return "pitch_not_in_preferred_pitch_set"
+    local_pitch_set = set(int(value) for value in region.local_pitch_set)
+    if (
+        local_pitch_set
+        and int(note.pitch_midi) not in local_pitch_set
+        and not bool(region.allow_pitch_outside_local_set)
+    ):
+        return "pitch_not_in_local_pitch_set"
 
     if duration_sec < float(region.min_note_duration_sec):
         return "note_too_short"
@@ -210,7 +228,9 @@ def _find_note_region_id(
     end_sec = float(note.end_sec)
 
     for region in allowed_completion_regions:
-        if start_sec >= float(region.start_sec) and end_sec <= float(region.end_sec):
+        write_start_sec = float(getattr(region, "write_start_sec", region.start_sec))
+        write_end_sec = float(getattr(region, "write_end_sec", region.end_sec))
+        if start_sec >= write_start_sec and end_sec <= write_end_sec:
             return region.region_id
     return None
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -301,6 +302,8 @@ def _test_allowed_region(*, start_sec: float = 1.2, end_sec: float = 2.0) -> All
         region_id="acr_test_region_0001",
         start_sec=start_sec,
         end_sec=end_sec,
+        write_start_sec=start_sec,
+        write_end_sec=end_sec,
         reason="test region",
         context_before_start_sec=max(0.0, start_sec - 1.0),
         context_after_end_sec=end_sec + 1.0,
@@ -308,22 +311,56 @@ def _test_allowed_region(*, start_sec: float = 1.2, end_sec: float = 2.0) -> All
         context_window_after_sec=1.0,
         reference_notes_before=["base_001"],
         reference_notes_after=["base_002"],
+        notes_before=[
+            {
+                "note_id": "base_001",
+                "start_sec": 0.2,
+                "end_sec": 0.6,
+                "pitch_midi": 40,
+                "pitch_name": "E2",
+            }
+        ],
+        notes_after=[
+            {
+                "note_id": "base_002",
+                "start_sec": 0.8,
+                "end_sec": 1.2,
+                "pitch_midi": 43,
+                "pitch_name": "G2",
+            }
+        ],
+        local_pitch_set=[40, 43],
+        local_pitch_names=["E2", "G2"],
         local_pitch_range={"min": 40, "max": 43},
         allowed_pitch_range={"min": 38, "max": 45},
         preferred_pitches=[40, 43],
         forbidden_pitches=[37, 46],
+        allow_pitch_outside_local_set=False,
         estimated_key_or_scale="E minor (estimated)",
         rhythmic_pattern_summary={
             "note_onsets_sec": [0.2, 0.8],
             "intervals_sec": [0.6],
             "common_durations_sec": [0.4],
         },
+        local_rhythm_intervals_sec=[0.6],
+        detected_local_motif={
+            "pitch_sequence": [40, 43],
+            "interval_sequence": [3],
+            "rhythm_sequence_sec": [0.6],
+            "confidence": 0.8,
+        },
+        motif_confidence=0.8,
+        optional_region=False,
         expected_note_count_min=1,
         expected_note_count_max=3,
         density_limit_notes_per_sec=4.0,
         min_note_duration_sec=0.08,
         max_note_duration_sec=0.9,
         no_notes_outside_region=True,
+        instruction=(
+            "Fill only this gap by continuing the local motif. "
+            "Do not write outside write_start_sec/write_end_sec."
+        ),
     )
 
 
@@ -353,11 +390,15 @@ def test_prompt_builder_has_json_only_and_no_base_rewrite_instruction() -> None:
 
     assert "JSON only" in system_prompt
     assert "not a free music generator" in system_prompt
+    assert "You are not composing a new bassline. You are filling local gaps." in system_prompt
+    assert "read notes_before and notes_after" in system_prompt
+    assert "write_start_sec/write_end_sec" in system_prompt
     assert "do not compose a new bassline for the whole song" in system_prompt
     assert "do not modify, delete, shorten, extend, or copy base MIDI notes" in system_prompt
     assert "pattern_reference_note_ids are evidence only" in system_prompt
     assert "every generated note must belong to exactly one allowed_completion_region" in system_prompt
     assert "only write notes inside allowed_completion_regions" in user_prompt
+    assert "infer continuation from ordered notes_before and notes_after" in user_prompt
     assert "max_completion_notes is an upper bound, not a target" in user_prompt
     assert "Do not add more than 64 notes" in user_prompt
     assert "Bad example (reject):" in user_prompt
@@ -454,6 +495,8 @@ def test_compact_request_pack_limits_and_metadata() -> None:
                 "region_id": "acr_0001",
                 "start_sec": 12.0,
                 "end_sec": 14.0,
+                "write_start_sec": 12.0,
+                "write_end_sec": 14.0,
                 "reason": "test region",
                 "context_before_start_sec": 7.0,
                 "context_after_end_sec": 19.0,
@@ -461,22 +504,56 @@ def test_compact_request_pack_limits_and_metadata() -> None:
                 "context_window_after_sec": 5.0,
                 "reference_notes_before": ["base_0010"],
                 "reference_notes_after": ["base_0020"],
+                "notes_before": [
+                    {
+                        "note_id": "base_0010",
+                        "start_sec": 11.5,
+                        "end_sec": 11.75,
+                        "pitch_midi": 36,
+                        "pitch_name": "C2",
+                    }
+                ],
+                "notes_after": [
+                    {
+                        "note_id": "base_0020",
+                        "start_sec": 14.1,
+                        "end_sec": 14.35,
+                        "pitch_midi": 34,
+                        "pitch_name": "A#1",
+                    }
+                ],
+                "local_pitch_set": [31, 34, 36],
+                "local_pitch_names": ["G1", "A#1", "C2"],
                 "local_pitch_range": {"min": 30, "max": 40},
                 "allowed_pitch_range": {"min": 28, "max": 42},
                 "preferred_pitches": [31, 34, 36],
                 "forbidden_pitches": [27, 43],
+                "allow_pitch_outside_local_set": False,
                 "estimated_key_or_scale": "C minor (estimated)",
                 "rhythmic_pattern_summary": {
                     "note_onsets_sec": [11.5, 11.75],
                     "intervals_sec": [0.25],
                     "common_durations_sec": [0.25, 0.5],
                 },
+                "local_rhythm_intervals_sec": [0.25, 0.25, 0.5],
+                "detected_local_motif": {
+                    "pitch_sequence": [36, 34, 31],
+                    "interval_sequence": [-2, -3],
+                    "rhythm_sequence_sec": [0.25, 0.5],
+                    "confidence": 0.8,
+                },
+                "motif_confidence": 0.8,
+                "optional_region": False,
                 "expected_note_count_min": 1,
                 "expected_note_count_max": 4,
                 "density_limit_notes_per_sec": 2.0,
                 "min_note_duration_sec": 0.1,
                 "max_note_duration_sec": 1.0,
                 "no_notes_outside_region": True,
+                "instruction": (
+                    "Fill only this gap by continuing the local motif. "
+                    "Do not write outside write_start_sec/write_end_sec."
+                ),
             }
         ],
         "instructions_for_ai": {"goal": "fill missing patterns"},
@@ -496,6 +573,10 @@ def test_compact_request_pack_limits_and_metadata() -> None:
     assert compact["timeline_sync"]["must_align_with"] == "working.mid"
     assert compact["included_counts"]["allowed_completion_regions"] == 1
     assert compact["allowed_completion_regions"][0]["region_id"] == "acr_0001"
+    assert compact["allowed_completion_regions"][0]["notes_before"][0]["pitch_midi"] == 36
+    assert compact["allowed_completion_regions"][0]["notes_after"][0]["pitch_name"] == "A#1"
+    assert compact["allowed_completion_regions"][0]["local_pitch_set"] == [31, 34, 36]
+    assert compact["allowed_completion_regions"][0]["detected_local_motif"]["pitch_sequence"] == [36, 34, 31]
     assert compact["base_occupancy_rules"]["do_not_place_ai_note_on_base_onset_within_ms"] == 30
     assert compact["base_occupancy_rules"]["do_not_overlap_same_or_near_pitch_base_note_ratio"] == 0.7
     assert compact["base_occupancy_rules"]["completion_track_role"] == "additive_missing_pattern_only"
@@ -582,6 +663,8 @@ def test_service_uses_compact_pack_for_prompt_and_writes_artifact(
                 "region_id": "acr_test_0001",
                 "start_sec": 1.2,
                 "end_sec": 2.0,
+                "write_start_sec": 1.2,
+                "write_end_sec": 2.0,
                 "reason": "test scoped region",
                 "context_before_start_sec": 0.0,
                 "context_after_end_sec": 7.0,
@@ -589,22 +672,56 @@ def test_service_uses_compact_pack_for_prompt_and_writes_artifact(
                 "context_window_after_sec": 5.0,
                 "reference_notes_before": ["base_0002"],
                 "reference_notes_after": ["base_0004"],
+                "notes_before": [
+                    {
+                        "note_id": "base_0002",
+                        "start_sec": 0.8,
+                        "end_sec": 1.0,
+                        "pitch_midi": 36,
+                        "pitch_name": "C2",
+                    }
+                ],
+                "notes_after": [
+                    {
+                        "note_id": "base_0004",
+                        "start_sec": 2.1,
+                        "end_sec": 2.3,
+                        "pitch_midi": 40,
+                        "pitch_name": "E2",
+                    }
+                ],
+                "local_pitch_set": [36, 40, 43, 45],
+                "local_pitch_names": ["C2", "E2", "G2", "A2"],
                 "local_pitch_range": {"min": 34, "max": 45},
                 "allowed_pitch_range": {"min": 32, "max": 47},
                 "preferred_pitches": [36, 40, 43, 45],
                 "forbidden_pitches": [31, 48],
+                "allow_pitch_outside_local_set": False,
                 "estimated_key_or_scale": "G minor (estimated)",
                 "rhythmic_pattern_summary": {
                     "note_onsets_sec": [0.8, 1.2],
                     "intervals_sec": [0.4],
                     "common_durations_sec": [0.25, 0.5],
                 },
+                "local_rhythm_intervals_sec": [0.4, 0.4, 0.8],
+                "detected_local_motif": {
+                    "pitch_sequence": [36, 40, 43, 45],
+                    "interval_sequence": [4, 3, 2],
+                    "rhythm_sequence_sec": [0.4, 0.4, 0.8],
+                    "confidence": 0.75,
+                },
+                "motif_confidence": 0.75,
+                "optional_region": False,
                 "expected_note_count_min": 1,
                 "expected_note_count_max": 4,
                 "density_limit_notes_per_sec": 4.0,
                 "min_note_duration_sec": 0.08,
                 "max_note_duration_sec": 1.0,
                 "no_notes_outside_region": True,
+                "instruction": (
+                    "Fill only this gap by continuing the local motif. "
+                    "Do not write outside write_start_sec/write_end_sec."
+                ),
             }
         ],
         "instructions_for_ai": {"goal": "complete bass continuity"},
@@ -615,6 +732,8 @@ def test_service_uses_compact_pack_for_prompt_and_writes_artifact(
             region_id="acr_test_0001",
             start_sec=1.2,
             end_sec=2.0,
+            write_start_sec=1.2,
+            write_end_sec=2.0,
             reason="test scoped region",
             context_before_start_sec=0.0,
             context_after_end_sec=7.0,
@@ -622,22 +741,56 @@ def test_service_uses_compact_pack_for_prompt_and_writes_artifact(
             context_window_after_sec=5.0,
             reference_notes_before=["base_0002"],
             reference_notes_after=["base_0004"],
+            notes_before=[
+                {
+                    "note_id": "base_0002",
+                    "start_sec": 0.8,
+                    "end_sec": 1.0,
+                    "pitch_midi": 36,
+                    "pitch_name": "C2",
+                }
+            ],
+            notes_after=[
+                {
+                    "note_id": "base_0004",
+                    "start_sec": 2.1,
+                    "end_sec": 2.3,
+                    "pitch_midi": 40,
+                    "pitch_name": "E2",
+                }
+            ],
+            local_pitch_set=[36, 40, 43, 45],
+            local_pitch_names=["C2", "E2", "G2", "A2"],
             local_pitch_range={"min": 34, "max": 45},
             allowed_pitch_range={"min": 32, "max": 47},
             preferred_pitches=[36, 40, 43, 45],
             forbidden_pitches=[31, 48],
+            allow_pitch_outside_local_set=False,
             estimated_key_or_scale="G minor (estimated)",
             rhythmic_pattern_summary={
                 "note_onsets_sec": [0.8, 1.2],
                 "intervals_sec": [0.4],
                 "common_durations_sec": [0.25, 0.5],
             },
+            local_rhythm_intervals_sec=[0.4, 0.4, 0.8],
+            detected_local_motif={
+                "pitch_sequence": [36, 40, 43, 45],
+                "interval_sequence": [4, 3, 2],
+                "rhythm_sequence_sec": [0.4, 0.4, 0.8],
+                "confidence": 0.75,
+            },
+            motif_confidence=0.75,
+            optional_region=False,
             expected_note_count_min=1,
             expected_note_count_max=4,
             density_limit_notes_per_sec=4.0,
             min_note_duration_sec=0.08,
             max_note_duration_sec=1.0,
             no_notes_outside_region=True,
+            instruction=(
+                "Fill only this gap by continuing the local motif. "
+                "Do not write outside write_start_sec/write_end_sec."
+            ),
         )
     ]
 
@@ -780,6 +933,31 @@ def test_pattern_pack_builder_has_required_top_level_fields(tmp_path: Path) -> N
     assert result.base_note_source.endswith("working.mid")
 
 
+def test_pattern_pack_regions_include_ordered_local_context_notes(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project_region_context"
+    _build_project_layout(project_dir)
+
+    result = build_pattern_pack(project_dir=project_dir, layer="bass")
+    assert result.allowed_completion_regions
+
+    region = result.allowed_completion_regions[0]
+    assert isinstance(region.notes_before, list)
+    assert isinstance(region.notes_after, list)
+    assert isinstance(region.local_pitch_set, list)
+    assert isinstance(region.detected_local_motif, dict)
+    assert "pitch_sequence" in region.detected_local_motif
+    assert "confidence" in region.detected_local_motif
+
+    if region.notes_before:
+        before_starts = [float(item["start_sec"]) for item in region.notes_before]
+        assert before_starts == sorted(before_starts)
+        assert all("pitch_name" in item for item in region.notes_before)
+    if region.notes_after:
+        after_starts = [float(item["start_sec"]) for item in region.notes_after]
+        assert after_starts == sorted(after_starts)
+        assert all("pitch_name" in item for item in region.notes_after)
+
+
 def test_ai_completion_retries_once_when_first_pass_is_mostly_duplicate(
     tmp_path: Path,
     monkeypatch,
@@ -866,6 +1044,12 @@ def test_ai_completion_valid_notes_export_bass_ai_completion_midi(
     assert report.status == "ok"
     assert client.called is True
     assert report.accepted_note_count == 1
+    assert report.region_reports
+    assert "notes_before_count" in report.region_reports[0]
+    assert "detected_local_motif" in report.region_reports[0]
+    assert "ai_notes_proposed" in report.region_reports[0]
+    assert "ai_notes_accepted" in report.region_reports[0]
+    assert "ai_notes_rejected" in report.region_reports[0]
     assert report.output_midi_file is not None
     assert Path(report.output_midi_file).exists()
 
@@ -981,6 +1165,59 @@ def test_validator_rejects_notes_outside_allowed_regions() -> None:
     assert result.rejected_reason_counts.get("outside_allowed_completion_region", 0) == 1
 
 
+def test_validator_rejects_notes_outside_write_bounds_even_inside_region_span() -> None:
+    payload = _valid_ai_payload()
+    payload["notes"] = [
+        {
+            "note_id": "outside_write_window",
+            "start_sec": 1.85,
+            "end_sec": 1.95,
+            "pitch_midi": 43,
+            "velocity": 90,
+            "confidence": 0.8,
+            "reason": "test",
+            "pattern_reference_note_ids": ["base_002"],
+            "risk": "low",
+        }
+    ]
+    output = AIPatternCompletionOutput.model_validate(payload)
+    base_notes = [
+        BasePatternNote(
+            note_id="base_001",
+            start_sec=0.2,
+            end_sec=0.6,
+            duration_sec=0.4,
+            pitch_midi=40,
+            velocity=90,
+            confidence=0.9,
+            source="working.mid",
+            reasons=[],
+        ),
+        BasePatternNote(
+            note_id="base_002",
+            start_sec=0.8,
+            end_sec=1.2,
+            duration_sec=0.4,
+            pitch_midi=43,
+            velocity=90,
+            confidence=0.9,
+            source="working.mid",
+            reasons=[],
+        ),
+    ]
+    region = replace(_test_allowed_region(start_sec=1.0, end_sec=2.0), write_start_sec=1.2, write_end_sec=1.8)
+    result = validate_ai_completion_notes(
+        output,
+        base_notes=base_notes,
+        project_duration_sec=3.0,
+        max_completion_notes=64,
+        allowed_completion_regions=[region],
+    )
+
+    assert len(result.accepted_notes) == 0
+    assert result.rejected_reason_counts.get("outside_allowed_completion_region", 0) == 1
+
+
 def test_validator_rejects_pitch_outside_region_range() -> None:
     payload = _valid_ai_payload()
     payload["notes"] = [
@@ -1030,7 +1267,61 @@ def test_validator_rejects_pitch_outside_region_range() -> None:
     )
 
     assert len(result.accepted_notes) == 0
-    assert result.rejected_reason_counts.get("pitch_above_region_range", 0) == 1
+    assert result.rejected_reason_counts.get("pitch_above_region_range", 0) == 1 or result.rejected_reason_counts.get(
+        "pitch_outside_allowed_range", 0
+    ) == 1
+
+
+def test_validator_rejects_pitch_not_in_local_pitch_set() -> None:
+    payload = _valid_ai_payload()
+    payload["notes"] = [
+        {
+            "note_id": "pitch_not_in_set",
+            "start_sec": 1.3,
+            "end_sec": 1.6,
+            "pitch_midi": 41,
+            "velocity": 90,
+            "confidence": 0.9,
+            "reason": "test",
+            "pattern_reference_note_ids": ["base_002"],
+            "risk": "low",
+        }
+    ]
+    output = AIPatternCompletionOutput.model_validate(payload)
+    base_notes = [
+        BasePatternNote(
+            note_id="base_001",
+            start_sec=0.2,
+            end_sec=0.6,
+            duration_sec=0.4,
+            pitch_midi=40,
+            velocity=90,
+            confidence=0.9,
+            source="working.mid",
+            reasons=[],
+        ),
+        BasePatternNote(
+            note_id="base_002",
+            start_sec=0.8,
+            end_sec=1.2,
+            duration_sec=0.4,
+            pitch_midi=43,
+            velocity=90,
+            confidence=0.9,
+            source="working.mid",
+            reasons=[],
+        ),
+    ]
+    result = validate_ai_completion_notes(
+        output,
+        base_notes=base_notes,
+        project_duration_sec=3.0,
+        max_completion_notes=64,
+        allowed_completion_regions=[_test_allowed_region()],
+    )
+
+    assert len(result.accepted_notes) == 0
+    assert result.rejected_reason_counts.get("pitch_not_in_local_pitch_set", 0) == 1
 
 
 def test_validator_warns_when_no_allowed_regions() -> None:

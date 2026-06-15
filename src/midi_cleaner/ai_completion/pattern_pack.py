@@ -38,6 +38,8 @@ class AllowedCompletionRegion:
     region_id: str
     start_sec: float
     end_sec: float
+    write_start_sec: float
+    write_end_sec: float
     reason: str
     context_before_start_sec: float
     context_after_end_sec: float
@@ -45,18 +47,28 @@ class AllowedCompletionRegion:
     context_window_after_sec: float
     reference_notes_before: list[str]
     reference_notes_after: list[str]
+    notes_before: list[dict[str, object]]
+    notes_after: list[dict[str, object]]
+    local_pitch_set: list[int]
+    local_pitch_names: list[str]
     local_pitch_range: dict[str, int]
     allowed_pitch_range: dict[str, int]
     preferred_pitches: list[int]
     forbidden_pitches: list[int]
+    allow_pitch_outside_local_set: bool
     estimated_key_or_scale: str
     rhythmic_pattern_summary: dict[str, object]
+    local_rhythm_intervals_sec: list[float]
+    detected_local_motif: dict[str, object]
+    motif_confidence: float
+    optional_region: bool
     expected_note_count_min: int
     expected_note_count_max: int
     density_limit_notes_per_sec: float
     min_note_duration_sec: float
     max_note_duration_sec: float
     no_notes_outside_region: bool
+    instruction: str
 
 
 @dataclass(frozen=True)
@@ -660,6 +672,8 @@ def _allowed_region_record(region: AllowedCompletionRegion) -> dict[str, object]
         "region_id": region.region_id,
         "start_sec": round(region.start_sec, 6),
         "end_sec": round(region.end_sec, 6),
+        "write_start_sec": round(region.write_start_sec, 6),
+        "write_end_sec": round(region.write_end_sec, 6),
         "reason": region.reason,
         "context_before_start_sec": round(region.context_before_start_sec, 6),
         "context_after_end_sec": round(region.context_after_end_sec, 6),
@@ -667,6 +681,10 @@ def _allowed_region_record(region: AllowedCompletionRegion) -> dict[str, object]
         "context_window_after_sec": round(region.context_window_after_sec, 6),
         "reference_notes_before": list(region.reference_notes_before),
         "reference_notes_after": list(region.reference_notes_after),
+        "notes_before": [dict(item) for item in region.notes_before],
+        "notes_after": [dict(item) for item in region.notes_after],
+        "local_pitch_set": [int(value) for value in region.local_pitch_set],
+        "local_pitch_names": [str(value) for value in region.local_pitch_names],
         "local_pitch_range": {
             "min": int(region.local_pitch_range["min"]),
             "max": int(region.local_pitch_range["max"]),
@@ -677,14 +695,22 @@ def _allowed_region_record(region: AllowedCompletionRegion) -> dict[str, object]
         },
         "preferred_pitches": [int(value) for value in region.preferred_pitches],
         "forbidden_pitches": [int(value) for value in region.forbidden_pitches],
+        "allow_pitch_outside_local_set": bool(region.allow_pitch_outside_local_set),
         "estimated_key_or_scale": region.estimated_key_or_scale,
         "rhythmic_pattern_summary": dict(region.rhythmic_pattern_summary),
+        "local_rhythm_intervals_sec": [
+            round(float(value), 6) for value in region.local_rhythm_intervals_sec
+        ],
+        "detected_local_motif": dict(region.detected_local_motif),
+        "motif_confidence": round(float(region.motif_confidence), 6),
+        "optional_region": bool(region.optional_region),
         "expected_note_count_min": int(region.expected_note_count_min),
         "expected_note_count_max": int(region.expected_note_count_max),
         "density_limit_notes_per_sec": round(region.density_limit_notes_per_sec, 6),
         "min_note_duration_sec": round(region.min_note_duration_sec, 6),
         "max_note_duration_sec": round(region.max_note_duration_sec, 6),
         "no_notes_outside_region": bool(region.no_notes_outside_region),
+        "instruction": region.instruction,
     }
 
 
@@ -829,6 +855,7 @@ def _detect_allowed_completion_regions(
             )
 
         local_pitches = [int(item.pitch_midi) for item in local_notes]
+        local_pitch_set = sorted(set(local_pitches))
         if local_pitches:
             local_pitch_min = min(local_pitches)
             local_pitch_max = max(local_pitches)
@@ -836,8 +863,8 @@ def _detect_allowed_completion_regions(
             local_pitch_min = global_pitch_min
             local_pitch_max = global_pitch_max
 
-        allowed_pitch_min = max(0, local_pitch_min - 2)
-        allowed_pitch_max = min(127, local_pitch_max + 2)
+        allowed_pitch_min = max(0, local_pitch_min)
+        allowed_pitch_max = min(127, local_pitch_max)
 
         preferred_pitches = [
             int(pitch)
@@ -853,6 +880,21 @@ def _detect_allowed_completion_regions(
         estimated_key_or_scale = _estimate_local_key_or_scale(local_pitches)
 
         rhythmic_summary = _build_local_rhythmic_summary(local_notes)
+        local_rhythm_intervals_sec = _build_local_rhythm_intervals(
+            before_notes=before_notes,
+            after_notes=after_notes,
+        )
+        detected_local_motif = _detect_local_motif(
+            before_notes=before_notes,
+            after_notes=after_notes,
+            local_rhythm_intervals_sec=local_rhythm_intervals_sec,
+        )
+        motif_confidence = float(detected_local_motif.get("confidence", 0.0))
+        optional_region = (
+            motif_confidence < 0.45
+            or len(before_notes) < 2
+            or len(after_notes) < 1
+        )
 
         local_durations = [float(item.duration_sec) for item in local_notes if float(item.duration_sec) > 0.0]
         local_duration_median = statistics.median(local_durations) if local_durations else median_duration
@@ -879,29 +921,55 @@ def _detect_allowed_completion_regions(
             expected_center = max(expected_center, min(8.0, float(onset_hint)))
 
         expected_note_count_min = int(max(0, math.floor(expected_center * 0.4)))
-        if expected_center >= 1.0 and expected_note_count_min == 0:
+        if optional_region:
+            expected_note_count_min = 0
+        elif expected_center >= 1.0 and expected_note_count_min == 0:
             expected_note_count_min = 1
         expected_note_count_max = int(
             max(expected_note_count_min, min(24, math.ceil(expected_center * 1.8) + 1))
         )
 
         expected_density_ceiling = float(expected_note_count_max) / region_duration_sec
+        median_rhythm_interval = (
+            statistics.median(local_rhythm_intervals_sec)
+            if local_rhythm_intervals_sec
+            else 0.0
+        )
+        rhythm_density_limit = (
+            (1.0 / max(0.05, median_rhythm_interval)) * 1.2
+            if median_rhythm_interval > 0.0
+            else 0.0
+        )
         density_limit_notes_per_sec = max(
             0.35,
             min(
                 8.0,
                 max(
                     (local_density * 1.7) if local_density > 0.0 else 0.0,
+                    rhythm_density_limit,
                     expected_density_ceiling,
                 ),
             ),
         )
+
+        notes_before_payload = [_context_note_record(item) for item in before_notes]
+        notes_after_payload = [_context_note_record(item) for item in after_notes]
+        local_pitch_names = [_midi_pitch_name(pitch) for pitch in local_pitch_set]
+
+        instruction = (
+            "Fill only this gap by continuing the local motif. "
+            "Do not write outside write_start_sec/write_end_sec."
+        )
+        if optional_region:
+            instruction += " Motif context is low confidence; prefer zero notes unless continuation is clear."
 
         detected_regions.append(
             AllowedCompletionRegion(
                 region_id=f"acr_{region_index:04d}",
                 start_sec=float(start_sec),
                 end_sec=float(end_sec),
+                write_start_sec=float(start_sec),
+                write_end_sec=float(end_sec),
                 reason=str(candidate["reason"]),
                 context_before_start_sec=float(context_before_start_sec),
                 context_after_end_sec=float(context_after_end_sec),
@@ -909,18 +977,28 @@ def _detect_allowed_completion_regions(
                 context_window_after_sec=float(context_after_end_sec - end_sec),
                 reference_notes_before=[item.note_id for item in before_notes],
                 reference_notes_after=[item.note_id for item in after_notes],
+                notes_before=notes_before_payload,
+                notes_after=notes_after_payload,
+                local_pitch_set=[int(value) for value in local_pitch_set],
+                local_pitch_names=local_pitch_names,
                 local_pitch_range={"min": int(local_pitch_min), "max": int(local_pitch_max)},
                 allowed_pitch_range={"min": int(allowed_pitch_min), "max": int(allowed_pitch_max)},
                 preferred_pitches=preferred_pitches,
                 forbidden_pitches=forbidden_pitches,
+                allow_pitch_outside_local_set=False,
                 estimated_key_or_scale=estimated_key_or_scale,
                 rhythmic_pattern_summary=rhythmic_summary,
+                local_rhythm_intervals_sec=local_rhythm_intervals_sec,
+                detected_local_motif=detected_local_motif,
+                motif_confidence=float(motif_confidence),
+                optional_region=optional_region,
                 expected_note_count_min=expected_note_count_min,
                 expected_note_count_max=expected_note_count_max,
                 density_limit_notes_per_sec=float(density_limit_notes_per_sec),
                 min_note_duration_sec=float(min_note_duration_sec),
                 max_note_duration_sec=float(max_note_duration_sec),
                 no_notes_outside_region=True,
+                instruction=instruction,
             )
         )
 
@@ -1036,6 +1114,105 @@ def _nearest_context_notes(
         ),
     )
     return ranked[: max(1, limit)]
+
+
+def _context_note_record(note: BasePatternNote) -> dict[str, object]:
+    pitch_midi = int(note.pitch_midi)
+    return {
+        "note_id": note.note_id,
+        "start_sec": round(float(note.start_sec), 6),
+        "end_sec": round(float(note.end_sec), 6),
+        "pitch_midi": pitch_midi,
+        "pitch_name": _midi_pitch_name(pitch_midi),
+    }
+
+
+def _build_local_rhythm_intervals(
+    *,
+    before_notes: list[BasePatternNote],
+    after_notes: list[BasePatternNote],
+) -> list[float]:
+    ordered = sorted(
+        before_notes + after_notes,
+        key=lambda note: (float(note.start_sec), float(note.end_sec)),
+    )
+    onsets = [float(note.start_sec) for note in ordered]
+    intervals: list[float] = []
+    for index in range(1, len(onsets)):
+        delta = onsets[index] - onsets[index - 1]
+        if delta > 0.0:
+            intervals.append(round(delta, 6))
+    return intervals[:24]
+
+
+def _detect_local_motif(
+    *,
+    before_notes: list[BasePatternNote],
+    after_notes: list[BasePatternNote],
+    local_rhythm_intervals_sec: list[float],
+) -> dict[str, object]:
+    ordered_before = sorted(before_notes, key=lambda note: float(note.start_sec))
+    ordered_after = sorted(after_notes, key=lambda note: float(note.start_sec))
+
+    motif_notes: list[BasePatternNote]
+    if ordered_before and ordered_after:
+        motif_notes = (ordered_before[-4:] + ordered_after[:4])[:8]
+    elif ordered_before:
+        motif_notes = ordered_before[-6:]
+    else:
+        motif_notes = ordered_after[:6]
+
+    pitch_sequence = [int(note.pitch_midi) for note in motif_notes]
+    interval_sequence = [
+        int(pitch_sequence[index + 1] - pitch_sequence[index])
+        for index in range(len(pitch_sequence) - 1)
+    ]
+
+    motif_rhythm_sequence: list[float] = []
+    motif_onsets = [float(note.start_sec) for note in motif_notes]
+    for index in range(1, len(motif_onsets)):
+        delta = motif_onsets[index] - motif_onsets[index - 1]
+        if delta > 0.0:
+            motif_rhythm_sequence.append(round(delta, 6))
+    if not motif_rhythm_sequence:
+        motif_rhythm_sequence = [float(value) for value in local_rhythm_intervals_sec[:8]]
+
+    confidence = 0.0
+    if len(ordered_before) >= 4:
+        confidence += 0.35
+    elif len(ordered_before) >= 2:
+        confidence += 0.2
+
+    if len(ordered_after) >= 3:
+        confidence += 0.35
+    elif len(ordered_after) >= 1:
+        confidence += 0.2
+
+    if interval_sequence:
+        dominant_interval_count = Counter(interval_sequence).most_common(1)[0][1]
+        confidence += 0.2 if dominant_interval_count >= 2 else 0.1
+
+    if len(motif_rhythm_sequence) >= 2:
+        if statistics.pstdev(motif_rhythm_sequence) <= 0.25:
+            confidence += 0.1
+    elif motif_rhythm_sequence:
+        confidence += 0.05
+
+    confidence = max(0.0, min(1.0, round(confidence, 3)))
+
+    return {
+        "pitch_sequence": pitch_sequence,
+        "interval_sequence": interval_sequence,
+        "rhythm_sequence_sec": motif_rhythm_sequence,
+        "confidence": confidence,
+    }
+
+
+def _midi_pitch_name(pitch_midi: int) -> str:
+    pitch_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    pitch = max(0, min(127, int(pitch_midi)))
+    octave = (pitch // 12) - 1
+    return f"{pitch_names[pitch % 12]}{octave}"
 
 
 def _build_local_rhythmic_summary(local_notes: list[BasePatternNote]) -> dict[str, object]:

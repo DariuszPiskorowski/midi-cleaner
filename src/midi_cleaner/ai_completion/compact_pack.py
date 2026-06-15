@@ -423,6 +423,8 @@ def _compact_allowed_completion_regions(
                 "region_id": str(region.get("region_id", "")),
                 "start_sec": _rounded(region.get("start_sec")),
                 "end_sec": _rounded(region.get("end_sec")),
+                "write_start_sec": _rounded(region.get("write_start_sec") or region.get("start_sec")),
+                "write_end_sec": _rounded(region.get("write_end_sec") or region.get("end_sec")),
                 "reason": str(region.get("reason", "")),
                 "context_before_start_sec": _rounded(region.get("context_before_start_sec")),
                 "context_after_end_sec": _rounded(region.get("context_after_end_sec")),
@@ -437,6 +439,26 @@ def _compact_allowed_completion_regions(
                     str(item)
                     for item in _as_list(region.get("reference_notes_after"))[:48]
                     if isinstance(item, str)
+                ],
+                "notes_before": [
+                    _compact_context_note(item)
+                    for item in _as_list(region.get("notes_before"))[:64]
+                    if isinstance(item, dict)
+                ],
+                "notes_after": [
+                    _compact_context_note(item)
+                    for item in _as_list(region.get("notes_after"))[:64]
+                    if isinstance(item, dict)
+                ],
+                "local_pitch_set": [
+                    _to_int(value, 0)
+                    for value in _as_list(region.get("local_pitch_set"))[:24]
+                    if isinstance(value, (int, float, str))
+                ],
+                "local_pitch_names": [
+                    str(value)
+                    for value in _as_list(region.get("local_pitch_names"))[:24]
+                    if isinstance(value, str)
                 ],
                 "local_pitch_range": {
                     "min": _to_int(
@@ -468,6 +490,9 @@ def _compact_allowed_completion_regions(
                     for value in _as_list(region.get("forbidden_pitches"))[:16]
                     if isinstance(value, (int, float, str))
                 ],
+                "allow_pitch_outside_local_set": bool(
+                    region.get("allow_pitch_outside_local_set", False)
+                ),
                 "estimated_key_or_scale": str(region.get("estimated_key_or_scale", "unknown")),
                 "rhythmic_pattern_summary": {
                     "note_onsets_sec": _float_list(
@@ -483,16 +508,64 @@ def _compact_allowed_completion_regions(
                         16,
                     ),
                 },
+                "local_rhythm_intervals_sec": _float_list(
+                    region.get("local_rhythm_intervals_sec"),
+                    24,
+                ),
+                "detected_local_motif": {
+                    "pitch_sequence": [
+                        _to_int(value, 0)
+                        for value in _as_list(
+                            (region.get("detected_local_motif") or {}).get("pitch_sequence")
+                            if isinstance(region.get("detected_local_motif"), dict)
+                            else None
+                        )[:12]
+                        if isinstance(value, (int, float, str))
+                    ],
+                    "interval_sequence": [
+                        _to_int(value, 0)
+                        for value in _as_list(
+                            (region.get("detected_local_motif") or {}).get("interval_sequence")
+                            if isinstance(region.get("detected_local_motif"), dict)
+                            else None
+                        )[:12]
+                        if isinstance(value, (int, float, str))
+                    ],
+                    "rhythm_sequence_sec": _float_list(
+                        (region.get("detected_local_motif") or {}).get("rhythm_sequence_sec")
+                        if isinstance(region.get("detected_local_motif"), dict)
+                        else None,
+                        12,
+                    ),
+                    "confidence": _rounded(
+                        (region.get("detected_local_motif") or {}).get("confidence")
+                        if isinstance(region.get("detected_local_motif"), dict)
+                        else None
+                    ),
+                },
+                "motif_confidence": _rounded(region.get("motif_confidence")),
+                "optional_region": bool(region.get("optional_region", False)),
                 "expected_note_count_min": _to_int(region.get("expected_note_count_min"), 0),
                 "expected_note_count_max": _to_int(region.get("expected_note_count_max"), 0),
                 "density_limit_notes_per_sec": _rounded(region.get("density_limit_notes_per_sec")),
                 "min_note_duration_sec": _rounded(region.get("min_note_duration_sec")),
                 "max_note_duration_sec": _rounded(region.get("max_note_duration_sec")),
                 "no_notes_outside_region": bool(region.get("no_notes_outside_region", True)),
+                "instruction": str(region.get("instruction", "")),
             }
         )
 
     return compacted
+
+
+def _compact_context_note(note: dict[str, Any]) -> dict[str, object]:
+    return {
+        "note_id": str(note.get("note_id", "")),
+        "start_sec": _rounded(note.get("start_sec")),
+        "end_sec": _rounded(note.get("end_sec")),
+        "pitch_midi": _to_int(note.get("pitch_midi"), 0),
+        "pitch_name": str(note.get("pitch_name", "")),
+    }
 
 
 def _note_indices_overlapping(
