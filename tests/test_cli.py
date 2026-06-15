@@ -140,7 +140,9 @@ def test_pattern_complete_blocks_calls_deterministic_service(monkeypatch: pytest
         captured["project_dir"] = project_dir
         captured["params"] = params
         return SimpleNamespace(
+            bar_aligned_block_count=3,
             pattern_block_count=3,
+            complete_block_count=2,
             pattern_family_count=1,
             incomplete_existing_block_count=1,
             missing_expected_block_count=0,
@@ -177,3 +179,4 @@ def test_pattern_complete_blocks_calls_deterministic_service(monkeypatch: pytest
     assert params.write_debug_midi is False
     assert "inserted_note_count=2" in result.stdout
     assert "missing_expected_block_count=0" in result.stdout
+    assert "bar_aligned_block_count=3" in result.stdout

@@ -1085,7 +1085,9 @@ def pattern_complete_blocks_command(
 
     typer.echo(
         "Pattern block completion complete: "
+        f"bar_aligned_block_count={report.bar_aligned_block_count}, "
         f"pattern_block_count={report.pattern_block_count}, "
+        f"complete_block_count={report.complete_block_count}, "
         f"pattern_family_count={report.pattern_family_count}, "
         f"incomplete_existing_block_count={report.incomplete_existing_block_count}, "
         f"missing_expected_block_count={report.missing_expected_block_count}, "

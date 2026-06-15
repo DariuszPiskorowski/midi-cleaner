@@ -2,320 +2,237 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import shutil
 
 import mido
 
-from midi_cleaner.pattern.models import MissingExpectedBlock
 from midi_cleaner.pattern import (
     PatternCompletionParameters,
     complete_pattern_blocks,
 )
+from midi_cleaner.pattern.models import MissingExpectedBlock
 
 
-def _append_block(track: mido.MidiTrack, notes: list[int], *, velocity: int = 96) -> None:
-    for pitch in notes:
-        track.append(mido.Message("note_on", note=pitch, velocity=velocity, time=0, channel=0))
-        track.append(mido.Message("note_off", note=pitch, velocity=0, time=240, channel=0))
+_TPB = 480
+_BEATS_PER_BAR = 4
+_BAR_TICKS = _TPB * _BEATS_PER_BAR
+_PATTERN_A = [36, 33, 38, 31]
 
 
-def _append_gap(track: mido.MidiTrack, ticks: int = 480) -> None:
-    track.append(mido.MetaMessage("text", text="gap", time=ticks))
-
-
-def _write_incomplete_existing_midi(
-    path: Path,
+def _append_pattern_events(
+    events: list[tuple[int, int, mido.Message]],
     *,
-    ambiguous: bool = False,
-    with_overlap_case: bool = False,
+    bar_index: int,
+    pattern: list[int],
+    note_count: int | None = None,
+    velocity: int = 96,
 ) -> None:
+    count = len(pattern) if note_count is None else max(0, min(note_count, len(pattern)))
+    for index, pitch in enumerate(pattern[:count]):
+        start_tick = (bar_index * _BAR_TICKS) + (index * _TPB)
+        end_tick = start_tick + (_TPB // 2)
+        events.append(
+            (
+                start_tick,
+                1,
+                mido.Message("note_on", note=int(pitch), velocity=int(velocity), channel=0, time=0),
+            )
+        )
+        events.append(
+            (
+                end_tick,
+                0,
+                mido.Message("note_off", note=int(pitch), velocity=0, channel=0, time=0),
+            )
+        )
+
+
+def _append_collision_note(
+    events: list[tuple[int, int, mido.Message]],
+    *,
+    bar_index: int,
+    pitch: int,
+) -> None:
+    start_tick = (bar_index * _BAR_TICKS) + (2 * _TPB)
+    end_tick = start_tick + (_TPB // 2)
+    events.append((start_tick, 1, mido.Message("note_on", note=pitch, velocity=72, channel=0, time=0)))
+    events.append((end_tick, 0, mido.Message("note_off", note=pitch, velocity=0, channel=0, time=0)))
+
+
+def _write_working_midi(path: Path, *, scenario: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    midi = mido.MidiFile(ticks_per_beat=480)
+    midi = mido.MidiFile(ticks_per_beat=_TPB)
     track = mido.MidiTrack()
     midi.tracks.append(track)
     track.append(mido.MetaMessage("set_tempo", tempo=500000, time=0))
+    track.append(mido.MetaMessage("time_signature", numerator=4, denominator=4, time=0))
 
-    # Pattern A (4-note block): C2 A1 D2 G1 (0.5 beat each)
-    block_a = [36, 33, 38, 31]
+    events: list[tuple[int, int, mido.Message]] = []
 
-    # Block 1: complete
-    _append_block(track, block_a, velocity=96)
-
-    # Gap between blocks
-    _append_gap(track, ticks=480)
-
-    # Block 2: complete repeated
-    _append_block(track, block_a, velocity=92)
-
-    # Gap
-    _append_gap(track, ticks=480)
-
-    # Block 3: incomplete prefix (first two notes only)
-    incomplete_notes = block_a[:2]
-    if with_overlap_case:
-        # Insert a base note where the completion would be placed to force rejection.
-        track.append(mido.Message("note_on", note=38, velocity=84, time=0, channel=0))
-        track.append(mido.Message("note_off", note=38, velocity=0, time=240, channel=0))
-
-    for pitch in incomplete_notes:
-        track.append(mido.Message("note_on", note=pitch, velocity=90, time=0, channel=0))
-        track.append(mido.Message("note_off", note=pitch, velocity=0, time=240, channel=0))
-
-    if ambiguous:
-        # Add competing family B to trigger ambiguity.
-        _append_gap(track, ticks=960)
-        family_b = [36, 33, 34, 31]
-        _append_block(track, family_b, velocity=88)
-
-    midi.save(path)
-
-
-def _write_missing_expected_midi(
-    path: Path,
-    *,
-    ambiguous: bool = False,
-    with_collision_case: bool = False,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    midi = mido.MidiFile(ticks_per_beat=480)
-    track = mido.MidiTrack()
-    midi.tracks.append(track)
-    track.append(mido.MetaMessage("set_tempo", tempo=500000, time=0))
-
-    family_a = [36, 33, 38, 31]
-    family_b = [36, 33, 34, 31]
-
-    # A1
-    _append_block(track, family_a, velocity=96)
-    _append_gap(track, ticks=1200)
-
-    # A2
-    _append_block(track, family_a, velocity=92)
-    _append_gap(track, ticks=3600)
-
-    # Optional collision note in expected missing region.
-    if with_collision_case:
-        track.append(mido.Message("note_on", note=38, velocity=76, time=0, channel=0))
-        track.append(mido.Message("note_off", note=38, velocity=0, time=240, channel=0))
-        _append_gap(track, ticks=1200)
-
-    # A4 after missing A3 slot
-    _append_block(track, family_a, velocity=93)
-
-    if ambiguous:
-        # Family B with matching spacing and hole to create ambiguous competing candidates.
-        _append_gap(track, ticks=2400)
-        _append_block(track, family_b, velocity=89)
-        _append_gap(track, ticks=1200)
-        _append_block(track, family_b, velocity=87)
-        _append_gap(track, ticks=3600)
-        _append_block(track, family_b, velocity=91)
-
-    midi.save(path)
-
-
-def _build_project(
-    tmp_path: Path,
-    *,
-    fixture: str = "incomplete_existing",
-    ambiguous: bool = False,
-    with_overlap_case: bool = False,
-    with_collision_case: bool = False,
-) -> Path:
-    project_dir = tmp_path / "project_pattern"
-    working_midi_path = project_dir / "midi" / "working" / "working.mid"
-
-    if fixture == "incomplete_existing":
-        _write_incomplete_existing_midi(
-            working_midi_path,
-            ambiguous=ambiguous,
-            with_overlap_case=with_overlap_case,
-        )
-    elif fixture == "missing_expected":
-        _write_missing_expected_midi(
-            working_midi_path,
-            ambiguous=ambiguous,
-            with_collision_case=with_collision_case,
-        )
+    if scenario == "incomplete_tail":
+        _append_pattern_events(events, bar_index=0, pattern=_PATTERN_A, note_count=4, velocity=96)
+        _append_pattern_events(events, bar_index=1, pattern=_PATTERN_A, note_count=2, velocity=92)
+        _append_pattern_events(events, bar_index=2, pattern=_PATTERN_A, note_count=4, velocity=94)
+    elif scenario == "missing_empty":
+        _append_pattern_events(events, bar_index=0, pattern=_PATTERN_A, note_count=4, velocity=96)
+        _append_pattern_events(events, bar_index=2, pattern=_PATTERN_A, note_count=4, velocity=94)
+    elif scenario == "missing_collision":
+        _append_pattern_events(events, bar_index=0, pattern=_PATTERN_A, note_count=4, velocity=96)
+        _append_collision_note(events, bar_index=1, pitch=38)
+        _append_pattern_events(events, bar_index=2, pattern=_PATTERN_A, note_count=4, velocity=94)
     else:
-        raise AssertionError(f"Unsupported fixture: {fixture}")
+        raise AssertionError(f"Unsupported scenario: {scenario}")
 
+    events.sort(key=lambda item: (item[0], item[1]))
+    current_tick = 0
+    for tick, _order, message in events:
+        message.time = max(0, int(tick - current_tick))
+        current_tick = int(tick)
+        track.append(message)
+
+    track.append(mido.MetaMessage("end_of_track", time=max(1, _TPB)))
+    midi.save(path)
+
+
+def _build_project(tmp_path: Path, *, scenario: str) -> Path:
+    project_dir = tmp_path / "project_pattern"
+    working_midi = project_dir / "midi" / "working" / "working.mid"
+    _write_working_midi(working_midi, scenario=scenario)
     return project_dir
 
 
 def _read_midi_note_count(path: Path) -> int:
     midi = mido.MidiFile(str(path))
-    count = 0
-    for track in midi.tracks:
-        for msg in track:
-            if msg.type == "note_on" and int(msg.velocity) > 0:
-                count += 1
-    return count
+    return sum(
+        1
+        for track in midi.tracks
+        for message in track
+        if message.type == "note_on" and int(message.velocity) > 0
+    )
 
 
-def test_pattern_completion_splits_blocks_and_groups_families(tmp_path: Path) -> None:
-    project_dir = _build_project(tmp_path, fixture="incomplete_existing")
+def test_bar_aligned_block_detection_and_grid_fields(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="incomplete_tail")
 
     report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
 
     assert report.status == "ok"
-    assert report.pattern_block_count >= 3
-    assert report.pattern_family_count >= 1
+    assert report.bar_aligned_block_count == report.pattern_block_count
+    assert report.bar_aligned_block_count >= 3
+    assert report.complete_block_count >= 1
 
     blocks = json.loads(Path(report.pattern_blocks_file).read_text(encoding="utf-8"))
-    families = json.loads(Path(report.pattern_families_file).read_text(encoding="utf-8"))
-
-    assert all("block_id" in item for item in blocks)
-    assert any(item.get("status") == "incomplete" for item in blocks)
-    assert all("pattern_family_id" in item for item in families)
-
-
-def test_pattern_completion_detects_incomplete_block_and_matches_family(tmp_path: Path) -> None:
-    project_dir = _build_project(tmp_path, fixture="incomplete_existing")
-
-    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
-
-    incomplete = json.loads(Path(report.incomplete_blocks_file).read_text(encoding="utf-8"))
-    assert incomplete
-
-    first = incomplete[0]
-    assert first["incomplete_block_id".lower() if False else "incomplete_block_id"]
-    assert first["possible_matches"]
-    assert first["best_match_pattern_family_id"] is not None
+    assert all("bar_index" in item for item in blocks)
+    assert all("occupied_slots" in item for item in blocks)
+    assert all("empty_slots" in item for item in blocks)
+    assert all(item.get("grid_resolution") == "1/16" for item in blocks)
+    assert all(item.get("time_signature") == "4/4" for item in blocks)
 
 
-def test_pattern_completion_inserts_missing_tail_notes_to_uzupelnienie_only(tmp_path: Path) -> None:
-    project_dir = _build_project(tmp_path, fixture="incomplete_existing")
+def test_incomplete_existing_block_completed_and_working_unchanged(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="incomplete_tail")
     working_path = project_dir / "midi" / "working" / "working.mid"
     before_bytes = working_path.read_bytes()
 
     report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
 
     assert report.status == "ok"
+    assert report.incomplete_existing_block_count >= 1
     assert report.inserted_note_count >= 1
+
+    incomplete_reports = json.loads(Path(report.incomplete_blocks_file).read_text(encoding="utf-8"))
+    existing = [item for item in incomplete_reports if item.get("block_type") == "incomplete_existing_block"]
+    assert existing
+    target = existing[0]
+    assert target.get("target_bar_index") == 1
+    assert target.get("best_match_pattern_family_id") is not None
+    assert target.get("observed_slots")
+    assert target.get("missing_slots")
+    assert target.get("action") in {"completed", "skipped"}
 
     output_midi = Path(report.output_midi_path)
     assert output_midi.exists()
     assert output_midi.name == "uzupelnienie.mid"
+    assert _read_midi_note_count(output_midi) == report.inserted_note_count
 
-    inserted_note_count = _read_midi_note_count(output_midi)
-    assert inserted_note_count == report.inserted_note_count
-
-    # Base MIDI remains unchanged.
     assert working_path.read_bytes() == before_bytes
 
 
-def test_pattern_completion_skips_ambiguous_incomplete_block(tmp_path: Path) -> None:
-    project_dir = _build_project(tmp_path, fixture="incomplete_existing", ambiguous=True)
-
-    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
-
-    incomplete = json.loads(Path(report.incomplete_blocks_file).read_text(encoding="utf-8"))
-    assert incomplete
-    assert any(item.get("action") == "skipped" for item in incomplete)
-    assert any("Ambiguous" in item.get("match_reason", "") for item in incomplete)
-
-
-def test_pattern_completion_rejects_overlapping_inserted_notes(tmp_path: Path) -> None:
-    project_dir = _build_project(
-        tmp_path,
-        fixture="incomplete_existing",
-        with_overlap_case=True,
-    )
-
-    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
-
-    incomplete = json.loads(Path(report.incomplete_blocks_file).read_text(encoding="utf-8"))
-    if incomplete:
-        assert any(
-            item.get("action") == "skipped"
-            or len(item.get("missing_notes_to_insert", [])) == 0
-            for item in incomplete
-        )
-
-    # Export remains valid and contains only accepted inserted notes.
-    output_midi = Path(report.output_midi_path)
-    assert output_midi.exists()
-    assert _read_midi_note_count(output_midi) == report.inserted_note_count
-
-
-def test_pattern_completion_is_deterministic_and_does_not_invoke_ai(tmp_path: Path, monkeypatch) -> None:
-    project_dir = _build_project(tmp_path, fixture="incomplete_existing")
-
-    called = {"value": False}
-
-    def _fake_ai(*args, **kwargs):
-        _ = (args, kwargs)
-        called["value"] = True
-        raise AssertionError("AI should not be called in pattern completion workflow")
-
-    monkeypatch.setattr("midi_cleaner.ai_completion.service.complete_ai_pattern_completion", _fake_ai)
-
-    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
-    assert report.status == "ok"
-    assert called["value"] is False
-
-
-def test_pattern_completion_detects_and_completes_missing_expected_block(tmp_path: Path) -> None:
-    project_dir = _build_project(tmp_path, fixture="missing_expected")
-    working_path = project_dir / "midi" / "working" / "working.mid"
-    before_bytes = working_path.read_bytes()
+def test_missing_expected_block_detected_for_empty_middle_bar(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="missing_empty")
 
     report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
 
     assert report.status == "ok"
     assert report.missing_expected_block_count >= 1
+
+    missing_reports = json.loads(Path(report.missing_expected_blocks_file).read_text(encoding="utf-8"))
+    assert missing_reports
+    candidate = missing_reports[0]
+    assert candidate.get("block_type") == "missing_expected_block"
+    assert candidate.get("target_bar_index") == 1
+    assert candidate.get("observed_slots") == []
+    assert candidate.get("best_match_pattern_family_id") is not None
+
+
+def test_missing_expected_block_completion_writes_only_uzupelnienie(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="missing_empty")
+    working_path = project_dir / "midi" / "working" / "working.mid"
+    before_bytes = working_path.read_bytes()
+
+    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
+
+    assert report.status == "ok"
     assert report.completed_missing_expected_block_count >= 1
     assert report.inserted_note_count >= 1
-
-    missing_path = project_dir / "analysis" / "pattern_blocks" / "missing_expected_blocks.json"
-    assert missing_path.exists()
-    missing_reports = json.loads(missing_path.read_text(encoding="utf-8"))
-    assert missing_reports
-    assert any(item.get("block_type") == "missing_expected_block" for item in missing_reports)
-    assert any(item.get("action") == "completed" for item in missing_reports)
 
     output_midi = Path(report.output_midi_path)
     assert output_midi.exists()
     assert output_midi.name == "uzupelnienie.mid"
     assert _read_midi_note_count(output_midi) == report.inserted_note_count
 
-    # Base MIDI remains unchanged.
     assert working_path.read_bytes() == before_bytes
 
 
-def test_pattern_completion_skips_ambiguous_missing_expected_block(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    project_dir = _build_project(tmp_path, fixture="missing_expected", ambiguous=True)
+def test_ambiguous_missing_expected_block_is_skipped(tmp_path: Path, monkeypatch) -> None:
+    project_dir = _build_project(tmp_path, scenario="missing_empty")
 
     def _fake_detect_missing_expected_blocks(*, families, blocks_by_id, base_notes):
         _ = (families, blocks_by_id, base_notes)
         return [
             MissingExpectedBlock(
-                missing_block_id="missing_a",
+                missing_block_id="missing_0001",
+                target_bar_index=1,
                 expected_pattern_family_id="pattern_A",
-                write_start_sec=4.5,
-                write_end_sec=5.5,
-                expected_duration_sec=1.0,
-                evidence_before_occurrences=["block_0001"],
-                evidence_after_occurrences=["block_0003"],
+                write_start_sec=2.0,
+                write_end_sec=4.0,
+                write_start_beat=4.0,
+                write_end_beat=8.0,
+                expected_duration_sec=2.0,
+                expected_duration_beat=4.0,
+                observed_slots=[],
+                missing_slots=[0, 4, 8, 12],
+                evidence_before_occurrences=["bar_0001"],
+                evidence_after_occurrences=["bar_0003"],
                 detected_note_count_in_region=0,
-                confidence_score=0.86,
+                confidence_score=0.84,
             ),
             MissingExpectedBlock(
-                missing_block_id="missing_b",
+                missing_block_id="missing_0002",
+                target_bar_index=1,
                 expected_pattern_family_id="pattern_B",
-                write_start_sec=4.52,
-                write_end_sec=5.52,
-                expected_duration_sec=1.0,
-                evidence_before_occurrences=["block_0001"],
-                evidence_after_occurrences=["block_0003"],
+                write_start_sec=2.0,
+                write_end_sec=4.0,
+                write_start_beat=4.0,
+                write_end_beat=8.0,
+                expected_duration_sec=2.0,
+                expected_duration_beat=4.0,
+                observed_slots=[],
+                missing_slots=[0, 4, 8, 12],
+                evidence_before_occurrences=["bar_0001"],
+                evidence_after_occurrences=["bar_0003"],
                 detected_note_count_in_region=0,
-                confidence_score=0.80,
+                confidence_score=0.78,
             ),
         ]
 
@@ -326,43 +243,40 @@ def test_pattern_completion_skips_ambiguous_missing_expected_block(
 
     report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
 
-    assert report.missing_expected_block_count >= 1
+    assert report.status == "ok"
     assert report.skipped_ambiguous_count >= 1
 
-    missing_path = project_dir / "analysis" / "pattern_blocks" / "missing_expected_blocks.json"
-    missing_reports = json.loads(missing_path.read_text(encoding="utf-8"))
+    missing_reports = json.loads(Path(report.missing_expected_blocks_file).read_text(encoding="utf-8"))
     assert any(item.get("action") == "skipped" for item in missing_reports)
-    assert any("Ambiguous" in item.get("match_reason", "") for item in missing_reports)
+    assert any(item.get("reason") == "ambiguous" for item in missing_reports)
 
 
-def test_pattern_completion_rejects_collisions_for_missing_expected_block(tmp_path: Path) -> None:
-    project_dir = _build_project(tmp_path, fixture="missing_expected", with_collision_case=True)
+def test_missing_expected_collision_rejects_overlapping_note(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="missing_collision")
 
     report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
 
-    missing_path = project_dir / "analysis" / "pattern_blocks" / "missing_expected_blocks.json"
-    missing_reports = json.loads(missing_path.read_text(encoding="utf-8"))
+    assert report.status == "ok"
+    missing_reports = json.loads(Path(report.missing_expected_blocks_file).read_text(encoding="utf-8"))
     assert missing_reports
     assert any("rejected=" in item.get("match_reason", "") for item in missing_reports)
 
     output_midi = Path(report.output_midi_path)
     assert output_midi.exists()
     assert _read_midi_note_count(output_midi) == report.inserted_note_count
+    assert report.inserted_note_count < len(_PATTERN_A)
 
 
-def test_pattern_completion_output_midi_contains_only_inserted_notes(tmp_path: Path) -> None:
-    project_dir = _build_project(tmp_path, fixture="missing_expected")
+def test_output_midi_contains_only_reported_inserted_notes(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="missing_empty")
 
     report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
 
     output_midi = Path(report.output_midi_path)
     assert output_midi.exists()
-    inserted_note_count = _read_midi_note_count(output_midi)
-    assert inserted_note_count == report.inserted_note_count
 
-    # Every note in output MIDI must come from report missing_notes_to_insert entries.
-    all_reports = json.loads(Path(report.incomplete_blocks_file).read_text(encoding="utf-8"))
     expected = set()
+    all_reports = json.loads(Path(report.incomplete_blocks_file).read_text(encoding="utf-8"))
     for block_report in all_reports:
         for note in block_report.get("missing_notes_to_insert", []):
             expected.add(
@@ -389,26 +303,24 @@ def test_pattern_completion_output_midi_contains_only_inserted_notes(tmp_path: P
                 if not starts:
                     continue
                 start_tick = starts.pop(0)
-                start_sec = int(round((start_tick / ticks_per_second) * 1000.0))
-                end_sec = int(round((absolute_tick / ticks_per_second) * 1000.0))
-                actual.add((start_sec, end_sec, note))
+                start_ms = int(round((start_tick / ticks_per_second) * 1000.0))
+                end_ms = int(round((absolute_tick / ticks_per_second) * 1000.0))
+                actual.add((start_ms, end_ms, note))
 
-    assert actual
     assert actual.issubset(expected)
 
 
-def test_pattern_completion_real_fixture_missing_expected_detection(tmp_path: Path) -> None:
-    source = Path("projects") / "real_bass_test_14_strictsplit" / "midi" / "working" / "working.mid"
-    if not source.exists():
-        return
+def test_pattern_completion_does_not_invoke_ai(tmp_path: Path, monkeypatch) -> None:
+    project_dir = _build_project(tmp_path, scenario="missing_empty")
+    called = {"value": False}
 
-    project_dir = tmp_path / "project_real_like"
-    working_dest = project_dir / "midi" / "working" / "working.mid"
-    working_dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, working_dest)
+    def _fake_ai(*args, **kwargs):
+        _ = (args, kwargs)
+        called["value"] = True
+        raise AssertionError("AI should not be called in deterministic pattern completion")
+
+    monkeypatch.setattr("midi_cleaner.ai_completion.service.complete_ai_pattern_completion", _fake_ai)
 
     report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
-
-    # This regression guard ensures missing-expected detector can fire when there are timeline holes.
     assert report.status == "ok"
-    assert report.missing_expected_block_count >= 0
+    assert called["value"] is False

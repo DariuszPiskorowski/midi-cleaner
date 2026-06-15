@@ -7,9 +7,16 @@ from pydantic import BaseModel, Field
 
 class PatternBlockNote(BaseModel):
     note_id: str
+    start_tick: int | None = None
+    end_tick: int | None = None
     start_sec: float
     end_sec: float
     duration_sec: float
+    start_beat: float | None = None
+    end_beat: float | None = None
+    duration_beat: float | None = None
+    onset_slot: int | None = None
+    duration_slots: int | None = None
     pitch_midi: int
     pitch_name: str
     velocity: int
@@ -18,11 +25,21 @@ class PatternBlockNote(BaseModel):
 
 class PatternBlock(BaseModel):
     block_id: str
+    bar_index: int
+    start_beat: float
+    end_beat: float
+    block_length_beats: float
     start_sec: float
     end_sec: float
     duration_sec: float
+    time_signature: str = "4/4"
+    grid_resolution: str = "1/16"
+    occupied_slots: list[int] = Field(default_factory=list)
+    empty_slots: list[int] = Field(default_factory=list)
     note_count: int
     notes: list[PatternBlockNote] = Field(default_factory=list)
+    relative_onsets_beat: list[float] = Field(default_factory=list)
+    relative_durations_beat: list[float] = Field(default_factory=list)
     relative_onsets_sec: list[float] = Field(default_factory=list)
     relative_durations_sec: list[float] = Field(default_factory=list)
     pitch_sequence: list[int] = Field(default_factory=list)
@@ -31,17 +48,26 @@ class PatternBlock(BaseModel):
     rhythm_signature: list[float] = Field(default_factory=list)
     pitch_set: list[int] = Field(default_factory=list)
     assigned_pattern_family_id: str | None
-    status: Literal["complete", "incomplete", "unknown"]
+    status: Literal["complete", "incomplete", "empty", "unknown"]
 
 
 class PatternFamily(BaseModel):
     pattern_family_id: str
+    block_length_beats: float
+    time_signature: str = "4/4"
+    grid_resolution: str = "1/16"
+    representative_onset_slots: list[int] = Field(default_factory=list)
+    representative_duration_slots: list[int] = Field(default_factory=list)
+    representative_relative_onsets_beat: list[float] = Field(default_factory=list)
+    representative_relative_durations_beat: list[float] = Field(default_factory=list)
     representative_pitch_sequence: list[int] = Field(default_factory=list)
     representative_interval_sequence: list[int] = Field(default_factory=list)
     representative_relative_onsets_sec: list[float] = Field(default_factory=list)
     representative_durations_sec: list[float] = Field(default_factory=list)
     representative_pitch_set: list[int] = Field(default_factory=list)
+    representative_note_count: int
     occurrence_count: int
+    occurrence_bars: list[int] = Field(default_factory=list)
     occurrences: list[str] = Field(default_factory=list)
     first_seen_sec: float
     last_seen_sec: float
@@ -69,10 +95,16 @@ class IncompleteBlockMatch(BaseModel):
 
 class MissingExpectedBlock(BaseModel):
     missing_block_id: str
+    target_bar_index: int
     expected_pattern_family_id: str | None
     write_start_sec: float
     write_end_sec: float
+    write_start_beat: float
+    write_end_beat: float
     expected_duration_sec: float
+    expected_duration_beat: float
+    observed_slots: list[int] = Field(default_factory=list)
+    missing_slots: list[int] = Field(default_factory=list)
     evidence_before_occurrences: list[str] = Field(default_factory=list)
     evidence_after_occurrences: list[str] = Field(default_factory=list)
     detected_note_count_in_region: int
@@ -84,15 +116,23 @@ class IncompleteBlockReport(BaseModel):
     block_type: Literal["incomplete_existing_block", "missing_expected_block"]
     incomplete_block_id: str | None = None
     missing_block_id: str | None = None
+    target_bar_index: int | None = None
     expected_pattern_family_id: str | None = None
     start_sec: float
     end_sec: float
+    start_beat: float | None = None
+    end_beat: float | None = None
     write_start_sec: float | None = None
     write_end_sec: float | None = None
+    write_start_beat: float | None = None
+    write_end_beat: float | None = None
     expected_duration_sec: float | None = None
+    expected_duration_beat: float | None = None
     evidence_before_occurrences: list[str] = Field(default_factory=list)
     evidence_after_occurrences: list[str] = Field(default_factory=list)
     observed_note_count_in_region: int | None = None
+    observed_slots: list[int] = Field(default_factory=list)
+    missing_slots: list[int] = Field(default_factory=list)
     observed_pitch_sequence: list[int] = Field(default_factory=list)
     observed_relative_onsets_sec: list[float] = Field(default_factory=list)
     possible_matches: list[IncompleteBlockMatch] = Field(default_factory=list)
@@ -109,7 +149,9 @@ class PatternCompletionReport(BaseModel):
     layer: str
     project_dir: str
     base_midi_path: str | None
+    bar_aligned_block_count: int
     pattern_block_count: int
+    complete_block_count: int
     pattern_family_count: int
     incomplete_existing_block_count: int
     missing_expected_block_count: int
