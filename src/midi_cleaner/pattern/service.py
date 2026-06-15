@@ -697,25 +697,31 @@ def _detect_missing_expected_blocks(
     candidates: list[MissingExpectedBlock] = []
     candidate_counter = 0
 
-    for family in families:
-        if family.occurrence_count < 2:
+    compatible_groups: dict[tuple[int, tuple[int, ...], tuple[int, ...]], list[PatternBlock]] = defaultdict(list)
+    all_blocks = sorted(blocks_by_id.values(), key=lambda item: item.start_sec)
+    for block in all_blocks:
+        if block.note_count < 2:
+            continue
+        compatible_groups[_compatible_group_key(block)].append(block)
+
+    for grouped_blocks in compatible_groups.values():
+        if len(grouped_blocks) < 2:
             continue
 
-        occurrence_blocks = [
-            blocks_by_id[block_id]
-            for block_id in family.occurrences
-            if block_id in blocks_by_id
-        ]
+        occurrence_blocks = list(grouped_blocks)
         occurrence_blocks.sort(key=lambda item: item.start_sec)
-        if len(occurrence_blocks) < 2:
-            continue
 
         period_estimate = _infer_family_period(occurrence_blocks)
         if period_estimate is None:
             continue
 
-        expected_duration_sec = _family_duration_sec(family)
-        sparse_threshold = max(1, int(math.floor(len(family.representative_pitch_sequence) * 0.70)))
+        expected_duration_sec = statistics.median(
+            block.duration_sec for block in occurrence_blocks
+        )
+        sparse_threshold = max(
+            1,
+            int(math.floor(statistics.median(block.note_count for block in occurrence_blocks) * 0.80)),
+        )
 
         for index in range(len(occurrence_blocks) - 1):
             before = occurrence_blocks[index]
@@ -761,40 +767,65 @@ def _detect_missing_expected_blocks(
                     0.0,
                     min(
                         1.0,
-                        0.25
+                        0.22
                         + (0.35 * period_estimate.stability)
                         + (0.25 * gap_fit_score)
-                        + (0.15 * sparsity_score),
+                        + (0.15 * sparsity_score)
+                        + (0.03 if len(occurrence_blocks) >= 3 else 0.0),
                     ),
                 )
 
-                candidate_counter += 1
-                reason = (
-                    "missing_expected_pattern_occurrence; "
-                    f"period={period_estimate.period_sec:.3f}s stability={period_estimate.stability:.2f} "
-                    f"gap={gap_sec:.3f}s estimated_missing={missing_count} "
-                    f"region_notes={detected_note_count}"
-                )
-                candidates.append(
-                    MissingExpectedBlock(
-                        missing_block_id=f"missing_{candidate_counter:04d}",
-                        expected_pattern_family_id=family.pattern_family_id,
-                        write_start_sec=round(write_start_sec, 6),
-                        write_end_sec=round(write_end_sec, 6),
-                        expected_duration_sec=round(expected_duration_sec, 6),
-                        evidence_before_occurrences=[before.block_id],
-                        evidence_after_occurrences=[after.block_id],
-                        detected_note_count_in_region=detected_note_count,
-                        confidence_score=round(confidence_score, 6),
-                        possible_matches=[
-                            IncompleteBlockMatch(
-                                pattern_family_id=family.pattern_family_id,
-                                score=round(confidence_score, 6),
-                                reason=reason,
-                            )
-                        ],
+                candidate_family_ids: list[tuple[str, float]] = []
+                before_family = before.assigned_pattern_family_id
+                after_family = after.assigned_pattern_family_id
+
+                if before_family and after_family and before_family == after_family:
+                    candidate_family_ids.append((before_family, min(1.0, confidence_score + 0.08)))
+                else:
+                    if before_family:
+                        candidate_family_ids.append((before_family, confidence_score))
+                    else:
+                        candidate_family_ids.append((f"synthetic::{before.block_id}", confidence_score - 0.02))
+
+                    if after_family and after_family != before_family:
+                        candidate_family_ids.append((after_family, max(0.0, confidence_score - 0.03)))
+                    elif not after_family:
+                        candidate_family_ids.append((f"synthetic::{after.block_id}", max(0.0, confidence_score - 0.03)))
+
+                deduped_families: dict[str, float] = {}
+                for family_id, score in candidate_family_ids:
+                    existing = deduped_families.get(family_id)
+                    if existing is None or score > existing:
+                        deduped_families[family_id] = score
+
+                for family_id, family_score in sorted(deduped_families.items()):
+                    candidate_counter += 1
+                    reason = (
+                        "missing_expected_pattern_occurrence; "
+                        f"period={period_estimate.period_sec:.3f}s stability={period_estimate.stability:.2f} "
+                        f"gap={gap_sec:.3f}s estimated_missing={missing_count} "
+                        f"region_notes={detected_note_count} compatible_group_size={len(occurrence_blocks)}"
                     )
-                )
+                    candidates.append(
+                        MissingExpectedBlock(
+                            missing_block_id=f"missing_{candidate_counter:04d}",
+                            expected_pattern_family_id=family_id,
+                            write_start_sec=round(write_start_sec, 6),
+                            write_end_sec=round(write_end_sec, 6),
+                            expected_duration_sec=round(expected_duration_sec, 6),
+                            evidence_before_occurrences=[before.block_id],
+                            evidence_after_occurrences=[after.block_id],
+                            detected_note_count_in_region=detected_note_count,
+                            confidence_score=round(max(0.0, min(1.0, family_score)), 6),
+                            possible_matches=[
+                                IncompleteBlockMatch(
+                                    pattern_family_id=family_id,
+                                    score=round(max(0.0, min(1.0, family_score)), 6),
+                                    reason=reason,
+                                )
+                            ],
+                        )
+                    )
 
     deduped: dict[tuple[str, int, int], MissingExpectedBlock] = {}
     for candidate in candidates:
@@ -927,6 +958,27 @@ def _complete_missing_expected_blocks(
             continue
 
         family = families_by_id.get(best.expected_pattern_family_id)
+        if (
+            family is None
+            and best.expected_pattern_family_id is not None
+            and best.expected_pattern_family_id.startswith("synthetic::")
+        ):
+            synthetic_block_id = best.expected_pattern_family_id.split("::", 1)[1]
+            synthetic_block = blocks_by_id.get(synthetic_block_id)
+            if synthetic_block is not None:
+                family = _family_from_block(
+                    block=synthetic_block,
+                    family_id=best.expected_pattern_family_id,
+                )
+
+        if family is None and best.evidence_before_occurrences:
+            evidence_block = blocks_by_id.get(best.evidence_before_occurrences[0])
+            if evidence_block is not None:
+                family = _family_from_block(
+                    block=evidence_block,
+                    family_id=best.expected_pattern_family_id or f"synthetic::{evidence_block.block_id}",
+                )
+
         if family is None:
             reports.append(
                 IncompleteBlockReport(
@@ -1167,6 +1219,31 @@ def _family_duration_sec(family: PatternFamily) -> float:
         )
         max_end = max(max_end, float(onset) + float(duration))
     return max(0.05, float(max_end))
+
+
+def _compatible_group_key(block: PatternBlock) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
+    # Quantize rhythm to 80 ms bins to keep deterministic grouping robust to small timing drift.
+    rhythm_bins = tuple(int(round((value * 1000.0) / 80.0)) for value in block.rhythm_signature)
+    return (
+        int(block.note_count),
+        tuple(int(item) for item in block.interval_sequence),
+        rhythm_bins,
+    )
+
+
+def _family_from_block(*, block: PatternBlock, family_id: str) -> PatternFamily:
+    return PatternFamily(
+        pattern_family_id=family_id,
+        representative_pitch_sequence=list(block.pitch_sequence),
+        representative_interval_sequence=list(block.interval_sequence),
+        representative_relative_onsets_sec=list(block.relative_onsets_sec),
+        representative_durations_sec=list(block.relative_durations_sec),
+        representative_pitch_set=list(block.pitch_set),
+        occurrence_count=1,
+        occurrences=[block.block_id],
+        first_seen_sec=block.start_sec,
+        last_seen_sec=block.end_sec,
+    )
 
 
 def _infer_family_period(occurrence_blocks: list[PatternBlock]) -> _FamilyPeriodEstimate | None:
