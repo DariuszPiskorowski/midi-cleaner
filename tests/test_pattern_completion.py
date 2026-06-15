@@ -400,6 +400,51 @@ def test_large_expected_missing_gap_completed_from_strong_family(tmp_path: Path)
     assert report.inserted_note_count >= len(_PATTERN_A)
 
 
+def test_bar_gap_candidates_file_created_with_context(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="large_gap_missing")
+
+    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
+
+    assert report.status == "ok"
+    assert report.bar_gap_candidate_count > 0
+    assert report.bar_gap_candidates_file
+
+    gap_candidates = json.loads(Path(report.bar_gap_candidates_file).read_text(encoding="utf-8"))
+    assert len(gap_candidates) == report.bar_gap_candidate_count
+    target = gap_candidates[0]
+    assert "bar_index_range" in target
+    assert "start_sec" in target
+    assert "end_sec" in target
+    assert "note_count" in target
+    assert "families_before" in target
+    assert "families_after" in target
+    assert "completion_reason" in target
+
+
+def test_bar_gap_candidates_detect_sparse_and_empty_ranges(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="missing_sparse")
+
+    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
+
+    assert report.status == "ok"
+    assert report.bar_gap_candidate_count >= 1
+
+    gap_candidates = json.loads(Path(report.bar_gap_candidates_file).read_text(encoding="utf-8"))
+    assert any(int(item.get("start_bar_index", -1)) == 1 for item in gap_candidates)
+
+
+def test_bar_gap_candidate_extremely_clear_bridge_flag(tmp_path: Path) -> None:
+    project_dir = _build_project(tmp_path, scenario="large_gap_missing")
+
+    report = complete_pattern_blocks(project_dir=project_dir, params=PatternCompletionParameters(layer="bass"))
+
+    assert report.status == "ok"
+    gap_candidates = json.loads(Path(report.bar_gap_candidates_file).read_text(encoding="utf-8"))
+    assert gap_candidates
+    assert any(item.get("same_family_bridge") for item in gap_candidates)
+    assert any(item.get("completion_readiness") in {"extremely_clear", "unclear", "insufficient_context"} for item in gap_candidates)
+
+
 def test_ambiguous_missing_expected_block_is_skipped(tmp_path: Path, monkeypatch) -> None:
     project_dir = _build_project(tmp_path, scenario="missing_empty")
 

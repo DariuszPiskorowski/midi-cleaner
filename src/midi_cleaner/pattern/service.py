@@ -11,6 +11,8 @@ import mido
 
 from midi_cleaner.midi.importer import import_midi_candidate
 from midi_cleaner.pattern.models import (
+    BarGapCandidate,
+    BarGapFamilyContext,
     IncompleteBlockMatch,
     IncompleteBlockReport,
     MissingExpectedBlock,
@@ -104,6 +106,7 @@ def complete_pattern_blocks(
     pattern_families_path = analysis_dir / "pattern_families.json"
     incomplete_blocks_path = analysis_dir / "incomplete_blocks.json"
     missing_expected_blocks_path = analysis_dir / "missing_expected_blocks.json"
+    bar_gap_candidates_path = analysis_dir / "bar_gap_candidates.json"
     report_path = analysis_dir / "pattern_completion_report.json"
     output_midi_path = midi_dir / "uzupelnienie.mid"
     debug_midi_path = debug_dir / "pattern_blocks_debug.mid"
@@ -154,6 +157,11 @@ def complete_pattern_blocks(
             blocks_by_id=blocks_by_id,
             base_notes=base_notes,
         )
+        bar_gap_candidates = _detect_bar_gap_candidates(
+            project_dir=project_dir,
+            blocks=enriched_blocks,
+            families=families,
+        )
         missing_reports, missing_inserted_notes = _complete_missing_expected_blocks(
             missing_expected_blocks=missing_expected_blocks,
             blocks_by_id=blocks_by_id,
@@ -175,6 +183,10 @@ def complete_pattern_blocks(
         _write_json(
             missing_expected_blocks_path,
             [item.model_dump(mode="json") for item in missing_expected_reports],
+        )
+        _write_json(
+            bar_gap_candidates_path,
+            [item.model_dump(mode="json") for item in bar_gap_candidates],
         )
 
         _write_completion_midi(
@@ -253,6 +265,8 @@ def complete_pattern_blocks(
             incomplete_blocks_file=str(incomplete_blocks_path),
             missing_expected_blocks_file=str(missing_expected_blocks_path),
             debug_midi_path=debug_path_for_report,
+            bar_gap_candidate_count=len(bar_gap_candidates),
+            bar_gap_candidates_file=str(bar_gap_candidates_path),
             warnings=warnings,
             warning_count=len(warnings),
             error=None,
@@ -290,6 +304,8 @@ def complete_pattern_blocks(
             incomplete_blocks_file=str(incomplete_blocks_path),
             missing_expected_blocks_file=str(missing_expected_blocks_path),
             debug_midi_path=None,
+            bar_gap_candidate_count=0,
+            bar_gap_candidates_file=str(bar_gap_candidates_path),
             warnings=[str(exc)],
             warning_count=1,
             error=str(exc),
@@ -1169,6 +1185,265 @@ def _detect_missing_expected_blocks(
         deduped.values(),
         key=lambda item: (item.write_start_sec, item.write_end_sec, -(item.confidence_score)),
     )
+
+
+def _detect_bar_gap_candidates(
+    *,
+    project_dir: Path,
+    blocks: list[PatternBlock],
+    families: list[PatternFamily],
+) -> list[BarGapCandidate]:
+    if not blocks:
+        return []
+
+    blocks_sorted = sorted(blocks, key=lambda item: item.bar_index)
+    audio_frames = _load_audio_frames(project_dir=project_dir)
+    pitch_frames = _load_pitch_frames(project_dir=project_dir)
+    audio_available = bool(audio_frames)
+    pitch_available = bool(pitch_frames)
+
+    family_by_id = {family.pattern_family_id: family for family in families}
+    family_by_bar: dict[int, str] = {}
+    for block in blocks_sorted:
+        family_id = block.assigned_pattern_family_id
+        if family_id is None:
+            continue
+        family_by_bar[int(block.bar_index)] = str(family_id)
+
+    sparse_threshold = max(1, int(math.ceil(statistics.median([item.note_count for item in blocks_sorted]) * 0.35)))
+
+    candidates: list[BarGapCandidate] = []
+    current_start: int | None = None
+    current_note_count = 0
+    candidate_counter = 0
+
+    def finalize(end_index: int) -> None:
+        nonlocal current_start
+        nonlocal current_note_count
+        nonlocal candidate_counter
+
+        if current_start is None:
+            return
+
+        gap_blocks = [
+            block
+            for block in blocks_sorted
+            if current_start <= int(block.bar_index) <= end_index
+        ]
+        if not gap_blocks:
+            current_start = None
+            current_note_count = 0
+            return
+
+        start_sec = float(gap_blocks[0].start_sec)
+        end_sec = float(gap_blocks[-1].end_sec)
+        bar_count = (end_index - current_start) + 1
+
+        before_context = _collect_family_context(
+            anchor_bar=current_start - 1,
+            direction=-1,
+            family_by_bar=family_by_bar,
+            family_by_id=family_by_id,
+        )
+        after_context = _collect_family_context(
+            anchor_bar=end_index + 1,
+            direction=1,
+            family_by_bar=family_by_bar,
+            family_by_id=family_by_id,
+        )
+
+        before_ids = {item.pattern_family_id for item in before_context}
+        after_ids = {item.pattern_family_id for item in after_context}
+        bridge_ids = sorted(before_ids.intersection(after_ids))
+        same_bridge = bool(bridge_ids)
+
+        compatible_bridge = False
+        if not same_bridge and before_context and after_context:
+            compatible_bridge = _has_compatible_bridge(before_context, after_context, family_by_id)
+
+        audio_ratio = _activity_ratio_in_frames(audio_frames, start_sec=start_sec, end_sec=end_sec, key="onset_score")
+        pitch_ratio = _activity_ratio_in_frames(pitch_frames, start_sec=start_sec, end_sec=end_sec, key="voiced")
+
+        completion_readiness = "insufficient_context"
+        completion_possible = False
+        reason = "No deterministic bridge context around gap."
+
+        if same_bridge and bar_count >= 1:
+            completion_readiness = "extremely_clear"
+            completion_possible = True
+            reason = (
+                "Same pattern family appears before and after gap; deterministic bridge is extremely clear."
+            )
+        elif compatible_bridge:
+            completion_readiness = "unclear"
+            reason = "Compatible but non-identical families appear before and after gap; diagnostic only."
+        elif before_context or after_context:
+            completion_readiness = "unclear"
+            reason = "Partial family context around gap; deterministic fill not yet allowed."
+
+        candidate_counter += 1
+        candidates.append(
+            BarGapCandidate(
+                gap_id=f"gap_{candidate_counter:04d}",
+                start_bar_index=int(current_start),
+                end_bar_index=int(end_index),
+                bar_index_range=f"{current_start + 1}-{end_index + 1}",
+                bar_count=int(bar_count),
+                start_sec=round(start_sec, 6),
+                end_sec=round(end_sec, 6),
+                note_count=int(current_note_count),
+                sparse_threshold=int(sparse_threshold),
+                audio_features_available=audio_available,
+                audio_evidence_exists=(audio_ratio is not None and audio_ratio >= 0.10) if audio_available else None,
+                audio_active_frame_ratio=round(audio_ratio, 6) if audio_ratio is not None else None,
+                pitch_contour_available=pitch_available,
+                pitch_contour_evidence_exists=(pitch_ratio is not None and pitch_ratio >= 0.10) if pitch_available else None,
+                pitch_voiced_frame_ratio=round(pitch_ratio, 6) if pitch_ratio is not None else None,
+                families_before=before_context,
+                families_after=after_context,
+                same_family_bridge=same_bridge,
+                compatible_family_bridge=compatible_bridge,
+                bridge_family_ids=bridge_ids,
+                completion_possible=completion_possible,
+                completion_readiness=completion_readiness,
+                completion_reason=reason,
+            )
+        )
+
+        current_start = None
+        current_note_count = 0
+
+    for block in blocks_sorted:
+        is_sparse = int(block.note_count) <= sparse_threshold
+        if is_sparse:
+            if current_start is None:
+                current_start = int(block.bar_index)
+                current_note_count = int(block.note_count)
+            else:
+                current_note_count += int(block.note_count)
+            continue
+
+        if current_start is not None:
+            finalize(int(block.bar_index) - 1)
+
+    if current_start is not None:
+        finalize(int(blocks_sorted[-1].bar_index))
+
+    return sorted(candidates, key=lambda item: (item.start_sec, item.end_sec, item.bar_count), reverse=False)
+
+
+def _collect_family_context(
+    *,
+    anchor_bar: int,
+    direction: int,
+    family_by_bar: dict[int, str],
+    family_by_id: dict[str, PatternFamily],
+    max_scan: int = 8,
+) -> list[BarGapFamilyContext]:
+    contexts: list[BarGapFamilyContext] = []
+    seen: set[str] = set()
+    for offset in range(0, max_scan):
+        bar_index = anchor_bar + (direction * offset)
+        family_id = family_by_bar.get(int(bar_index))
+        if family_id is None or family_id in seen:
+            continue
+        seen.add(family_id)
+        family = family_by_id.get(family_id)
+        occurrence_count = family.occurrence_count if family is not None else None
+        contexts.append(
+            BarGapFamilyContext(
+                pattern_family_id=family_id,
+                bar_index=int(bar_index),
+                distance_bars=int(abs(offset)),
+                occurrence_count=int(occurrence_count) if occurrence_count is not None else None,
+            )
+        )
+        if len(contexts) >= 5:
+            break
+    return contexts
+
+
+def _has_compatible_bridge(
+    before: list[BarGapFamilyContext],
+    after: list[BarGapFamilyContext],
+    family_by_id: dict[str, PatternFamily],
+) -> bool:
+    for left in before:
+        for right in after:
+            fam_left = family_by_id.get(left.pattern_family_id)
+            fam_right = family_by_id.get(right.pattern_family_id)
+            if fam_left is None or fam_right is None:
+                continue
+            if fam_left.representative_note_count != fam_right.representative_note_count:
+                continue
+            if fam_left.representative_interval_sequence == fam_right.representative_interval_sequence:
+                return True
+            left_rhythm = tuple(int(round(item * 1000.0)) for item in fam_left.representative_relative_onsets_beat)
+            right_rhythm = tuple(int(round(item * 1000.0)) for item in fam_right.representative_relative_onsets_beat)
+            if left_rhythm == right_rhythm:
+                return True
+    return False
+
+
+def _load_audio_frames(*, project_dir: Path) -> list[dict[str, object]]:
+    path = project_dir / "analysis" / "audio_features.json"
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    frames = payload.get("frames")
+    if isinstance(frames, list):
+        return [item for item in frames if isinstance(item, dict)]
+    return []
+
+
+def _load_pitch_frames(*, project_dir: Path) -> list[dict[str, object]]:
+    path = project_dir / "analysis" / "bass_pitch_contour.json"
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    frames = payload.get("frames")
+    if isinstance(frames, list):
+        return [item for item in frames if isinstance(item, dict)]
+    return []
+
+
+def _activity_ratio_in_frames(
+    frames: list[dict[str, object]],
+    *,
+    start_sec: float,
+    end_sec: float,
+    key: str,
+) -> float | None:
+    if not frames:
+        return None
+
+    selected = [
+        item
+        for item in frames
+        if float(item.get("end_sec", 0.0)) > float(start_sec)
+        and float(item.get("start_sec", 0.0)) < float(end_sec)
+    ]
+    if not selected:
+        return None
+
+    active = 0
+    for frame in selected:
+        if key == "onset_score":
+            if float(frame.get("onset_score", 0.0)) >= 0.01 or bool(frame.get("is_silent", False)) is False:
+                active += 1
+            continue
+        if key == "voiced":
+            if bool(frame.get("voiced", False)):
+                active += 1
+            continue
+
+    return active / float(len(selected))
 
 
 def _complete_missing_expected_blocks(

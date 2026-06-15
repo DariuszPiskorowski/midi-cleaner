@@ -157,8 +157,10 @@ def test_pattern_complete_blocks_calls_deterministic_service(monkeypatch: pytest
             rejected_polyphonic_stack_count=0,
             rejected_low_confidence_count=0,
             rejected_tiny_gap_count=0,
+            bar_gap_candidate_count=2,
             inserted_note_count=2,
             output_midi_path="projects/demo/midi/uzupelnienie.mid",
+            bar_gap_candidates_file="projects/demo/analysis/pattern_blocks/bar_gap_candidates.json",
             warning_count=0,
         )
 
@@ -185,3 +187,4 @@ def test_pattern_complete_blocks_calls_deterministic_service(monkeypatch: pytest
     assert "missing_expected_block_count=0" in result.stdout
     assert "bar_aligned_block_count=3" in result.stdout
     assert "rejected_low_confidence_count=0" in result.stdout
+    assert "bar_gap_candidate_count=2" in result.stdout

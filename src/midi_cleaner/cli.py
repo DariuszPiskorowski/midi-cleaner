@@ -1102,8 +1102,10 @@ def pattern_complete_blocks_command(
         f"rejected_polyphonic_stack_count={report.rejected_polyphonic_stack_count}, "
         f"rejected_low_confidence_count={report.rejected_low_confidence_count}, "
         f"rejected_tiny_gap_count={report.rejected_tiny_gap_count}, "
+        f"bar_gap_candidate_count={report.bar_gap_candidate_count}, "
         f"inserted_note_count={report.inserted_note_count}, "
         f"output_midi_path={report.output_midi_path}, "
+        f"bar_gap_candidates_file={report.bar_gap_candidates_file}, "
         f"warnings={report.warning_count}"
     )
 

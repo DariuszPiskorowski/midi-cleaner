@@ -154,6 +154,39 @@ class IncompleteBlockReport(BaseModel):
     action: Literal["completed", "skipped"]
 
 
+class BarGapFamilyContext(BaseModel):
+    pattern_family_id: str
+    bar_index: int
+    distance_bars: int
+    occurrence_count: int | None = None
+
+
+class BarGapCandidate(BaseModel):
+    gap_id: str
+    start_bar_index: int
+    end_bar_index: int
+    bar_index_range: str
+    bar_count: int
+    start_sec: float
+    end_sec: float
+    note_count: int
+    sparse_threshold: int
+    audio_features_available: bool
+    audio_evidence_exists: bool | None = None
+    audio_active_frame_ratio: float | None = None
+    pitch_contour_available: bool
+    pitch_contour_evidence_exists: bool | None = None
+    pitch_voiced_frame_ratio: float | None = None
+    families_before: list[BarGapFamilyContext] = Field(default_factory=list)
+    families_after: list[BarGapFamilyContext] = Field(default_factory=list)
+    same_family_bridge: bool = False
+    compatible_family_bridge: bool = False
+    bridge_family_ids: list[str] = Field(default_factory=list)
+    completion_possible: bool = False
+    completion_readiness: Literal["extremely_clear", "unclear", "insufficient_context"]
+    completion_reason: str
+
+
 class PatternCompletionReport(BaseModel):
     status: Literal["ok", "error"]
     layer: str
@@ -183,6 +216,8 @@ class PatternCompletionReport(BaseModel):
     incomplete_blocks_file: str | None
     missing_expected_blocks_file: str | None
     debug_midi_path: str | None
+    bar_gap_candidate_count: int = 0
+    bar_gap_candidates_file: str | None = None
     warnings: list[str] = Field(default_factory=list)
     warning_count: int = 0
     error: str | None = None
