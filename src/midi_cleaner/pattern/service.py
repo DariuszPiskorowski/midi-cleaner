@@ -9,11 +9,11 @@ import statistics
 
 import mido
 
-from midi_cleaner.midi.importer import import_midi_candidate, pitch_name_from_midi
-from midi_cleaner.midi.models import NoteEvent
+from midi_cleaner.midi.importer import import_midi_candidate
 from midi_cleaner.pattern.models import (
     IncompleteBlockMatch,
     IncompleteBlockReport,
+    MissingExpectedBlock,
     PatternBlock,
     PatternBlockNote,
     PatternCompletionReport,
@@ -58,6 +58,12 @@ class _CandidateFamilyMatch:
     reason: str
 
 
+@dataclass(frozen=True)
+class _FamilyPeriodEstimate:
+    period_sec: float
+    stability: float
+
+
 def complete_pattern_blocks(
     project_dir: Path,
     params: PatternCompletionParameters,
@@ -74,6 +80,7 @@ def complete_pattern_blocks(
     pattern_blocks_path = analysis_dir / "pattern_blocks.json"
     pattern_families_path = analysis_dir / "pattern_families.json"
     incomplete_blocks_path = analysis_dir / "incomplete_blocks.json"
+    missing_expected_blocks_path = analysis_dir / "missing_expected_blocks.json"
     report_path = analysis_dir / "pattern_completion_report.json"
     output_midi_path = midi_dir / "uzupelnienie.mid"
     debug_midi_path = debug_dir / "pattern_blocks_debug.mid"
@@ -97,7 +104,8 @@ def complete_pattern_blocks(
         ]
 
         blocks_by_id = {block.block_id: block for block in enriched_blocks}
-        incomplete_reports: list[IncompleteBlockReport] = []
+        incomplete_existing_reports: list[IncompleteBlockReport] = []
+        missing_expected_reports: list[IncompleteBlockReport] = []
         inserted_notes: list[ProposedCompletionNote] = []
 
         for block in enriched_blocks:
@@ -110,14 +118,34 @@ def complete_pattern_blocks(
                 families=families,
                 base_notes=base_notes,
             )
-            incomplete_reports.append(report)
+            incomplete_existing_reports.append(report)
             inserted_notes.extend(new_notes)
+
+        missing_expected_blocks = _detect_missing_expected_blocks(
+            families=families,
+            blocks_by_id=blocks_by_id,
+            base_notes=base_notes,
+        )
+        missing_reports, missing_inserted_notes = _complete_missing_expected_blocks(
+            missing_expected_blocks=missing_expected_blocks,
+            blocks_by_id=blocks_by_id,
+            families=families,
+            base_notes=base_notes,
+        )
+        missing_expected_reports.extend(missing_reports)
+        inserted_notes.extend(missing_inserted_notes)
+
+        all_reports = list(incomplete_existing_reports) + list(missing_expected_reports)
 
         deduped_inserted_notes = _dedupe_inserted_notes(inserted_notes)
 
         _write_json(pattern_blocks_path, [item.model_dump(mode="json") for item in enriched_blocks])
         _write_json(pattern_families_path, [item.model_dump(mode="json") for item in families])
-        _write_json(incomplete_blocks_path, [item.model_dump(mode="json") for item in incomplete_reports])
+        _write_json(incomplete_blocks_path, [item.model_dump(mode="json") for item in all_reports])
+        _write_json(
+            missing_expected_blocks_path,
+            [item.model_dump(mode="json") for item in missing_expected_reports],
+        )
 
         _write_completion_midi(
             output_path=output_midi_path,
@@ -139,8 +167,31 @@ def complete_pattern_blocks(
             )
             debug_path_for_report = str(debug_midi_path)
 
-        completed_block_count = sum(1 for item in incomplete_reports if item.action == "completed")
-        skipped_block_count = sum(1 for item in incomplete_reports if item.action == "skipped")
+        incomplete_existing_block_count = len(incomplete_existing_reports)
+        missing_expected_block_count = len(missing_expected_reports)
+        completed_incomplete_existing_block_count = sum(
+            1
+            for item in incomplete_existing_reports
+            if item.action == "completed"
+        )
+        completed_missing_expected_block_count = sum(
+            1
+            for item in missing_expected_reports
+            if item.action == "completed"
+        )
+        completed_block_count = completed_incomplete_existing_block_count + completed_missing_expected_block_count
+        skipped_block_count = sum(1 for item in all_reports if item.action == "skipped")
+        skipped_ambiguous_count = sum(
+            1
+            for item in all_reports
+            if item.action == "skipped" and item.reason == "ambiguous"
+        )
+        skipped_no_clear_family_count = sum(
+            1
+            for item in all_reports
+            if item.action == "skipped"
+            and item.reason == "no_clear_family"
+        )
 
         report = PatternCompletionReport(
             status="ok",
@@ -149,14 +200,21 @@ def complete_pattern_blocks(
             base_midi_path=str(base_midi_path),
             pattern_block_count=len(enriched_blocks),
             pattern_family_count=len(families),
-            incomplete_block_count=len(incomplete_reports),
+            incomplete_existing_block_count=incomplete_existing_block_count,
+            missing_expected_block_count=missing_expected_block_count,
+            incomplete_block_count=len(all_reports),
+            completed_incomplete_existing_block_count=completed_incomplete_existing_block_count,
+            completed_missing_expected_block_count=completed_missing_expected_block_count,
             completed_block_count=completed_block_count,
             skipped_block_count=skipped_block_count,
+            skipped_ambiguous_count=skipped_ambiguous_count,
+            skipped_no_clear_family_count=skipped_no_clear_family_count,
             inserted_note_count=len(deduped_inserted_notes),
             output_midi_path=str(output_midi_path),
             pattern_blocks_file=str(pattern_blocks_path),
             pattern_families_file=str(pattern_families_path),
             incomplete_blocks_file=str(incomplete_blocks_path),
+            missing_expected_blocks_file=str(missing_expected_blocks_path),
             debug_midi_path=debug_path_for_report,
             warnings=warnings,
             warning_count=len(warnings),
@@ -173,14 +231,21 @@ def complete_pattern_blocks(
             base_midi_path=None,
             pattern_block_count=0,
             pattern_family_count=0,
+            incomplete_existing_block_count=0,
+            missing_expected_block_count=0,
             incomplete_block_count=0,
+            completed_incomplete_existing_block_count=0,
+            completed_missing_expected_block_count=0,
             completed_block_count=0,
             skipped_block_count=0,
+            skipped_ambiguous_count=0,
+            skipped_no_clear_family_count=0,
             inserted_note_count=0,
             output_midi_path=None,
             pattern_blocks_file=str(pattern_blocks_path),
             pattern_families_file=str(pattern_families_path),
             incomplete_blocks_file=str(incomplete_blocks_path),
+            missing_expected_blocks_file=str(missing_expected_blocks_path),
             debug_midi_path=None,
             warnings=[str(exc)],
             warning_count=1,
@@ -506,6 +571,7 @@ def _complete_incomplete_block(
 
     if not possible_matches:
         report = IncompleteBlockReport(
+            block_type="incomplete_existing_block",
             incomplete_block_id=incomplete_block.block_id,
             start_sec=incomplete_block.start_sec,
             end_sec=incomplete_block.end_sec,
@@ -513,7 +579,8 @@ def _complete_incomplete_block(
             observed_relative_onsets_sec=list(incomplete_block.relative_onsets_sec),
             possible_matches=[],
             best_match_pattern_family_id=None,
-            match_reason="No deterministic family match found.",
+            reason="no_clear_family",
+            match_reason="No clear deterministic family match found.",
             missing_notes_to_insert=[],
             confidence_level="low",
             action="skipped",
@@ -525,6 +592,7 @@ def _complete_incomplete_block(
 
     if second is not None and (best.score - second.score) < 0.08:
         report = IncompleteBlockReport(
+            block_type="incomplete_existing_block",
             incomplete_block_id=incomplete_block.block_id,
             start_sec=incomplete_block.start_sec,
             end_sec=incomplete_block.end_sec,
@@ -532,6 +600,7 @@ def _complete_incomplete_block(
             observed_relative_onsets_sec=list(incomplete_block.relative_onsets_sec),
             possible_matches=match_models,
             best_match_pattern_family_id=None,
+            reason="ambiguous",
             match_reason=(
                 "Ambiguous deterministic match. Top families are too close in score: "
                 f"{best.family.pattern_family_id}={best.score:.3f}, {second.family.pattern_family_id}={second.score:.3f}"
@@ -545,6 +614,7 @@ def _complete_incomplete_block(
     exemplar_block = _find_exemplar_block(best.family, blocks_by_id)
     if exemplar_block is None:
         report = IncompleteBlockReport(
+            block_type="incomplete_existing_block",
             incomplete_block_id=incomplete_block.block_id,
             start_sec=incomplete_block.start_sec,
             end_sec=incomplete_block.end_sec,
@@ -552,6 +622,7 @@ def _complete_incomplete_block(
             observed_relative_onsets_sec=list(incomplete_block.relative_onsets_sec),
             possible_matches=match_models,
             best_match_pattern_family_id=best.family.pattern_family_id,
+            reason="no_clear_family",
             match_reason="Matched family has no exemplar block payload.",
             missing_notes_to_insert=[],
             confidence_level="low",
@@ -581,6 +652,7 @@ def _complete_incomplete_block(
 
     if not validated:
         report = IncompleteBlockReport(
+            block_type="incomplete_existing_block",
             incomplete_block_id=incomplete_block.block_id,
             start_sec=incomplete_block.start_sec,
             end_sec=incomplete_block.end_sec,
@@ -588,6 +660,7 @@ def _complete_incomplete_block(
             observed_relative_onsets_sec=list(incomplete_block.relative_onsets_sec),
             possible_matches=match_models,
             best_match_pattern_family_id=best.family.pattern_family_id,
+            reason="rejected_validation",
             match_reason=f"{best.reason}. All proposed notes rejected during validation.",
             missing_notes_to_insert=[],
             confidence_level=_confidence_from_score(best.score),
@@ -596,6 +669,7 @@ def _complete_incomplete_block(
         return report, []
 
     report = IncompleteBlockReport(
+        block_type="incomplete_existing_block",
         incomplete_block_id=incomplete_block.block_id,
         start_sec=incomplete_block.start_sec,
         end_sec=incomplete_block.end_sec,
@@ -603,6 +677,7 @@ def _complete_incomplete_block(
         observed_relative_onsets_sec=list(incomplete_block.relative_onsets_sec),
         possible_matches=match_models,
         best_match_pattern_family_id=best.family.pattern_family_id,
+        reason="completed",
         match_reason=(
             f"{best.reason}. Proposed={len(proposed)} accepted={len(validated)} rejected={rejected_count}."
         ),
@@ -611,6 +686,523 @@ def _complete_incomplete_block(
         action="completed",
     )
     return report, validated
+
+
+def _detect_missing_expected_blocks(
+    *,
+    families: list[PatternFamily],
+    blocks_by_id: dict[str, PatternBlock],
+    base_notes: list[_BaseNote],
+) -> list[MissingExpectedBlock]:
+    candidates: list[MissingExpectedBlock] = []
+    candidate_counter = 0
+
+    for family in families:
+        if family.occurrence_count < 2:
+            continue
+
+        occurrence_blocks = [
+            blocks_by_id[block_id]
+            for block_id in family.occurrences
+            if block_id in blocks_by_id
+        ]
+        occurrence_blocks.sort(key=lambda item: item.start_sec)
+        if len(occurrence_blocks) < 2:
+            continue
+
+        period_estimate = _infer_family_period(occurrence_blocks)
+        if period_estimate is None:
+            continue
+
+        expected_duration_sec = _family_duration_sec(family)
+        sparse_threshold = max(1, int(math.floor(len(family.representative_pitch_sequence) * 0.70)))
+
+        for index in range(len(occurrence_blocks) - 1):
+            before = occurrence_blocks[index]
+            after = occurrence_blocks[index + 1]
+            gap_sec = after.start_sec - before.start_sec
+            if gap_sec <= period_estimate.period_sec * 1.45:
+                continue
+
+            estimated_step_count = int(round(gap_sec / period_estimate.period_sec))
+            missing_count = estimated_step_count - 1
+            if missing_count <= 0:
+                continue
+
+            expected_gap_sec = (missing_count + 1) * period_estimate.period_sec
+            gap_error_sec = abs(gap_sec - expected_gap_sec)
+            if gap_error_sec > max(0.22, period_estimate.period_sec * 0.22):
+                continue
+
+            for step in range(1, missing_count + 1):
+                write_start_sec = before.start_sec + (period_estimate.period_sec * step)
+                write_end_sec = min(write_start_sec + expected_duration_sec, after.start_sec)
+                if write_end_sec <= write_start_sec + 0.03:
+                    continue
+
+                detected_note_count = _count_notes_in_region(
+                    base_notes=base_notes,
+                    start_sec=write_start_sec,
+                    end_sec=write_end_sec,
+                )
+                if detected_note_count > sparse_threshold:
+                    continue
+
+                sparsity_score = 1.0 - min(1.0, detected_note_count / float(sparse_threshold + 1))
+                gap_fit_score = max(
+                    0.0,
+                    1.0
+                    - (
+                        gap_error_sec
+                        / max(1e-6, max(0.22, period_estimate.period_sec * 0.22))
+                    ),
+                )
+                confidence_score = max(
+                    0.0,
+                    min(
+                        1.0,
+                        0.25
+                        + (0.35 * period_estimate.stability)
+                        + (0.25 * gap_fit_score)
+                        + (0.15 * sparsity_score),
+                    ),
+                )
+
+                candidate_counter += 1
+                reason = (
+                    "missing_expected_pattern_occurrence; "
+                    f"period={period_estimate.period_sec:.3f}s stability={period_estimate.stability:.2f} "
+                    f"gap={gap_sec:.3f}s estimated_missing={missing_count} "
+                    f"region_notes={detected_note_count}"
+                )
+                candidates.append(
+                    MissingExpectedBlock(
+                        missing_block_id=f"missing_{candidate_counter:04d}",
+                        expected_pattern_family_id=family.pattern_family_id,
+                        write_start_sec=round(write_start_sec, 6),
+                        write_end_sec=round(write_end_sec, 6),
+                        expected_duration_sec=round(expected_duration_sec, 6),
+                        evidence_before_occurrences=[before.block_id],
+                        evidence_after_occurrences=[after.block_id],
+                        detected_note_count_in_region=detected_note_count,
+                        confidence_score=round(confidence_score, 6),
+                        possible_matches=[
+                            IncompleteBlockMatch(
+                                pattern_family_id=family.pattern_family_id,
+                                score=round(confidence_score, 6),
+                                reason=reason,
+                            )
+                        ],
+                    )
+                )
+
+    deduped: dict[tuple[str, int, int], MissingExpectedBlock] = {}
+    for candidate in candidates:
+        family_id = candidate.expected_pattern_family_id or "unknown"
+        key = (
+            family_id,
+            int(round(candidate.write_start_sec * 100.0)),
+            int(round(candidate.write_end_sec * 100.0)),
+        )
+        existing = deduped.get(key)
+        if existing is None or candidate.confidence_score > existing.confidence_score:
+            deduped[key] = candidate
+
+    return sorted(
+        deduped.values(),
+        key=lambda item: (item.write_start_sec, item.write_end_sec, -(item.confidence_score)),
+    )
+
+
+def _complete_missing_expected_blocks(
+    *,
+    missing_expected_blocks: list[MissingExpectedBlock],
+    blocks_by_id: dict[str, PatternBlock],
+    families: list[PatternFamily],
+    base_notes: list[_BaseNote],
+) -> tuple[list[IncompleteBlockReport], list[ProposedCompletionNote]]:
+    if not missing_expected_blocks:
+        return [], []
+
+    families_by_id = {family.pattern_family_id: family for family in families}
+    region_groups: dict[tuple[int, int], list[MissingExpectedBlock]] = defaultdict(list)
+
+    for block in missing_expected_blocks:
+        key = (
+            int(round(block.write_start_sec * 1000.0 / 120.0)),
+            int(round(block.write_end_sec * 1000.0 / 120.0)),
+        )
+        region_groups[key].append(block)
+
+    reports: list[IncompleteBlockReport] = []
+    inserted_notes: list[ProposedCompletionNote] = []
+
+    for grouped in sorted(
+        region_groups.values(),
+        key=lambda items: min(item.write_start_sec for item in items),
+    ):
+        best_by_family: dict[str, MissingExpectedBlock] = {}
+        for item in grouped:
+            family_id = item.expected_pattern_family_id or "unknown"
+            existing = best_by_family.get(family_id)
+            if existing is None or item.confidence_score > existing.confidence_score:
+                best_by_family[family_id] = item
+
+        candidates = sorted(best_by_family.values(), key=lambda item: item.confidence_score, reverse=True)
+        if not candidates:
+            continue
+
+        possible_matches = [
+            IncompleteBlockMatch(
+                pattern_family_id=item.expected_pattern_family_id or "unknown",
+                score=round(item.confidence_score, 6),
+                reason=(
+                    "missing_expected_pattern_occurrence; "
+                    f"before={item.evidence_before_occurrences} after={item.evidence_after_occurrences} "
+                    f"region_notes={item.detected_note_count_in_region}"
+                ),
+            )
+            for item in candidates[:5]
+        ]
+
+        best = candidates[0]
+        second = candidates[1] if len(candidates) > 1 else None
+
+        if (
+            second is not None
+            and best.expected_pattern_family_id != second.expected_pattern_family_id
+            and (best.confidence_score - second.confidence_score) < 0.12
+        ):
+            reports.append(
+                IncompleteBlockReport(
+                    block_type="missing_expected_block",
+                    missing_block_id=best.missing_block_id,
+                    expected_pattern_family_id=None,
+                    start_sec=best.write_start_sec,
+                    end_sec=best.write_end_sec,
+                    write_start_sec=best.write_start_sec,
+                    write_end_sec=best.write_end_sec,
+                    expected_duration_sec=best.expected_duration_sec,
+                    evidence_before_occurrences=list(best.evidence_before_occurrences),
+                    evidence_after_occurrences=list(best.evidence_after_occurrences),
+                    observed_note_count_in_region=best.detected_note_count_in_region,
+                    possible_matches=possible_matches,
+                    best_match_pattern_family_id=None,
+                    reason="ambiguous",
+                    match_reason=(
+                        "Ambiguous deterministic match for missing expected block. "
+                        f"Top families are too close: {best.expected_pattern_family_id}={best.confidence_score:.3f}, "
+                        f"{second.expected_pattern_family_id}={second.confidence_score:.3f}"
+                    ),
+                    missing_notes_to_insert=[],
+                    confidence_level="low",
+                    action="skipped",
+                )
+            )
+            continue
+
+        if best.expected_pattern_family_id is None or best.confidence_score < 0.62:
+            reports.append(
+                IncompleteBlockReport(
+                    block_type="missing_expected_block",
+                    missing_block_id=best.missing_block_id,
+                    expected_pattern_family_id=best.expected_pattern_family_id,
+                    start_sec=best.write_start_sec,
+                    end_sec=best.write_end_sec,
+                    write_start_sec=best.write_start_sec,
+                    write_end_sec=best.write_end_sec,
+                    expected_duration_sec=best.expected_duration_sec,
+                    evidence_before_occurrences=list(best.evidence_before_occurrences),
+                    evidence_after_occurrences=list(best.evidence_after_occurrences),
+                    observed_note_count_in_region=best.detected_note_count_in_region,
+                    possible_matches=possible_matches,
+                    best_match_pattern_family_id=best.expected_pattern_family_id,
+                    reason="no_clear_family",
+                    match_reason="No clear deterministic family evidence for missing expected block.",
+                    missing_notes_to_insert=[],
+                    confidence_level="low",
+                    action="skipped",
+                )
+            )
+            continue
+
+        family = families_by_id.get(best.expected_pattern_family_id)
+        if family is None:
+            reports.append(
+                IncompleteBlockReport(
+                    block_type="missing_expected_block",
+                    missing_block_id=best.missing_block_id,
+                    expected_pattern_family_id=best.expected_pattern_family_id,
+                    start_sec=best.write_start_sec,
+                    end_sec=best.write_end_sec,
+                    write_start_sec=best.write_start_sec,
+                    write_end_sec=best.write_end_sec,
+                    expected_duration_sec=best.expected_duration_sec,
+                    evidence_before_occurrences=list(best.evidence_before_occurrences),
+                    evidence_after_occurrences=list(best.evidence_after_occurrences),
+                    observed_note_count_in_region=best.detected_note_count_in_region,
+                    possible_matches=possible_matches,
+                    best_match_pattern_family_id=best.expected_pattern_family_id,
+                    reason="no_clear_family",
+                    match_reason="No clear deterministic family payload for missing expected block.",
+                    missing_notes_to_insert=[],
+                    confidence_level="low",
+                    action="skipped",
+                )
+            )
+            continue
+
+        report, notes = _complete_missing_expected_block(
+            missing_expected_block=best,
+            family=family,
+            blocks_by_id=blocks_by_id,
+            base_notes=base_notes,
+            possible_matches=possible_matches,
+        )
+        reports.append(report)
+        inserted_notes.extend(notes)
+
+    return reports, inserted_notes
+
+
+def _complete_missing_expected_block(
+    *,
+    missing_expected_block: MissingExpectedBlock,
+    family: PatternFamily,
+    blocks_by_id: dict[str, PatternBlock],
+    base_notes: list[_BaseNote],
+    possible_matches: list[IncompleteBlockMatch],
+) -> tuple[IncompleteBlockReport, list[ProposedCompletionNote]]:
+    exemplar_block = _find_exemplar_block(family, blocks_by_id)
+    if exemplar_block is None:
+        report = IncompleteBlockReport(
+            block_type="missing_expected_block",
+            missing_block_id=missing_expected_block.missing_block_id,
+            expected_pattern_family_id=family.pattern_family_id,
+            start_sec=missing_expected_block.write_start_sec,
+            end_sec=missing_expected_block.write_end_sec,
+            write_start_sec=missing_expected_block.write_start_sec,
+            write_end_sec=missing_expected_block.write_end_sec,
+            expected_duration_sec=missing_expected_block.expected_duration_sec,
+            evidence_before_occurrences=list(missing_expected_block.evidence_before_occurrences),
+            evidence_after_occurrences=list(missing_expected_block.evidence_after_occurrences),
+            observed_note_count_in_region=missing_expected_block.detected_note_count_in_region,
+            possible_matches=possible_matches,
+            best_match_pattern_family_id=family.pattern_family_id,
+            reason="no_clear_family",
+            match_reason="No clear deterministic family payload for missing expected block.",
+            missing_notes_to_insert=[],
+            confidence_level="low",
+            action="skipped",
+        )
+        return report, []
+
+    proposed = _propose_missing_expected_notes(
+        missing_expected_block=missing_expected_block,
+        family=family,
+        exemplar_block=exemplar_block,
+    )
+
+    validated: list[ProposedCompletionNote] = []
+    rejected_count = 0
+    for note in proposed:
+        reason = _validate_missing_expected_note(
+            note=note,
+            missing_expected_block=missing_expected_block,
+            family=family,
+            base_notes=base_notes,
+        )
+        if reason is None:
+            validated.append(note)
+        else:
+            rejected_count += 1
+
+    if not validated:
+        report = IncompleteBlockReport(
+            block_type="missing_expected_block",
+            missing_block_id=missing_expected_block.missing_block_id,
+            expected_pattern_family_id=family.pattern_family_id,
+            start_sec=missing_expected_block.write_start_sec,
+            end_sec=missing_expected_block.write_end_sec,
+            write_start_sec=missing_expected_block.write_start_sec,
+            write_end_sec=missing_expected_block.write_end_sec,
+            expected_duration_sec=missing_expected_block.expected_duration_sec,
+            evidence_before_occurrences=list(missing_expected_block.evidence_before_occurrences),
+            evidence_after_occurrences=list(missing_expected_block.evidence_after_occurrences),
+            observed_note_count_in_region=missing_expected_block.detected_note_count_in_region,
+            possible_matches=possible_matches,
+            best_match_pattern_family_id=family.pattern_family_id,
+            reason="rejected_validation",
+            match_reason=(
+                "missing_expected_pattern_occurrence. "
+                f"All proposed notes rejected during validation (rejected={rejected_count})."
+            ),
+            missing_notes_to_insert=[],
+            confidence_level=_confidence_from_score(missing_expected_block.confidence_score),
+            action="skipped",
+        )
+        return report, []
+
+    report = IncompleteBlockReport(
+        block_type="missing_expected_block",
+        missing_block_id=missing_expected_block.missing_block_id,
+        expected_pattern_family_id=family.pattern_family_id,
+        start_sec=missing_expected_block.write_start_sec,
+        end_sec=missing_expected_block.write_end_sec,
+        write_start_sec=missing_expected_block.write_start_sec,
+        write_end_sec=missing_expected_block.write_end_sec,
+        expected_duration_sec=missing_expected_block.expected_duration_sec,
+        evidence_before_occurrences=list(missing_expected_block.evidence_before_occurrences),
+        evidence_after_occurrences=list(missing_expected_block.evidence_after_occurrences),
+        observed_note_count_in_region=missing_expected_block.detected_note_count_in_region,
+        possible_matches=possible_matches,
+        best_match_pattern_family_id=family.pattern_family_id,
+        reason="missing_expected_pattern_occurrence",
+        match_reason=(
+            "missing_expected_pattern_occurrence. "
+            f"Proposed={len(proposed)} accepted={len(validated)} rejected={rejected_count}."
+        ),
+        missing_notes_to_insert=validated,
+        confidence_level=_confidence_from_score(missing_expected_block.confidence_score),
+        action="completed",
+    )
+    return report, validated
+
+
+def _propose_missing_expected_notes(
+    *,
+    missing_expected_block: MissingExpectedBlock,
+    family: PatternFamily,
+    exemplar_block: PatternBlock,
+) -> list[ProposedCompletionNote]:
+    exemplar_notes = exemplar_block.notes
+    if not exemplar_notes:
+        return []
+
+    reference_velocity = int(statistics.median(note.velocity for note in exemplar_notes)) if exemplar_notes else 90
+    reference_channel = exemplar_notes[0].channel if exemplar_notes else 0
+
+    proposals: list[ProposedCompletionNote] = []
+    for index, rel_start in enumerate(family.representative_relative_onsets_sec):
+        if index >= len(exemplar_notes):
+            continue
+
+        exemplar_note = exemplar_notes[index]
+        rel_duration = (
+            family.representative_durations_sec[index]
+            if index < len(family.representative_durations_sec)
+            else exemplar_note.duration_sec
+        )
+
+        raw_start = float(missing_expected_block.write_start_sec) + float(rel_start)
+        raw_end = raw_start + float(rel_duration)
+        if raw_end <= missing_expected_block.write_start_sec:
+            continue
+        if raw_start >= missing_expected_block.write_end_sec:
+            continue
+
+        start_sec = max(raw_start, float(missing_expected_block.write_start_sec))
+        end_sec = min(raw_end, float(missing_expected_block.write_end_sec))
+        if end_sec - start_sec <= 0.01:
+            continue
+
+        proposals.append(
+            ProposedCompletionNote(
+                source_pattern_family_id=family.pattern_family_id,
+                source_block_id=exemplar_block.block_id,
+                source_note_index=index,
+                note_id=f"mx_{missing_expected_block.missing_block_id}_{index:02d}",
+                start_sec=round(start_sec, 6),
+                end_sec=round(end_sec, 6),
+                duration_sec=round(max(1e-6, end_sec - start_sec), 6),
+                pitch_midi=int(exemplar_note.pitch_midi),
+                pitch_name=exemplar_note.pitch_name,
+                velocity=int(reference_velocity),
+                channel=reference_channel,
+            )
+        )
+
+    proposals.sort(key=lambda item: (item.start_sec, item.end_sec, item.pitch_midi))
+    return proposals
+
+
+def _validate_missing_expected_note(
+    *,
+    note: ProposedCompletionNote,
+    missing_expected_block: MissingExpectedBlock,
+    family: PatternFamily,
+    base_notes: list[_BaseNote],
+) -> str | None:
+    if note.end_sec <= note.start_sec:
+        return "invalid_duration"
+
+    if note.start_sec < (missing_expected_block.write_start_sec - 1e-6):
+        return "outside_expected_write_region"
+
+    if note.end_sec > (missing_expected_block.write_end_sec + 1e-6):
+        return "outside_expected_write_region"
+
+    if note.pitch_midi < min(family.representative_pitch_set) or note.pitch_midi > max(family.representative_pitch_set):
+        return "outside_pattern_pitch_range"
+
+    if note.duration_sec <= 0.01:
+        return "timing_not_matching_pattern"
+
+    family_durations = family.representative_durations_sec
+    if family_durations:
+        median_duration = statistics.median(family_durations)
+        if note.duration_sec > max(0.35, median_duration * 1.8):
+            return "timing_not_matching_pattern"
+
+    return _collision_with_base_notes(note=note, base_notes=base_notes)
+
+
+def _family_duration_sec(family: PatternFamily) -> float:
+    max_end = 0.0
+    for index, onset in enumerate(family.representative_relative_onsets_sec):
+        duration = (
+            family.representative_durations_sec[index]
+            if index < len(family.representative_durations_sec)
+            else 0.0
+        )
+        max_end = max(max_end, float(onset) + float(duration))
+    return max(0.05, float(max_end))
+
+
+def _infer_family_period(occurrence_blocks: list[PatternBlock]) -> _FamilyPeriodEstimate | None:
+    if len(occurrence_blocks) < 2:
+        return None
+
+    diffs = [
+        occurrence_blocks[index + 1].start_sec - occurrence_blocks[index].start_sec
+        for index in range(len(occurrence_blocks) - 1)
+        if occurrence_blocks[index + 1].start_sec > occurrence_blocks[index].start_sec
+    ]
+    if not diffs:
+        return None
+
+    base_period = min(diffs)
+    normalized_periods: list[float] = []
+    for diff in diffs:
+        multiple = max(1, int(round(diff / max(1e-6, base_period))))
+        normalized_periods.append(diff / float(multiple))
+
+    period_sec = statistics.median(normalized_periods)
+    if period_sec <= 0.03:
+        return None
+
+    variation = statistics.pstdev(normalized_periods) if len(normalized_periods) > 1 else 0.0
+    stability = max(0.0, min(1.0, 1.0 - (variation / max(1e-6, period_sec))))
+    return _FamilyPeriodEstimate(period_sec=float(period_sec), stability=float(stability))
+
+
+def _count_notes_in_region(*, base_notes: list[_BaseNote], start_sec: float, end_sec: float) -> int:
+    count = 0
+    for note in base_notes:
+        overlap = min(end_sec, note.end_sec) - max(start_sec, note.start_sec)
+        if overlap > 0.0:
+            count += 1
+    return count
 
 
 def _score_family_match(
@@ -864,6 +1456,10 @@ def _validate_proposed_note(
         if note.duration_sec <= 0.01 or abs(note.duration_sec - median_duration) > max(0.25, median_duration * 0.85):
             return "timing_not_matching_pattern"
 
+    return _collision_with_base_notes(note=note, base_notes=base_notes)
+
+
+def _collision_with_base_notes(*, note: ProposedCompletionNote, base_notes: list[_BaseNote]) -> str | None:
     for base_note in base_notes:
         onset_delta = abs(note.start_sec - base_note.start_sec)
         overlap = min(note.end_sec, base_note.end_sec) - max(note.start_sec, base_note.start_sec)

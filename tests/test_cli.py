@@ -142,9 +142,15 @@ def test_pattern_complete_blocks_calls_deterministic_service(monkeypatch: pytest
         return SimpleNamespace(
             pattern_block_count=3,
             pattern_family_count=1,
+            incomplete_existing_block_count=1,
+            missing_expected_block_count=0,
             incomplete_block_count=1,
+            completed_incomplete_existing_block_count=1,
+            completed_missing_expected_block_count=0,
             completed_block_count=1,
             skipped_block_count=0,
+            skipped_ambiguous_count=0,
+            skipped_no_clear_family_count=0,
             inserted_note_count=2,
             output_midi_path="projects/demo/midi/uzupelnienie.mid",
             warning_count=0,
@@ -170,3 +176,4 @@ def test_pattern_complete_blocks_calls_deterministic_service(monkeypatch: pytest
     assert params.layer == "bass"
     assert params.write_debug_midi is False
     assert "inserted_note_count=2" in result.stdout
+    assert "missing_expected_block_count=0" in result.stdout
