@@ -108,6 +108,8 @@ def _patch_detected_hits(
             high_ratio,
             1500.0,
             4500.0,
+            0.20,
+            0.70,
         ),
     )
 
@@ -161,6 +163,20 @@ def test_audio_onset_extraction_creates_midi_notes(tmp_path: Path) -> None:
     assert len(_note_on_events(output_midi)) > 0
     assert payload["onset_count"] > 0
     assert sum(payload["output_note_counts"].values()) > 0
+    assert payload["output_pitch_counts"] == payload["output_note_counts"]
+
+
+def test_drums_extract_command_is_registered() -> None:
+    result = runner.invoke(
+        app,
+        ["drums", "extract-from-audio", "--help"],
+        env={"COLUMNS": "240", "LINES": "120"},
+    )
+
+    assert result.exit_code == 0
+    assert "--wav" in result.stdout
+    assert "--output" in result.stdout
+    assert "--target-map" in result.stdout
 
 
 def test_output_note_timing_follows_detected_onset_times(
@@ -216,7 +232,7 @@ def test_target_map_ujam_candy_maps_classes_to_expected_notes(
             "kick",
             "snare_or_clap",
             "hat",
-            "crash_or_cymbal",
+            "cymbal",
             "tom_or_perc",
         ],
         low_ratio=0.7,
@@ -329,6 +345,39 @@ def test_no_quantization_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert note_on_ticks[0] not in {120, 144}
 
 
+def test_output_midi_uses_channel_10_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "channel10.mid"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.20, 0.40],
+        class_names=["kick", "snare_or_clap"],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "gm",
+            "--bpm",
+            "120",
+        ],
+    )
+
+    channels = {channel for _tick, _note, channel, _velocity in _note_on_events(output_midi)}
+
+    assert result.exit_code == 0
+    assert channels == {9}
+
+
 def test_dry_run_writes_report_but_not_midi(tmp_path: Path) -> None:
     wav_path = tmp_path / "Drums.wav"
     output_midi = tmp_path / "dry.mid"
@@ -360,6 +409,60 @@ def test_dry_run_writes_report_but_not_midi(tmp_path: Path) -> None:
     assert payload["output_file"] is None
 
 
+def test_report_and_debug_csv_are_written(tmp_path: Path) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "drums.mid"
+    report_path = tmp_path / "report.json"
+    debug_csv = tmp_path / "hits.csv"
+    _build_drum_like_wav(wav_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "ujam-candy",
+            "--report",
+            str(report_path),
+            "--debug-csv",
+            str(debug_csv),
+        ],
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    header = debug_csv.read_text(encoding="utf-8").splitlines()[0]
+
+    assert result.exit_code == 0
+    assert report_path.exists()
+    assert debug_csv.exists()
+    assert "output_pitch_counts" in payload
+    assert "per_hit_summary" in payload
+    assert len(payload["per_hit_summary"]) > 0
+    assert all(
+        key in payload["per_hit_summary"][0]
+        for key in [
+            "tick",
+            "class",
+            "target_note",
+            "velocity",
+            "confidence",
+            "low_energy_ratio",
+            "mid_energy_ratio",
+            "high_energy_ratio",
+            "spectral_centroid",
+            "onset_strength",
+        ]
+    )
+    assert "tick" in header
+    assert "spectral_centroid" in header
+    assert "onset_strength" in header
+
+
 def test_separate_files_mode_creates_synchronized_class_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -375,7 +478,7 @@ def test_separate_files_mode_creates_synchronized_class_files(
             "kick",
             "snare_or_clap",
             "hat",
-            "crash_or_cymbal",
+            "cymbal",
             "tom_or_perc",
             "unknown",
         ],
@@ -451,6 +554,36 @@ def test_no_ai_is_invoked_during_audio_drum_extraction(
         raise AssertionError("AI completion should not be called for drums extract-from-audio")
 
     monkeypatch.setattr("midi_cleaner.cli.complete_ai_pattern_completion", _raise_if_called)
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "gm",
+        ],
+    )
+
+    assert result.exit_code == 0
+
+
+def test_extract_from_audio_does_not_call_remap_drums(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "no_remap.mid"
+    _build_drum_like_wav(wav_path)
+
+    def _raise_if_called(*args, **kwargs):
+        raise AssertionError("remap_drums_file must not be called by extract-from-audio")
+
+    monkeypatch.setattr("midi_cleaner.cli.remap_drums_file", _raise_if_called)
 
     result = runner.invoke(
         app,

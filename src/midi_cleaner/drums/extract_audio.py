@@ -24,6 +24,7 @@ DrumClass = Literal[
     "kick",
     "snare_or_clap",
     "hat",
+    "cymbal",
     "crash_or_cymbal",
     "tom_or_perc",
     "unknown",
@@ -38,7 +39,7 @@ _CLASS_FILE_NAMES: dict[str, str] = {
     "kick": "kick.mid",
     "snare_or_clap": "snare_clap.mid",
     "hat": "hat.mid",
-    "crash_or_cymbal": "cymbal.mid",
+    "cymbal": "cymbal.mid",
     "tom_or_perc": "tom_perc.mid",
 }
 
@@ -46,6 +47,7 @@ _CLASS_NOTE_DURATIONS_SEC: dict[DrumClass, float] = {
     "kick": 0.10,
     "snare_or_clap": 0.10,
     "hat": 0.06,
+    "cymbal": 0.32,
     "crash_or_cymbal": 0.32,
     "tom_or_perc": 0.14,
     "unknown": 0.08,
@@ -76,6 +78,7 @@ class AudioDrumExtractionParameters:
 @dataclass
 class PerHitSummary:
     onset_sec: float
+    tick: int
     class_name: DrumClass
     target_note: int
     velocity: int
@@ -83,6 +86,8 @@ class PerHitSummary:
     low_energy_ratio: float
     mid_energy_ratio: float
     high_energy_ratio: float
+    spectral_centroid: float
+    onset_strength: float
 
 
 @dataclass
@@ -96,6 +101,7 @@ class AudioDrumExtractionReport:
     onset_count: int
     class_counts: dict[str, int]
     output_note_counts: dict[str, int]
+    output_pitch_counts: dict[str, int]
     target_map: str
     c1_midi_note: int
     synchronization_preserved: bool
@@ -107,6 +113,7 @@ class AudioDrumExtractionReport:
         payload["per_hit_summary"] = [
             {
                 "onset_sec": item.onset_sec,
+                "tick": item.tick,
                 "class": item.class_name,
                 "target_note": item.target_note,
                 "velocity": item.velocity,
@@ -114,6 +121,8 @@ class AudioDrumExtractionReport:
                 "low_energy_ratio": item.low_energy_ratio,
                 "mid_energy_ratio": item.mid_energy_ratio,
                 "high_energy_ratio": item.high_energy_ratio,
+                "spectral_centroid": item.spectral_centroid,
+                "onset_strength": item.onset_strength,
             }
             for item in self.per_hit_summary
         ]
@@ -123,11 +132,13 @@ class AudioDrumExtractionReport:
 @dataclass
 class _DetectedHit:
     onset_sec: float
+    tick: int
     onset_strength: float
     class_name: DrumClass
     low_energy_ratio: float
     mid_energy_ratio: float
     high_energy_ratio: float
+    spectral_centroid: float
     confidence: float
     target_note: int
     velocity: int
@@ -247,7 +258,7 @@ def _extract_hit_spectral_features(
     audio: np.ndarray,
     sample_rate: int,
     onset_sec: float,
-) -> tuple[float, float, float, float, float]:
+) -> tuple[float, float, float, float, float, float, float]:
     onset_sample = int(round(onset_sec * sample_rate))
     frame_size = max(256, int(round(0.10 * sample_rate)))
 
@@ -278,7 +289,10 @@ def _extract_hit_spectral_features(
     rolloff_index = min(rolloff_index, len(freqs) - 1)
     rolloff_hz = float(freqs[rolloff_index]) if len(freqs) else 0.0
 
-    return low_ratio, mid_ratio, high_ratio, centroid_hz, rolloff_hz
+    rms = float(np.sqrt(np.mean(frame * frame)))
+    peak = float(np.max(np.abs(frame)))
+
+    return low_ratio, mid_ratio, high_ratio, centroid_hz, rolloff_hz, rms, peak
 
 
 def _classify_hit(
@@ -300,7 +314,7 @@ def _classify_hit(
     if high_ratio >= 0.58 and (centroid_hz >= 5200.0 or rolloff_hz >= 9000.0):
         if high_ratio >= 0.75 or rolloff_hz >= 11000.0:
             base_confidence = 0.65 + (high_ratio - 0.58)
-            return "crash_or_cymbal", min(1.0, base_confidence + 0.20 * onset_strength)
+            return "cymbal", min(1.0, base_confidence + 0.20 * onset_strength)
         base_confidence = 0.62 + (high_ratio - 0.58)
         return "hat", min(1.0, base_confidence + 0.20 * onset_strength)
 
@@ -406,6 +420,7 @@ def _infer_custom_class_targets(
         "kick": _first("kick"),
         "snare_or_clap": snare_note,
         "hat": _first("hat"),
+        "cymbal": _first("cym"),
         "crash_or_cymbal": _first("cym"),
         "tom_or_perc": _first("tom", "perc"),
         "unknown": fallback_note,
@@ -427,6 +442,7 @@ def _resolve_class_targets(
             "kick": candy_layout["C1"],
             "snare_or_clap": candy_layout[snare_note_name],
             "hat": candy_layout["C2"],
+            "cymbal": candy_layout["C3"],
             "crash_or_cymbal": candy_layout["C3"],
             "tom_or_perc": candy_layout["D2"],
             "unknown": candy_layout["D1"],
@@ -442,12 +458,19 @@ def _resolve_class_targets(
             "kick": 36,
             "snare_or_clap": snare_note,
             "hat": 42,
+            "cymbal": 49,
             "crash_or_cymbal": 49,
             "tom_or_perc": 45,
             "unknown": 39,
         }
 
     return _infer_custom_class_targets(map_definition, snare_target=params.snare_target)
+
+
+def _normalize_class_name(class_name: DrumClass) -> DrumClass:
+    if class_name == "crash_or_cymbal":
+        return "cymbal"
+    return class_name
 
 
 def _hit_to_tick(onset_sec: float, ticks_per_second: float) -> int:
@@ -538,7 +561,7 @@ def _write_debug_csv(path: Path, hits: list[_DetectedHit]) -> None:
             handle,
             fieldnames=[
                 "onset_sec",
-                "onset_strength",
+                "tick",
                 "class",
                 "target_note",
                 "velocity",
@@ -546,6 +569,8 @@ def _write_debug_csv(path: Path, hits: list[_DetectedHit]) -> None:
                 "low_energy_ratio",
                 "mid_energy_ratio",
                 "high_energy_ratio",
+                "spectral_centroid",
+                "onset_strength",
             ],
         )
         writer.writeheader()
@@ -553,6 +578,7 @@ def _write_debug_csv(path: Path, hits: list[_DetectedHit]) -> None:
             writer.writerow(
                 {
                     "onset_sec": hit.onset_sec,
+                    "tick": hit.tick,
                     "onset_strength": hit.onset_strength,
                     "class": hit.class_name,
                     "target_note": hit.target_note,
@@ -561,6 +587,7 @@ def _write_debug_csv(path: Path, hits: list[_DetectedHit]) -> None:
                     "low_energy_ratio": hit.low_energy_ratio,
                     "mid_energy_ratio": hit.mid_energy_ratio,
                     "high_energy_ratio": hit.high_energy_ratio,
+                    "spectral_centroid": hit.spectral_centroid,
                 }
             )
 
@@ -585,6 +612,8 @@ def _validate_params(params: AudioDrumExtractionParameters) -> None:
 def _count_output_notes(hits: list[_DetectedHit]) -> dict[str, int]:
     counts: dict[int, int] = {}
     for hit in hits:
+        if int(hit.target_note) < 0:
+            continue
         note = int(hit.target_note)
         counts[note] = counts.get(note, 0) + 1
     return {str(note): count for note, count in sorted(counts.items())}
@@ -595,12 +624,13 @@ def _count_classes(hits: list[_DetectedHit]) -> dict[str, int]:
         "kick": 0,
         "snare_or_clap": 0,
         "hat": 0,
-        "crash_or_cymbal": 0,
+        "cymbal": 0,
         "tom_or_perc": 0,
         "unknown": 0,
     }
     for hit in hits:
-        counts[hit.class_name] += 1
+        normalized = _normalize_class_name(hit.class_name)
+        counts[normalized] += 1
     return counts
 
 
@@ -608,13 +638,16 @@ def _to_per_hit_summary(hits: list[_DetectedHit]) -> list[PerHitSummary]:
     return [
         PerHitSummary(
             onset_sec=float(hit.onset_sec),
-            class_name=hit.class_name,
+            tick=int(hit.tick),
+            class_name=_normalize_class_name(hit.class_name),
             target_note=int(hit.target_note),
             velocity=int(hit.velocity),
             confidence=float(hit.confidence),
             low_energy_ratio=float(hit.low_energy_ratio),
             mid_energy_ratio=float(hit.mid_energy_ratio),
             high_energy_ratio=float(hit.high_energy_ratio),
+            spectral_centroid=float(hit.spectral_centroid),
+            onset_strength=float(hit.onset_strength),
         )
         for hit in hits
     ]
@@ -655,6 +688,7 @@ def extract_drums_from_audio(
 
     detected_bpm = _estimate_bpm(onset_times)
     bpm_used = float(params.bpm) if params.bpm is not None else float(detected_bpm or DEFAULT_BPM)
+    ticks_per_second = (params.ticks_per_beat * bpm_used) / 60.0
 
     warnings: list[str] = []
     if detected_bpm is None:
@@ -663,8 +697,18 @@ def extract_drums_from_audio(
         warnings.append("No onsets detected above threshold.")
 
     hits: list[_DetectedHit] = []
+    emitted_hits: list[_DetectedHit] = []
+    skipped_unknown_count = 0
     for onset_sec, onset_strength in zip(onset_times.tolist(), onset_strengths.tolist()):
-        low_ratio, mid_ratio, high_ratio, centroid_hz, rolloff_hz = _extract_hit_spectral_features(
+        (
+            low_ratio,
+            mid_ratio,
+            high_ratio,
+            centroid_hz,
+            rolloff_hz,
+            _rms,
+            _peak,
+        ) = _extract_hit_spectral_features(
             mono,
             sample_rate,
             onset_sec,
@@ -677,27 +721,41 @@ def extract_drums_from_audio(
             centroid_hz=centroid_hz,
             rolloff_hz=rolloff_hz,
         )
+        class_name = _normalize_class_name(class_name)
 
         target_note = int(class_targets[class_name])
         if class_name == "tom_or_perc" and params.target_map == "ujam-candy" and high_ratio > 0.45:
             candy_layout = resolve_ujam_candy_layout_notes(params.c1_midi_note)
             target_note = candy_layout["F2"]
 
-        hits.append(
-            _DetectedHit(
-                onset_sec=float(onset_sec),
-                onset_strength=float(onset_strength),
-                class_name=class_name,
-                low_energy_ratio=float(low_ratio),
-                mid_energy_ratio=float(mid_ratio),
-                high_energy_ratio=float(high_ratio),
-                confidence=float(confidence),
-                target_note=target_note,
-                velocity=_velocity_from_hit(float(onset_strength), confidence),
-            )
+        hit = _DetectedHit(
+            onset_sec=float(onset_sec),
+            tick=_hit_to_tick(float(onset_sec), ticks_per_second),
+            onset_strength=float(onset_strength),
+            class_name=class_name,
+            low_energy_ratio=float(low_ratio),
+            mid_energy_ratio=float(mid_ratio),
+            high_energy_ratio=float(high_ratio),
+            spectral_centroid=float(centroid_hz),
+            confidence=float(confidence),
+            target_note=target_note,
+            velocity=_velocity_from_hit(float(onset_strength), confidence),
         )
+        if class_name == "unknown" and float(confidence) < 0.80:
+            skipped_unknown_count += 1
+            hit.target_note = -1
+        else:
+            emitted_hits.append(hit)
+
+        hits.append(hit)
 
     hits.sort(key=lambda item: item.onset_sec)
+    emitted_hits.sort(key=lambda item: item.onset_sec)
+
+    if skipped_unknown_count > 0:
+        warnings.append(
+            f"Skipped {skipped_unknown_count} low-confidence unknown hits from MIDI output."
+        )
 
     if params.debug_csv is not None:
         _write_debug_csv(params.debug_csv, hits)
@@ -708,7 +766,7 @@ def extract_drums_from_audio(
     if not params.dry_run:
         track_name = f"drums_from_audio_{params.target_map.replace('-', '_')}"
         source_length_ticks, output_length_ticks = _build_midi(
-            hits,
+            emitted_hits,
             output_path=output_file,
             ticks_per_beat=params.ticks_per_beat,
             bpm_used=bpm_used,
@@ -723,10 +781,10 @@ def extract_drums_from_audio(
                 "kick": [],
                 "snare_or_clap": [],
                 "hat": [],
-                "crash_or_cymbal": [],
+                "cymbal": [],
                 "tom_or_perc": [],
             }
-            for hit in hits:
+            for hit in emitted_hits:
                 bucket = hit.class_name
                 if bucket == "unknown":
                     bucket = "tom_or_perc"
@@ -764,9 +822,10 @@ def extract_drums_from_audio(
         sample_rate=int(sample_rate),
         detected_bpm=float(detected_bpm) if detected_bpm is not None else None,
         bpm_used=float(bpm_used),
-        onset_count=len(hits),
+        onset_count=len(onset_times),
         class_counts=_count_classes(hits),
-        output_note_counts=_count_output_notes(hits),
+        output_note_counts=_count_output_notes(emitted_hits),
+        output_pitch_counts=_count_output_notes(emitted_hits),
         target_map=map_definition.name,
         c1_midi_note=int(params.c1_midi_note),
         synchronization_preserved=bool(synchronization_preserved),
