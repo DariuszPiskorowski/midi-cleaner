@@ -157,6 +157,21 @@ Write JSON report to file:
 uv run midi-cleaner doctor --output runtime_report.json
 ```
 
+## Hermes GUI Panel
+
+Launch the simple local Hermes workflow window:
+
+```powershell
+uv run midi-cleaner gui
+```
+
+Current GUI actions:
+- make MIDI from WAV (bass/drums)
+- synchronize existing MIDI with WAV
+- set/fix BPM
+
+Generated GUI outputs are written to your Desktop.
+
 ## AI Pattern Completion Environment
 
 Create a local `.env` from `.env.example`:
@@ -179,6 +194,28 @@ Example:
 ```powershell
 uv run midi-cleaner midi import-candidate .\candidate.mid --source ripx --layer bass --output .\artifacts\note_events.json --report .\artifacts\midi_import_report.json
 ```
+
+## MIDI Sync with WAV
+
+```powershell
+uv run midi-cleaner midi sync-with-wav --wav INPUT_WAV --midi INPUT_MIDI --output OUTPUT_MIDI --report REPORT_JSON
+```
+
+Optional exact BPM override:
+
+```powershell
+uv run midi-cleaner midi sync-with-wav --wav INPUT_WAV --midi INPUT_MIDI --output OUTPUT_MIDI --bpm 124.529
+```
+
+Without `--bpm`, source MIDI tempo is preserved.
+
+## MIDI Set BPM (Tempo Map Only)
+
+```powershell
+uv run midi-cleaner midi set-bpm --input INPUT_MIDI --bpm 124.529 --output OUTPUT_MIDI --report REPORT_JSON
+```
+
+This updates tempo meta events without changing note tick positions.
 
 ## WAV Stem Analysis
 

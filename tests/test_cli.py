@@ -188,3 +188,54 @@ def test_pattern_complete_blocks_calls_deterministic_service(monkeypatch: pytest
     assert "bar_aligned_block_count=3" in result.stdout
     assert "rejected_low_confidence_count=0" in result.stdout
     assert "bar_gap_candidate_count=2" in result.stdout
+
+
+def test_gui_command_registered_in_help() -> None:
+    result = runner.invoke(
+        app,
+        ["--help"],
+        env={"COLUMNS": "240", "LINES": "120"},
+    )
+
+    assert result.exit_code == 0
+    assert "gui" in result.stdout
+
+
+def test_gui_command_invokes_launcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    called = {"invoked": False}
+
+    def _fake_launch_hermes_gui(controller=None) -> None:
+        called["invoked"] = True
+
+    monkeypatch.setattr("midi_cleaner.gui.panel.launch_hermes_gui", _fake_launch_hermes_gui)
+
+    result = runner.invoke(app, ["gui"])
+
+    assert result.exit_code == 0
+    assert called["invoked"] is True
+
+
+def test_midi_set_bpm_help_lists_required_options() -> None:
+    result = runner.invoke(
+        app,
+        ["midi", "set-bpm", "--help"],
+        env={"COLUMNS": "240", "LINES": "120"},
+    )
+
+    assert result.exit_code == 0
+    assert "--input" in result.stdout
+    assert "--bpm" in result.stdout
+    assert "--output" in result.stdout
+
+
+def test_midi_sync_with_wav_help_lists_required_options() -> None:
+    result = runner.invoke(
+        app,
+        ["midi", "sync-with-wav", "--help"],
+        env={"COLUMNS": "240", "LINES": "120"},
+    )
+
+    assert result.exit_code == 0
+    assert "--wav" in result.stdout
+    assert "--midi" in result.stdout
+    assert "--output" in result.stdout

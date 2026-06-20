@@ -54,6 +54,12 @@ from midi_cleaner.midi.remap_drums import (
     MidiRemapDrumsError,
     remap_drums_file,
 )
+from midi_cleaner.midi.set_bpm import MidiSetBpmError, set_midi_bpm
+from midi_cleaner.midi.sync_with_audio import (
+    MidiSyncWithAudioError,
+    MidiSyncWithAudioParameters,
+    sync_midi_with_wav,
+)
 from midi_cleaner.pipeline.process_stem import (
     PipelineProcessError,
     PipelineProcessParameters,
@@ -212,6 +218,18 @@ def doctor(
 
     if report.status == "error":
         raise typer.Exit(code=1)
+
+
+@app.command("gui")
+def gui_command() -> None:
+    """Launch a simple desktop Hermes workflow panel."""
+    try:
+        from midi_cleaner.gui import launch_hermes_gui
+    except Exception as exc:
+        typer.echo(f"GUI launch failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    launch_hermes_gui()
 
 
 @midi_app.command("import-candidate")
@@ -439,6 +457,128 @@ def remap_drums_command(
         f"unmapped={len(remap_report.unmapped_pitches)}, "
         f"warnings={len(remap_report.warnings)}, "
         f"dry_run={str(dry_run).lower()}"
+    )
+
+
+@midi_app.command("sync-with-wav")
+def midi_sync_with_wav_command(
+    wav: Path = typer.Option(..., "--wav", help="Path to source WAV file."),
+    midi: Path = typer.Option(..., "--midi", help="Path to source MIDI file."),
+    output: Path = typer.Option(..., "--output", help="Output synchronized MIDI file path."),
+    report: Path | None = typer.Option(
+        None,
+        "--report",
+        help="Optional path for sync/alignment report JSON.",
+    ),
+    layer: str = typer.Option(
+        "bass",
+        "--layer",
+        help="Logical layer label used by existing Hermes sync workflow.",
+    ),
+    source: str = typer.Option(
+        "ripx",
+        "--source",
+        help="Source label for imported MIDI (for reporting).",
+    ),
+    bpm: float | None = typer.Option(
+        None,
+        "--bpm",
+        help="Optional BPM override. When omitted, source MIDI tempo map is preserved.",
+    ),
+    onset_search_window_ms: float = typer.Option(250.0, "--onset-search-window-ms"),
+    offset_search_window_ms: float = typer.Option(350.0, "--offset-search-window-ms"),
+    min_onset_score: float = typer.Option(0.005, "--min-onset-score"),
+    min_rms: float = typer.Option(0.001, "--min-rms"),
+    snap_start_to_audio_onset: bool = typer.Option(
+        True,
+        "--snap-start-to-audio-onset/--no-snap-start-to-audio-onset",
+    ),
+    snap_end_to_energy_offset: bool = typer.Option(
+        True,
+        "--snap-end-to-energy-offset/--no-snap-end-to-energy-offset",
+    ),
+    max_start_correction_ms: float = typer.Option(500.0, "--max-start-correction-ms"),
+    max_end_correction_ms: float = typer.Option(800.0, "--max-end-correction-ms"),
+    low_confidence_action: str = typer.Option(
+        "KEEP_ORIGINAL_LOW_CONFIDENCE",
+        "--low-confidence-action",
+    ),
+) -> None:
+    params = MidiSyncWithAudioParameters(
+        source=source,
+        layer=layer,
+        bpm_override=bpm,
+        onset_search_window_ms=onset_search_window_ms,
+        offset_search_window_ms=offset_search_window_ms,
+        min_onset_score=min_onset_score,
+        min_rms=min_rms,
+        snap_start_to_audio_onset=snap_start_to_audio_onset,
+        snap_end_to_energy_offset=snap_end_to_energy_offset,
+        max_start_correction_ms=max_start_correction_ms,
+        max_end_correction_ms=max_end_correction_ms,
+        low_confidence_action=low_confidence_action,
+    )
+
+    try:
+        sync_report, _aligned_document, alignment_report_payload = sync_midi_with_wav(
+            input_midi=midi,
+            input_wav=wav,
+            output_midi=output,
+            params=params,
+        )
+    except MidiSyncWithAudioError as exc:
+        typer.echo(f"MIDI sync failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if report is not None:
+        report.parent.mkdir(parents=True, exist_ok=True)
+        sync_report.alignment_report_file = str(report)
+        report_payload = {
+            "sync_report": sync_report.model_dump(mode="json"),
+            "alignment_report": alignment_report_payload,
+        }
+        report.write_text(json.dumps(report_payload, indent=2) + "\n", encoding="utf-8")
+
+    typer.echo(
+        "MIDI sync summary: "
+        f"notes={sync_report.note_count}, "
+        f"aligned={sync_report.aligned_count}, "
+        f"keep_original={sync_report.keep_original_count}, "
+        f"review={sync_report.review_timing_count}, "
+        f"no_audio_evidence={sync_report.no_audio_evidence_count}, "
+        f"tempo_preserved={str(sync_report.tempo_preserved).lower()}, "
+        f"warnings={sync_report.warning_count}"
+    )
+
+
+@midi_app.command("set-bpm")
+def midi_set_bpm_command(
+    input_midi: Path = typer.Option(..., "--input", help="Path to source MIDI file."),
+    bpm: float = typer.Option(..., "--bpm", help="Target BPM, e.g. 124.529."),
+    output: Path = typer.Option(..., "--output", help="Output MIDI file path."),
+    report: Path | None = typer.Option(
+        None,
+        "--report",
+        help="Optional path for set-BPM report JSON.",
+    ),
+) -> None:
+    try:
+        bpm_report = set_midi_bpm(input_file=input_midi, output_file=output, bpm=bpm)
+    except MidiSetBpmError as exc:
+        typer.echo(f"Set BPM failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if report is not None:
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(bpm_report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+
+    typer.echo(
+        "Set BPM summary: "
+        f"bpm={bpm_report.bpm:.3f}, "
+        f"tempo_us_per_beat={bpm_report.tempo_us_per_beat}, "
+        f"removed_tempo_events={bpm_report.removed_tempo_event_count}, "
+        f"inserted_tempo_events={bpm_report.inserted_tempo_event_count}, "
+        f"warnings={bpm_report.warning_count}"
     )
 
 
