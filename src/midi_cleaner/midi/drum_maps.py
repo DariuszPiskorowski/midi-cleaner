@@ -161,6 +161,13 @@ def _build_ujam_candy_map(c1_midi_note: int) -> DrumMapDefinition:
     )
 
 
+def resolve_ujam_candy_layout_notes(c1_midi_note: int) -> dict[str, int]:
+    resolved: dict[str, int] = {}
+    for note_name in sorted(_UJAM_CANDY_LAYOUT_LABELS, key=lambda item: (_note_name_to_midi(item, c1_midi_note=c1_midi_note), item)):
+        resolved[note_name] = _note_name_to_midi(note_name, c1_midi_note=c1_midi_note)
+    return resolved
+
+
 def _coerce_note_value(value: object, *, field_name: str) -> int:
     try:
         note = int(value)

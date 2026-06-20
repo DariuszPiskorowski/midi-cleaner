@@ -137,6 +137,10 @@ def _is_drum_note_message(message: mido.Message) -> bool:
     return int(getattr(message, "channel", -1)) == DRUM_CHANNEL_ZERO_BASED
 
 
+def _is_real_note_on(message: mido.Message) -> bool:
+    return message.type == "note_on" and int(getattr(message, "velocity", 0)) > 0
+
+
 def _nearest_note(source_note: int, known_notes: set[int]) -> int:
     if not known_notes:
         return source_note
@@ -216,7 +220,7 @@ def _accumulate_source_audit(
                 continue
             if hasattr(message, "channel"):
                 context.source_channels.add(int(message.channel))
-            if _is_drum_note_message(message):
+            if _is_drum_note_message(message) and _is_real_note_on(message):
                 note = int(message.note)
                 context.source_pitch_counts[note] = context.source_pitch_counts.get(note, 0) + 1
 
@@ -273,7 +277,10 @@ def _copy_message_with_policy(
         if mapped_note is None:
             return None
         copied.note = mapped_note
-        context.remapped_pitch_counts[mapped_note] = context.remapped_pitch_counts.get(mapped_note, 0) + 1
+        if _is_real_note_on(copied):
+            context.remapped_pitch_counts[mapped_note] = (
+                context.remapped_pitch_counts.get(mapped_note, 0) + 1
+            )
 
     if output_channel is not None and hasattr(copied, "channel"):
         copied.channel = output_channel

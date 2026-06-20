@@ -21,6 +21,11 @@ from midi_cleaner.alignment.audio_time import (
 from midi_cleaner.alignment.models import AudioAlignmentReport
 from midi_cleaner.audio.analyzer import AudioAnalysisError, analyze_stem
 from midi_cleaner.dsp.analyzer import DspAnalysisError, analyze_dsp_stem
+from midi_cleaner.drums.extract_audio import (
+    AudioDrumExtractionError,
+    AudioDrumExtractionParameters,
+    extract_drums_from_audio,
+)
 from midi_cleaner.cleanup.cleaned_exporter import (
     CleanedMidiExportError,
     CleanedMidiExportParameters,
@@ -103,6 +108,7 @@ pitch_app = typer.Typer(help="Bass pitch contour analysis tools.")
 pipeline_app = typer.Typer(help="End-to-end pipeline tools.")
 ai_app = typer.Typer(help="AI pattern completion tools.")
 pattern_app = typer.Typer(help="Deterministic pattern block tools.")
+drums_app = typer.Typer(help="Audio-driven drum extraction tools.")
 console = Console()
 
 app.add_typer(midi_app, name="midi")
@@ -115,6 +121,7 @@ app.add_typer(pitch_app, name="pitch")
 app.add_typer(pipeline_app, name="pipeline")
 app.add_typer(ai_app, name="ai")
 app.add_typer(pattern_app, name="pattern")
+app.add_typer(drums_app, name="drums")
 
 
 def version_callback(value: bool) -> None:
@@ -431,6 +438,104 @@ def remap_drums_command(
         f"output_length_ticks={remap_report.output_length_ticks}, "
         f"unmapped={len(remap_report.unmapped_pitches)}, "
         f"warnings={len(remap_report.warnings)}, "
+        f"dry_run={str(dry_run).lower()}"
+    )
+
+
+@drums_app.command("extract-from-audio")
+def drums_extract_from_audio_command(
+    wav: Path = typer.Option(..., "--wav", help="Path to source drum WAV stem."),
+    output: Path = typer.Option(..., "--output", help="Output MIDI file path."),
+    target_map: str = typer.Option(
+        ..., "--target-map", help="Target map: gm|sitala|ujam-candy|custom."
+    ),
+    c1_midi_note: int = typer.Option(
+        36,
+        "--c1-midi-note",
+        help=(
+            "MIDI note number treated as C1 for target layout resolution "
+            "(default 36; try 24 for alternate octave conventions)."
+        ),
+    ),
+    bpm: float | None = typer.Option(
+        None,
+        "--bpm",
+        help="Force BPM for MIDI export; otherwise estimate from detected onsets.",
+    ),
+    channel: int = typer.Option(
+        10,
+        "--channel",
+        help="Output MIDI channel number (1-16). Default 10 for drums.",
+    ),
+    map_file: Path | None = typer.Option(
+        None,
+        "--map-file",
+        help="Custom map JSON path (required for --target-map custom).",
+    ),
+    min_onset_strength: float = typer.Option(
+        0.20,
+        "--min-onset-strength",
+        help="Minimum normalized onset strength threshold.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Analyze and report only; do not write MIDI files.",
+    ),
+    separate_files: bool = typer.Option(
+        False,
+        "--separate-files",
+        help="Also export class-isolated synchronized MIDI files.",
+    ),
+    debug_csv: Path | None = typer.Option(
+        None,
+        "--debug-csv",
+        help="Optional CSV output with per-hit debug evidence.",
+    ),
+    report: Path | None = typer.Option(
+        None,
+        "--report",
+        help="Optional report JSON output path.",
+    ),
+    snare_target: str = typer.Option(
+        "clap",
+        "--snare-target",
+        help="Snare/clap target note preference: sn1|sn2|clap.",
+    ),
+) -> None:
+    if channel < 1 or channel > 16:
+        typer.echo("Invalid --channel. Use 1..16.", err=True)
+        raise typer.Exit(code=1)
+
+    params = AudioDrumExtractionParameters(
+        output_file=output,
+        target_map=target_map,
+        map_file=map_file,
+        c1_midi_note=c1_midi_note,
+        bpm=bpm,
+        channel=channel - 1,
+        min_onset_strength=min_onset_strength,
+        dry_run=dry_run,
+        separate_files=separate_files,
+        debug_csv=debug_csv,
+        report_file=report,
+        snare_target=snare_target,
+    )
+
+    try:
+        extraction_report = extract_drums_from_audio(wav_file=wav, params=params)
+    except AudioDrumExtractionError as exc:
+        typer.echo(f"Drum extraction failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        "Drum extraction summary: "
+        f"target_map={extraction_report.target_map}, "
+        f"onset_count={extraction_report.onset_count}, "
+        f"bpm_used={extraction_report.bpm_used:.3f}, "
+        f"notes={sum(extraction_report.output_note_counts.values())}, "
+        f"sync={str(extraction_report.synchronization_preserved).lower()}, "
+        f"warnings={len(extraction_report.warnings)}, "
         f"dry_run={str(dry_run).lower()}"
     )
 

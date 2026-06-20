@@ -664,3 +664,46 @@ def test_remap_report_contains_source_and_remapped_pitch_counts(tmp_path: Path) 
     assert payload["c1_midi_note"] == 36
     assert payload["resolved_target_note_names"]["39"] == "G1"
     assert payload["resolved_mapping_note_numbers"]["39"] == 43
+
+
+def test_remap_report_counts_only_real_note_on_events(tmp_path: Path) -> None:
+    source = tmp_path / "note_on_only_count.mid"
+    output = tmp_path / "note_on_only_count_out.mid"
+    report = tmp_path / "note_on_only_count_report.json"
+
+    tempo_track = mido.MidiTrack()
+    tempo_track.append(mido.MetaMessage("set_tempo", tempo=500000, time=0))
+    tempo_track.append(mido.MetaMessage("end_of_track", time=480))
+
+    drum_track = mido.MidiTrack()
+    drum_track.append(mido.Message("note_on", note=36, velocity=100, channel=9, time=0))
+    drum_track.append(mido.Message("note_off", note=36, velocity=0, channel=9, time=120))
+    drum_track.append(mido.Message("note_on", note=36, velocity=0, channel=9, time=60))
+    drum_track.append(mido.Message("note_off", note=36, velocity=0, channel=9, time=60))
+    drum_track.append(mido.Message("note_on", note=39, velocity=110, channel=9, time=60))
+    drum_track.append(mido.Message("note_off", note=39, velocity=0, channel=9, time=120))
+    drum_track.append(mido.MetaMessage("end_of_track", time=240))
+
+    _write_midi_file(source, [tempo_track, drum_track], ticks_per_beat=480, midi_type=1)
+
+    result = runner.invoke(
+        app,
+        [
+            "midi",
+            "remap-drums",
+            "--input",
+            str(source),
+            "--target-map",
+            "ujam-candy",
+            "--output",
+            str(output),
+            "--report",
+            str(report),
+        ],
+    )
+
+    payload = json.loads(report.read_text(encoding="utf-8"))
+
+    assert result.exit_code == 0
+    assert payload["source_pitch_counts"] == {"36": 1, "39": 1}
+    assert payload["remapped_pitch_counts"] == {"36": 1, "43": 1}
