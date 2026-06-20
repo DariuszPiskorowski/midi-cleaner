@@ -369,6 +369,14 @@ def remap_drums_command(
         "--strip-track-names/--keep-track-names",
         help="Strip legacy track names from source tracks.",
     ),
+    c1_midi_note: int = typer.Option(
+        36,
+        "--c1-midi-note",
+        help=(
+            "MIDI note number treated as C1 when resolving UJAM Candy layout "
+            "(default 36; try 24 for alternate octave conventions)."
+        ),
+    ),
     output_format: str = typer.Option(
         "type0",
         "--format",
@@ -402,6 +410,7 @@ def remap_drums_command(
         unmapped_policy=unmapped,
         strip_program_changes=strip_program_changes,
         strip_track_names=strip_track_names,
+        c1_midi_note=c1_midi_note,
         output_format=output_format,
         dry_run=dry_run,
         report_file=report,

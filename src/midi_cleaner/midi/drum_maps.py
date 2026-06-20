@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,6 +16,8 @@ class DrumMapDefinition:
     output_channel: int
     notes: dict[int, int]
     labels: dict[int, str] = field(default_factory=dict)
+    key_layout_name: str = ""
+    target_note_names: dict[int, str] = field(default_factory=dict)
 
 
 _GM_MAP_NOTES: dict[int, int] = {
@@ -56,6 +59,47 @@ _GM_MAP_LABELS: dict[int, str] = {
     57: "crash_2",
 }
 
+_NATURAL_SEMITONE_BY_NOTE_NAME: dict[str, int] = {
+    "C": 0,
+    "D": 2,
+    "E": 4,
+    "F": 5,
+    "G": 7,
+    "A": 9,
+    "B": 11,
+}
+
+_UJAM_CANDY_LAYOUT_LABELS: dict[str, str] = {
+    "C1": "Kick",
+    "D1": "Acc",
+    "E1": "Sn1",
+    "F1": "Sn2",
+    "G1": "Clap",
+    "A1": "HH1",
+    "B1": "HH2",
+    "C2": "HH0",
+    "D2": "Tom L",
+    "E2": "Tom M",
+    "F2": "Tom H",
+    "G2": "Perc 1",
+    "A2": "Perc 2",
+    "B2": "Perc 3",
+    "C3": "Cym 1",
+    "D3": "Cym 2",
+}
+
+_UJAM_CANDY_SOURCE_TO_LAYOUT_NOTE: dict[int, str] = {
+    32: "C1",
+    36: "C1",
+    39: "G1",
+    45: "D2",
+    46: "C2",
+    50: "F2",
+    57: "C3",
+}
+
+_UJAM_CANDY_LAYOUT_NAME = "ujam-candy-observed-ui"
+
 # These presets are intentionally compact and editable for real-world kit adjustments.
 PRESET_DRUM_MAPS: dict[str, DrumMapDefinition] = {
     "gm": DrumMapDefinition(
@@ -63,36 +107,58 @@ PRESET_DRUM_MAPS: dict[str, DrumMapDefinition] = {
         output_channel=9,
         notes=_GM_MAP_NOTES,
         labels=_GM_MAP_LABELS,
+        key_layout_name="gm",
     ),
     "sitala": DrumMapDefinition(
         name="sitala",
         output_channel=9,
         notes=_GM_MAP_NOTES,
         labels=_GM_MAP_LABELS,
-    ),
-    "ujam-candy": DrumMapDefinition(
-        name="ujam_candy",
-        output_channel=9,
-        notes={
-            32: 36,
-            36: 36,
-            39: 38,
-            45: 45,
-            46: 46,
-            50: 50,
-            57: 49,
-        },
-        labels={
-            36: "kick",
-            39: "clap_or_snare",
-            46: "open_hat",
-            57: "crash",
-            45: "low_tom",
-            50: "high_tom",
-            32: "low_kick_or_artifact",
-        },
+        key_layout_name="sitala-gm-compatible",
     ),
 }
+
+
+def _note_name_to_midi(note_name: str, *, c1_midi_note: int) -> int:
+    matched = re.fullmatch(r"([A-G])([0-9]+)", note_name)
+    if matched is None:
+        raise DrumMapError(f"Invalid note name in key layout: {note_name}")
+
+    note_token = matched.group(1)
+    octave = int(matched.group(2))
+
+    semitone = _NATURAL_SEMITONE_BY_NOTE_NAME[note_token]
+    midi_note = c1_midi_note + ((octave - 1) * 12) + semitone
+    if midi_note < 0 or midi_note > 127:
+        raise DrumMapError(
+            f"Resolved note {note_name} from c1_midi_note={c1_midi_note} is out of MIDI range."
+        )
+
+    return midi_note
+
+
+def _build_ujam_candy_map(c1_midi_note: int) -> DrumMapDefinition:
+    if c1_midi_note < 0 or c1_midi_note > 127:
+        raise DrumMapError(f"c1_midi_note must be in range 0..127, got {c1_midi_note}")
+
+    notes: dict[int, int] = {}
+    labels: dict[int, str] = {}
+    target_note_names: dict[int, str] = {}
+
+    for source_note, target_layout_note in _UJAM_CANDY_SOURCE_TO_LAYOUT_NOTE.items():
+        target_midi_note = _note_name_to_midi(target_layout_note, c1_midi_note=c1_midi_note)
+        notes[source_note] = target_midi_note
+        labels[source_note] = _UJAM_CANDY_LAYOUT_LABELS[target_layout_note]
+        target_note_names[source_note] = target_layout_note
+
+    return DrumMapDefinition(
+        name="ujam-candy",
+        output_channel=9,
+        notes=notes,
+        labels=labels,
+        key_layout_name=_UJAM_CANDY_LAYOUT_NAME,
+        target_note_names=target_note_names,
+    )
 
 
 def _coerce_note_value(value: object, *, field_name: str) -> int:
@@ -153,14 +219,21 @@ def _clone_map(map_definition: DrumMapDefinition) -> DrumMapDefinition:
         output_channel=map_definition.output_channel,
         notes=dict(map_definition.notes),
         labels=dict(map_definition.labels),
+        key_layout_name=map_definition.key_layout_name,
+        target_note_names=dict(map_definition.target_note_names),
     )
 
 
-def load_preset_drum_map(name: str) -> DrumMapDefinition:
+def load_preset_drum_map(name: str, *, c1_midi_note: int = 36) -> DrumMapDefinition:
     normalized = name.strip().lower()
+    if normalized == "ujam-candy":
+        return _build_ujam_candy_map(c1_midi_note=c1_midi_note)
+
     if normalized not in PRESET_DRUM_MAPS:
         allowed = ", ".join(sorted(PRESET_DRUM_MAPS))
+        allowed = f"{allowed}, ujam-candy"
         raise DrumMapError(f"Unknown target map: {name}. Available presets: {allowed}")
+
     return _clone_map(PRESET_DRUM_MAPS[normalized])
 
 
@@ -187,10 +260,21 @@ def load_custom_drum_map(map_file: Path) -> DrumMapDefinition:
     output_channel = _coerce_output_channel(payload["output_channel"])
     notes = _coerce_notes(payload["notes"])
     labels = _coerce_labels(payload.get("labels"))
+    key_layout_name = str(payload.get("key_layout_name", "custom"))
+    raw_target_note_names = payload.get("target_note_names")
+    target_note_names: dict[int, str] = {}
+    if raw_target_note_names is not None:
+        if not isinstance(raw_target_note_names, dict):
+            raise DrumMapError("Custom map 'target_note_names' must be an object when provided.")
+        for source_note, note_name in raw_target_note_names.items():
+            source = _coerce_note_value(source_note, field_name="target_note_names note")
+            target_note_names[source] = str(note_name)
 
     return DrumMapDefinition(
         name=name,
         output_channel=output_channel,
         notes=notes,
         labels=labels,
+        key_layout_name=key_layout_name,
+        target_note_names=target_note_names,
     )

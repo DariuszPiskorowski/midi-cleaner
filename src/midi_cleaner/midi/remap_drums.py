@@ -36,6 +36,7 @@ class DrumRemapParameters:
     unmapped_policy: UnmappedPolicy = "keep"
     strip_program_changes: bool = True
     strip_track_names: bool = True
+    c1_midi_note: int = 36
     output_format: OutputFormat = "type0"
     dry_run: bool = False
     report_file: Path | None = None
@@ -59,6 +60,10 @@ class DrumRemapReport:
     source_channels: list[int]
     output_channels: list[int]
     target_map: str
+    target_key_layout_name: str
+    c1_midi_note: int
+    resolved_target_note_names: dict[str, str]
+    resolved_mapping_note_numbers: dict[str, int]
     map_file: str | None
     unmapped_policy: UnmappedPolicy
     unmapped_pitches: list[int]
@@ -187,13 +192,16 @@ def _validate_params(params: DrumRemapParameters) -> None:
     if params.target_map == "custom" and params.map_file is None:
         raise MidiRemapDrumsError("--map-file is required when --target-map custom.")
 
+    if params.c1_midi_note < 0 or params.c1_midi_note > 127:
+        raise MidiRemapDrumsError("--c1-midi-note must be in range 0..127.")
+
 
 def _load_map_definition(params: DrumRemapParameters) -> DrumMapDefinition:
     try:
         if params.target_map == "custom":
             assert params.map_file is not None
             return load_custom_drum_map(params.map_file)
-        return load_preset_drum_map(params.target_map)
+        return load_preset_drum_map(params.target_map, c1_midi_note=params.c1_midi_note)
     except DrumMapError as exc:
         raise MidiRemapDrumsError(str(exc)) from exc
 
@@ -447,6 +455,15 @@ def _build_report(
     if not sync_preserved:
         warnings.append("Output MIDI timing differs from source timing.")
 
+    resolved_target_note_names = {
+        str(source_note): target_note_name
+        for source_note, target_note_name in sorted(map_definition.target_note_names.items())
+    }
+    resolved_mapping_note_numbers = {
+        str(source_note): target_note
+        for source_note, target_note in sorted(map_definition.notes.items())
+    }
+
     return DrumRemapReport(
         input_file=str(input_file),
         output_file=str(output_file) if output_file is not None else None,
@@ -464,6 +481,10 @@ def _build_report(
         source_channels=sorted(context.source_channels),
         output_channels=sorted(context.output_channels),
         target_map=map_definition.name,
+        target_key_layout_name=map_definition.key_layout_name or map_definition.name,
+        c1_midi_note=params.c1_midi_note,
+        resolved_target_note_names=resolved_target_note_names,
+        resolved_mapping_note_numbers=resolved_mapping_note_numbers,
         map_file=str(params.map_file) if params.map_file is not None else None,
         unmapped_policy=params.unmapped_policy,
         unmapped_pitches=sorted(context.unmapped_pitches),

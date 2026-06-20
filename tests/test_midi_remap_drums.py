@@ -159,11 +159,11 @@ def test_remap_changes_note_numbers_and_preserves_timing(tmp_path: Path) -> None
     mapping = {
         32: 36,
         36: 36,
-        39: 38,
-        45: 45,
-        46: 46,
-        50: 50,
-        57: 49,
+        39: 43,
+        45: 50,
+        46: 48,
+        50: 53,
+        57: 60,
     }
     expected_events = [
         (kind, mapping.get(note, note), tick)
@@ -173,6 +173,148 @@ def test_remap_changes_note_numbers_and_preserves_timing(tmp_path: Path) -> None
 
     assert result.exit_code == 0
     assert expected_events == actual_events
+
+
+def test_ujam_candy_maps_39_to_g1_midi_43_with_c1_36(tmp_path: Path) -> None:
+    source = tmp_path / "drums.mid"
+    output = tmp_path / "drums_ujam_candy.mid"
+    _build_multitrack_drum_source(source)
+
+    result = runner.invoke(
+        app,
+        [
+            "midi",
+            "remap-drums",
+            "--input",
+            str(source),
+            "--target-map",
+            "ujam-candy",
+            "--c1-midi-note",
+            "36",
+            "--output",
+            str(output),
+        ],
+    )
+
+    note_ons = [
+        note for kind, note, _channel, _tick in _note_events(output) if kind == "on"
+    ]
+
+    assert result.exit_code == 0
+    assert 43 in note_ons
+    assert 39 not in note_ons
+
+
+def test_ujam_candy_maps_46_to_c2_midi_48_with_c1_36(tmp_path: Path) -> None:
+    source = tmp_path / "drums.mid"
+    output = tmp_path / "drums_ujam_candy.mid"
+    _build_multitrack_drum_source(source)
+
+    result = runner.invoke(
+        app,
+        [
+            "midi",
+            "remap-drums",
+            "--input",
+            str(source),
+            "--target-map",
+            "ujam-candy",
+            "--c1-midi-note",
+            "36",
+            "--output",
+            str(output),
+        ],
+    )
+
+    note_ons = [
+        note for kind, note, _channel, _tick in _note_events(output) if kind == "on"
+    ]
+
+    assert result.exit_code == 0
+    assert 48 in note_ons
+    assert 46 not in note_ons
+
+
+def test_ujam_candy_maps_57_to_c3_midi_60_with_c1_36(tmp_path: Path) -> None:
+    source = tmp_path / "drums.mid"
+    output = tmp_path / "drums_ujam_candy.mid"
+    _build_multitrack_drum_source(source)
+
+    result = runner.invoke(
+        app,
+        [
+            "midi",
+            "remap-drums",
+            "--input",
+            str(source),
+            "--target-map",
+            "ujam-candy",
+            "--c1-midi-note",
+            "36",
+            "--output",
+            str(output),
+        ],
+    )
+
+    note_ons = [
+        note for kind, note, _channel, _tick in _note_events(output) if kind == "on"
+    ]
+
+    assert result.exit_code == 0
+    assert 60 in note_ons
+    assert 57 not in note_ons
+
+
+def test_ujam_candy_c1_midi_note_24_shifts_resolved_notes_down_by_12(tmp_path: Path) -> None:
+    source = tmp_path / "drums.mid"
+    report_c1_36 = tmp_path / "report_c1_36.json"
+    report_c1_24 = tmp_path / "report_c1_24.json"
+    _build_multitrack_drum_source(source)
+
+    result_c1_36 = runner.invoke(
+        app,
+        [
+            "midi",
+            "remap-drums",
+            "--input",
+            str(source),
+            "--target-map",
+            "ujam-candy",
+            "--c1-midi-note",
+            "36",
+            "--dry-run",
+            "--report",
+            str(report_c1_36),
+        ],
+    )
+    result_c1_24 = runner.invoke(
+        app,
+        [
+            "midi",
+            "remap-drums",
+            "--input",
+            str(source),
+            "--target-map",
+            "ujam-candy",
+            "--c1-midi-note",
+            "24",
+            "--dry-run",
+            "--report",
+            str(report_c1_24),
+        ],
+    )
+
+    mapping_36 = json.loads(report_c1_36.read_text(encoding="utf-8"))[
+        "resolved_mapping_note_numbers"
+    ]
+    mapping_24 = json.loads(report_c1_24.read_text(encoding="utf-8"))[
+        "resolved_mapping_note_numbers"
+    ]
+
+    assert result_c1_36.exit_code == 0
+    assert result_c1_24.exit_code == 0
+    for source_note in ("32", "36", "39", "45", "46", "50", "57"):
+        assert mapping_24[source_note] == mapping_36[source_note] - 12
 
 
 def test_remap_preserves_tempo_and_time_signature(tmp_path: Path) -> None:
@@ -432,9 +574,9 @@ def test_remap_custom_map_json_is_applied(tmp_path: Path) -> None:
     assert set(channels) == {7}
 
 
-def test_remap_preserves_output_length_and_final_end_of_track(tmp_path: Path) -> None:
+def test_ujam_candy_preserves_timing_and_source_length_ticks(tmp_path: Path) -> None:
     source = tmp_path / "drums.mid"
-    output = tmp_path / "drums_sitala.mid"
+    output = tmp_path / "drums_ujam_candy.mid"
     _build_multitrack_drum_source(source)
 
     result = runner.invoke(
@@ -445,7 +587,7 @@ def test_remap_preserves_output_length_and_final_end_of_track(tmp_path: Path) ->
             "--input",
             str(source),
             "--target-map",
-            "sitala",
+            "ujam-candy",
             "--output",
             str(output),
         ],
@@ -487,7 +629,7 @@ def test_remap_dry_run_writes_no_output_midi(tmp_path: Path) -> None:
 
 def test_remap_report_contains_source_and_remapped_pitch_counts(tmp_path: Path) -> None:
     source = tmp_path / "drums.mid"
-    output = tmp_path / "drums_gm.mid"
+    output = tmp_path / "drums_ujam_candy.mid"
     report = tmp_path / "drum_remap_report.json"
     _build_multitrack_drum_source(source)
 
@@ -499,7 +641,7 @@ def test_remap_report_contains_source_and_remapped_pitch_counts(tmp_path: Path) 
             "--input",
             str(source),
             "--target-map",
-            "gm",
+            "ujam-candy",
             "--output",
             str(output),
             "--report",
@@ -512,5 +654,13 @@ def test_remap_report_contains_source_and_remapped_pitch_counts(tmp_path: Path) 
     assert result.exit_code == 0
     assert "source_pitch_counts" in payload
     assert "remapped_pitch_counts" in payload
+    assert "target_key_layout_name" in payload
+    assert "c1_midi_note" in payload
+    assert "resolved_target_note_names" in payload
+    assert "resolved_mapping_note_numbers" in payload
     assert payload["source_pitch_counts"]["39"] > 0
-    assert payload["remapped_pitch_counts"]["38"] > 0
+    assert payload["remapped_pitch_counts"]["43"] > 0
+    assert payload["target_key_layout_name"] == "ujam-candy-observed-ui"
+    assert payload["c1_midi_note"] == 36
+    assert payload["resolved_target_note_names"]["39"] == "G1"
+    assert payload["resolved_mapping_note_numbers"]["39"] == 43
