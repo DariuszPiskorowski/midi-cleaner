@@ -98,6 +98,7 @@ class AudioDrumExtractionReport:
     sample_rate: int
     detected_bpm: float | None
     bpm_used: float
+    bpm_source: Literal["detected", "forced"]
     onset_count: int
     class_counts: dict[str, int]
     output_note_counts: dict[str, int]
@@ -596,8 +597,8 @@ def _validate_params(params: AudioDrumExtractionParameters) -> None:
     if params.channel < 0 or params.channel > 15:
         raise AudioDrumExtractionError("channel must be in range 0..15.")
 
-    if params.min_onset_strength <= 0.0:
-        raise AudioDrumExtractionError("--min-onset-strength must be > 0.")
+    if params.min_onset_strength < 0.0:
+        raise AudioDrumExtractionError("--min-onset-strength must be >= 0.")
 
     if params.bpm is not None and params.bpm <= 0.0:
         raise AudioDrumExtractionError("--bpm must be > 0.")
@@ -688,6 +689,7 @@ def extract_drums_from_audio(
 
     detected_bpm = _estimate_bpm(onset_times)
     bpm_used = float(params.bpm) if params.bpm is not None else float(detected_bpm or DEFAULT_BPM)
+    bpm_source: Literal["detected", "forced"] = "forced" if params.bpm is not None else "detected"
     ticks_per_second = (params.ticks_per_beat * bpm_used) / 60.0
 
     warnings: list[str] = []
@@ -822,6 +824,7 @@ def extract_drums_from_audio(
         sample_rate=int(sample_rate),
         detected_bpm=float(detected_bpm) if detected_bpm is not None else None,
         bpm_used=float(bpm_used),
+        bpm_source=bpm_source,
         onset_count=len(onset_times),
         class_counts=_count_classes(hits),
         output_note_counts=_count_output_notes(emitted_hits),

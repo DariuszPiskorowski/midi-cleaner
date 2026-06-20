@@ -309,6 +309,84 @@ def test_forced_bpm_is_respected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert len(tempo_events) == 1
     assert int(tempo_events[0].tempo) == int(round(60_000_000.0 / 123.0))
     assert payload["bpm_used"] == 123.0
+    assert payload["bpm_source"] == "forced"
+
+
+def test_auto_bpm_path_is_used_when_bpm_is_omitted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "auto_bpm.mid"
+    report_path = tmp_path / "auto_bpm_report.json"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.00, 0.50, 1.00],
+        class_names=["kick", "kick", "kick"],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "gm",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    tempo_events = [
+        msg
+        for track in mido.MidiFile(str(output_midi)).tracks
+        for msg in track
+        if msg.is_meta and msg.type == "set_tempo"
+    ]
+
+    assert result.exit_code == 0
+    assert payload["bpm_source"] == "detected"
+    assert payload["detected_bpm"] == 120.0
+    assert payload["bpm_used"] == 120.0
+    assert len(tempo_events) == 1
+    assert int(tempo_events[0].tempo) == int(round(60_000_000.0 / 120.0))
+
+
+def test_report_includes_bpm_fields(tmp_path: Path) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "bpm_fields.mid"
+    report_path = tmp_path / "bpm_fields_report.json"
+    _build_drum_like_wav(wav_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "gm",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert result.exit_code == 0
+    assert "detected_bpm" in payload
+    assert "bpm_used" in payload
+    assert "bpm_source" in payload
 
 
 def test_no_quantization_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
