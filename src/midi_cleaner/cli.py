@@ -44,6 +44,11 @@ from midi_cleaner.cleanup.planner import (
 )
 from midi_cleaner.midi.importer import MidiImportError, import_midi_candidate
 from midi_cleaner.midi.merge_folder import MidiMergeFolderError, merge_midi_folder
+from midi_cleaner.midi.remap_drums import (
+    DrumRemapParameters,
+    MidiRemapDrumsError,
+    remap_drums_file,
+)
 from midi_cleaner.pipeline.process_stem import (
     PipelineProcessError,
     PipelineProcessParameters,
@@ -315,6 +320,102 @@ def merge_folder_command(
         f"merged_file_count={result.merged_file_count}, "
         f"skipped_file_count={result.skipped_file_count}, "
         f"dry_run={str(result.dry_run).lower()}"
+    )
+
+
+@midi_app.command("remap-drums")
+def remap_drums_command(
+    input_midi: Path = typer.Option(..., "--input", help="Path to source drum MIDI file."),
+    target_map: str = typer.Option(
+        ..., "--target-map", help="Target map: gm|sitala|ujam-candy|custom."
+    ),
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        help="Output MIDI path. Defaults to input stem + target map suffix.",
+    ),
+    map_file: Path | None = typer.Option(
+        None,
+        "--map-file",
+        help="Path to custom drum map JSON (required for --target-map custom).",
+    ),
+    merge_tracks: bool = typer.Option(
+        True,
+        "--merge-tracks/--no-merge-tracks",
+        help="Merge all internal tracks into one output track.",
+    ),
+    channel_policy: str = typer.Option(
+        "single",
+        "--channel-policy",
+        help="Channel handling: preserve|single.",
+    ),
+    force_channel: int | None = typer.Option(
+        None,
+        "--force-channel",
+        help="Force output MIDI channel (0-15). Example: 9 for channel 10.",
+    ),
+    unmapped: str = typer.Option(
+        "keep",
+        "--unmapped",
+        help="Policy for unmapped drum notes: keep|drop|nearest.",
+    ),
+    strip_program_changes: bool = typer.Option(
+        True,
+        "--strip-program-changes/--keep-program-changes",
+        help="Strip program_change events (default strips for drum remap).",
+    ),
+    strip_track_names: bool = typer.Option(
+        True,
+        "--strip-track-names/--keep-track-names",
+        help="Strip legacy track names from source tracks.",
+    ),
+    output_format: str = typer.Option(
+        "type0",
+        "--format",
+        help="Output format: type0|single-track-type1.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Audit and report only. Do not write output MIDI.",
+    ),
+    report: Path | None = typer.Option(
+        None,
+        "--report",
+        help="Optional path for drum remap report JSON.",
+    ),
+) -> None:
+    params = DrumRemapParameters(
+        target_map=target_map,
+        output_file=output,
+        map_file=map_file,
+        merge_tracks=merge_tracks,
+        channel_policy=channel_policy,
+        force_channel=force_channel,
+        unmapped_policy=unmapped,
+        strip_program_changes=strip_program_changes,
+        strip_track_names=strip_track_names,
+        output_format=output_format,
+        dry_run=dry_run,
+        report_file=report,
+    )
+
+    try:
+        remap_report = remap_drums_file(input_file=input_midi, params=params)
+    except MidiRemapDrumsError as exc:
+        typer.echo(f"Drum remap failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        "Drum remap summary: "
+        f"target_map={remap_report.target_map}, "
+        f"source_tracks={remap_report.source_track_count}, "
+        f"output_tracks={remap_report.output_track_count}, "
+        f"source_length_ticks={remap_report.source_length_ticks}, "
+        f"output_length_ticks={remap_report.output_length_ticks}, "
+        f"unmapped={len(remap_report.unmapped_pitches)}, "
+        f"warnings={len(remap_report.warnings)}, "
+        f"dry_run={str(dry_run).lower()}"
     )
 
 
