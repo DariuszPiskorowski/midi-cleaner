@@ -301,7 +301,7 @@ def test_remap_channel_policy_single_forces_selected_channel(tmp_path: Path) -> 
             "--channel-policy",
             "single",
             "--force-channel",
-            "5",
+            "10",
         ],
     )
 
@@ -314,7 +314,7 @@ def test_remap_channel_policy_single_forces_selected_channel(tmp_path: Path) -> 
     }
 
     assert result.exit_code == 0
-    assert channels == {5}
+    assert channels == {9}
 
 
 def test_remap_strips_program_changes_by_default(tmp_path: Path) -> None:

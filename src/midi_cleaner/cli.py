@@ -352,7 +352,7 @@ def remap_drums_command(
     force_channel: int | None = typer.Option(
         None,
         "--force-channel",
-        help="Force output MIDI channel (0-15). Example: 9 for channel 10.",
+        help="Force output MIDI channel number (1-16). Example: 10 for drum channel.",
     ),
     unmapped: str = typer.Option(
         "keep",
@@ -385,13 +385,20 @@ def remap_drums_command(
         help="Optional path for drum remap report JSON.",
     ),
 ) -> None:
+    normalized_force_channel: int | None = None
+    if force_channel is not None:
+        if force_channel < 1 or force_channel > 16:
+            typer.echo("Invalid --force-channel. Use 1..16.", err=True)
+            raise typer.Exit(code=1)
+        normalized_force_channel = force_channel - 1
+
     params = DrumRemapParameters(
         target_map=target_map,
         output_file=output,
         map_file=map_file,
         merge_tracks=merge_tracks,
         channel_policy=channel_policy,
-        force_channel=force_channel,
+        force_channel=normalized_force_channel,
         unmapped_policy=unmapped,
         strip_program_changes=strip_program_changes,
         strip_track_names=strip_track_names,
