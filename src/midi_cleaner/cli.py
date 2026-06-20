@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import typer
@@ -42,6 +43,7 @@ from midi_cleaner.cleanup.planner import (
     build_cleanup_plan,
 )
 from midi_cleaner.midi.importer import MidiImportError, import_midi_candidate
+from midi_cleaner.midi.merge_folder import MidiMergeFolderError, merge_midi_folder
 from midi_cleaner.pipeline.process_stem import (
     PipelineProcessError,
     PipelineProcessParameters,
@@ -227,6 +229,92 @@ def import_candidate(
         f"notes={import_report.note_count}, "
         f"tracks={import_report.track_count}, "
         f"warnings={import_report.warning_count}"
+    )
+
+
+@midi_app.command("merge-folder")
+def merge_folder_command(
+    folder: Path = typer.Option(..., "--folder", help="Folder containing .mid/.midi files."),
+    recursive: bool = typer.Option(
+        False,
+        "--recursive/--no-recursive",
+        help="Recursively scan subfolders for MIDI files.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Merge all detected multi-track MIDI files without prompting.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Only report detected multi-track files without writing output files.",
+    ),
+    channel_policy: str = typer.Option(
+        "preserve",
+        "--channel-policy",
+        help="Channel handling: preserve|single.",
+    ),
+    output_suffix: str = typer.Option(
+        "_merge",
+        "--output-suffix",
+        help="Suffix appended to merged output filenames.",
+    ),
+    output_format: str = typer.Option(
+        "type0",
+        "--format",
+        help="Output format: type0|single-track-type1.",
+    ),
+    report: Path | None = typer.Option(
+        None,
+        "--report",
+        help="Optional path for merge report JSON.",
+    ),
+) -> None:
+    if channel_policy not in {"preserve", "single"}:
+        typer.echo("Invalid --channel-policy. Use preserve or single.", err=True)
+        raise typer.Exit(code=1)
+
+    if output_format not in {"type0", "single-track-type1"}:
+        typer.echo("Invalid --format. Use type0 or single-track-type1.", err=True)
+        raise typer.Exit(code=1)
+
+    def _on_detect_multitrack(path: Path, track_count: int) -> None:
+        typer.echo(f"Detected multi-track MIDI: {path.name} (tracks={track_count})")
+
+    def _prompt_merge(_path: Path, _track_count: int) -> bool:
+        return typer.confirm("Merge this MIDI file?", default=False)
+
+    try:
+        result = merge_midi_folder(
+            folder=folder,
+            recursive=recursive,
+            yes=yes,
+            dry_run=dry_run,
+            channel_policy=channel_policy,
+            output_suffix=output_suffix,
+            output_format=output_format,
+            on_detect_multitrack=_on_detect_multitrack,
+            prompt_merge=_prompt_merge,
+        )
+    except MidiMergeFolderError as exc:
+        typer.echo(f"MIDI folder merge failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if report is not None:
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(
+            json.dumps(result.to_json_dict(), indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    typer.echo(
+        "Merge folder summary: "
+        f"midi_file_count={result.midi_file_count}, "
+        f"multitrack_file_count={result.multitrack_file_count}, "
+        f"merged_file_count={result.merged_file_count}, "
+        f"skipped_file_count={result.skipped_file_count}, "
+        f"dry_run={str(result.dry_run).lower()}"
     )
 
 
