@@ -87,16 +87,36 @@ def _patch_detected_hits(
     *,
     onset_times: list[float],
     class_names: list[str],
+    onset_strengths: list[float] | None = None,
+    confidences: list[float] | None = None,
     low_ratio: float = 0.7,
     mid_ratio: float = 0.2,
     high_ratio: float = 0.1,
 ) -> None:
+    strengths = onset_strengths or [1.0 for _ in onset_times]
+    confidence_values = confidences or [0.90 for _ in onset_times]
+    frame_count = max(8, int(round((max(onset_times) if onset_times else 0.0) * 44100 / 256.0)) + 8)
+
+    monkeypatch.setattr(
+        drums_extract_audio,
+        "_onset_strength_envelopes",
+        lambda audio, sample_rate: (
+            {
+                "full": np.ones(frame_count, dtype=np.float64),
+                "low": np.full(frame_count, 0.85, dtype=np.float64),
+                "mid": np.full(frame_count, 0.35, dtype=np.float64),
+                "high": np.full(frame_count, 0.25, dtype=np.float64),
+            },
+            1024,
+            256,
+        ),
+    )
     monkeypatch.setattr(
         drums_extract_audio,
         "_detect_onsets",
-        lambda onset_strength, sample_rate, hop_size, min_onset_strength: (
+        lambda onset_strength, sample_rate, hop_size, min_onset_strength, **kwargs: (
             np.array(onset_times, dtype=np.float64),
-            np.ones(len(onset_times), dtype=np.float64),
+            np.array(strengths, dtype=np.float64),
         ),
     )
     monkeypatch.setattr(
@@ -127,9 +147,15 @@ def _patch_detected_hits(
         state["index"] += 1
         if idx >= len(class_names):
             idx = len(class_names) - 1
-        return class_names[idx], 0.90
+        confidence = confidence_values[idx] if idx < len(confidence_values) else confidence_values[-1]
+        return class_names[idx], confidence
 
     monkeypatch.setattr(drums_extract_audio, "_classify_hit", _classify)
+    monkeypatch.setattr(
+        drums_extract_audio,
+        "_adjust_class_with_band_evidence",
+        lambda **kwargs: kwargs["class_name"],
+    )
 
 
 def test_audio_onset_extraction_creates_midi_notes(tmp_path: Path) -> None:
@@ -524,6 +550,8 @@ def test_report_and_debug_csv_are_written(tmp_path: Path) -> None:
     assert all(
         key in payload["per_hit_summary"][0]
         for key in [
+            "raw_onset_sec",
+            "accepted_onset_sec",
             "tick",
             "class",
             "target_note",
@@ -534,11 +562,315 @@ def test_report_and_debug_csv_are_written(tmp_path: Path) -> None:
             "high_energy_ratio",
             "spectral_centroid",
             "onset_strength",
+            "suppressed",
+            "suppression_reason",
+            "grouped_transient_id",
+            "class_refractory_ms",
+            "nearest_previous_same_class_ms",
         ]
     )
+    assert "raw_onset_count" in payload
+    assert "accepted_onset_count" in payload
+    assert "suppressed_duplicate_count" in payload
+    assert "suppressed_by_class" in payload
+    assert "class_refractory_ms" in payload
+    assert "notes_per_second" in payload
+    assert "class_notes_per_second" in payload
+    assert "velocity_summary" in payload
+    assert "too_dense_warning" in payload
+    assert "duplicate_interval_summary" in payload
+    assert "raw_onset_sec" in header
+    assert "accepted_onset_sec" in header
+    assert "suppressed" in header
+    assert "suppression_reason" in header
+    assert "grouped_transient_id" in header
+    assert "class_refractory_ms" in header
+    assert "nearest_previous_same_class_ms" in header
     assert "tick" in header
     assert "spectral_centroid" in header
     assert "onset_strength" in header
+
+
+def test_duplicate_kick_hits_inside_refractory_window_are_suppressed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "kick_refractory.mid"
+    report_path = tmp_path / "kick_refractory_report.json"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10, 0.19],
+        onset_strengths=[0.70, 0.65],
+        class_names=["kick", "kick"],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "gm",
+            "--bpm",
+            "120",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    note_events = _note_on_events(output_midi)
+
+    assert result.exit_code == 0
+    assert len(note_events) == 1
+    assert payload["raw_onset_count"] == 2
+    assert payload["accepted_onset_count"] == 1
+    assert payload["suppressed_duplicate_count"] == 1
+    assert payload["suppressed_by_class"]["kick"] >= 1
+
+
+def test_stronger_hit_is_kept_when_class_duplicates_collide(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "stronger_duplicate.mid"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10, 0.19],
+        onset_strengths=[0.35, 0.95],
+        class_names=["kick", "kick"],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "gm",
+            "--bpm",
+            "120",
+        ],
+    )
+
+    note_on_ticks = [tick for tick, _note, _channel, _velocity in _note_on_events(output_midi)]
+
+    assert result.exit_code == 0
+    assert note_on_ticks == [182]
+
+
+def test_cymbal_tail_chatter_is_suppressed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "cymbal_tail.mid"
+    report_path = tmp_path / "cymbal_tail_report.json"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10, 0.20, 0.30, 0.40],
+        onset_strengths=[0.85, 0.55, 0.80, 0.50],
+        class_names=["cymbal", "cymbal", "cymbal", "cymbal"],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "gm",
+            "--bpm",
+            "120",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    cymbal_count = payload["class_counts"]["cymbal"]
+
+    assert result.exit_code == 0
+    assert cymbal_count <= 2
+    assert payload["suppressed_by_class"]["cymbal"] >= 2
+
+
+def test_same_transient_grouping_prevents_multiple_same_class_hits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "same_transient.mid"
+    report_path = tmp_path / "same_transient_report.json"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.100, 0.118, 0.130],
+        onset_strengths=[0.72, 0.61, 0.52],
+        class_names=["kick", "kick", "kick"],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "gm",
+            "--bpm",
+            "120",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    reasons = [
+        item.get("suppression_reason")
+        for item in payload["per_hit_summary"]
+        if item.get("suppressed")
+    ]
+
+    assert result.exit_code == 0
+    assert payload["class_counts"]["kick"] == 1
+    assert reasons.count("same_transient_group") >= 1
+
+
+def test_velocity_scaling_is_not_saturated_to_maximum(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "velocity_scaling.mid"
+    report_path = tmp_path / "velocity_scaling_report.json"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10, 0.30, 0.50, 0.70, 0.90, 1.10],
+        onset_strengths=[0.14, 0.22, 0.35, 0.50, 0.72, 0.98],
+        class_names=["kick", "kick", "kick", "kick", "kick", "kick"],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "gm",
+            "--bpm",
+            "120",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    velocities = [velocity for _tick, _note, _channel, velocity in _note_on_events(output_midi)]
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert result.exit_code == 0
+    assert len(set(velocities)) > 1
+    assert max(velocities) < 125
+    assert payload["velocity_summary"]["max"] < 125
+    assert payload["velocity_summary"]["p90"] < 125
+
+
+def test_conservative_profile_reduces_dense_repeated_hits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_balanced = tmp_path / "balanced.mid"
+    output_conservative = tmp_path / "conservative.mid"
+    _build_drum_like_wav(wav_path)
+
+    onset_times = [0.10, 0.23, 0.36, 0.49, 0.62, 0.75]
+    class_names = ["kick", "kick", "kick", "kick", "kick", "kick"]
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=onset_times,
+        onset_strengths=[0.80, 0.77, 0.75, 0.73, 0.70, 0.68],
+        class_names=class_names,
+    )
+    balanced_result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_balanced),
+            "--target-map",
+            "gm",
+            "--bpm",
+            "120",
+            "--profile",
+            "balanced",
+        ],
+    )
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=onset_times,
+        onset_strengths=[0.80, 0.77, 0.75, 0.73, 0.70, 0.68],
+        class_names=class_names,
+    )
+    conservative_result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_conservative),
+            "--target-map",
+            "gm",
+            "--bpm",
+            "120",
+            "--profile",
+            "conservative",
+        ],
+    )
+
+    balanced_count = len(_note_on_events(output_balanced))
+    conservative_count = len(_note_on_events(output_conservative))
+
+    assert balanced_result.exit_code == 0
+    assert conservative_result.exit_code == 0
+    assert conservative_count < balanced_count
 
 
 def test_separate_files_mode_creates_synchronized_class_files(

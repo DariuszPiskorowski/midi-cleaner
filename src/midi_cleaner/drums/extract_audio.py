@@ -9,7 +9,6 @@ from typing import Literal
 import mido
 import numpy as np
 import soundfile as sf
-from scipy.signal import find_peaks
 from scipy.signal.windows import hann
 
 from midi_cleaner.midi.drum_maps import (
@@ -30,6 +29,7 @@ DrumClass = Literal[
     "unknown",
 ]
 SnareTarget = Literal["sn1", "sn2", "clap"]
+ExtractionProfile = Literal["conservative", "balanced", "sensitive"]
 
 DEFAULT_TICKS_PER_BEAT = 480
 DEFAULT_MIN_ONSET_STRENGTH = 0.20
@@ -53,6 +53,64 @@ _CLASS_NOTE_DURATIONS_SEC: dict[DrumClass, float] = {
     "unknown": 0.08,
 }
 
+_CANONICAL_CLASSES: tuple[str, ...] = (
+    "kick",
+    "snare_or_clap",
+    "hat",
+    "cymbal",
+    "tom_or_perc",
+    "unknown",
+)
+
+
+_PROFILE_DEFAULTS: dict[str, dict[str, float | int]] = {
+    "conservative": {
+        "onset_pre_max": 1,
+        "onset_post_max": 1,
+        "onset_pre_avg": 6,
+        "onset_post_avg": 6,
+        "onset_delta": 0.10,
+        "onset_wait": 2,
+        "min_hit_spacing_ms": 80.0,
+        "kick_refractory_ms": 160.0,
+        "snare_refractory_ms": 140.0,
+        "hat_refractory_ms": 70.0,
+        "cymbal_refractory_ms": 280.0,
+        "tom_refractory_ms": 140.0,
+        "same_transient_window_ms": 35.0,
+    },
+    "balanced": {
+        "onset_pre_max": 1,
+        "onset_post_max": 1,
+        "onset_pre_avg": 5,
+        "onset_post_avg": 5,
+        "onset_delta": 0.08,
+        "onset_wait": 1,
+        "min_hit_spacing_ms": 60.0,
+        "kick_refractory_ms": 120.0,
+        "snare_refractory_ms": 120.0,
+        "hat_refractory_ms": 55.0,
+        "cymbal_refractory_ms": 180.0,
+        "tom_refractory_ms": 100.0,
+        "same_transient_window_ms": 35.0,
+    },
+    "sensitive": {
+        "onset_pre_max": 1,
+        "onset_post_max": 1,
+        "onset_pre_avg": 4,
+        "onset_post_avg": 4,
+        "onset_delta": 0.05,
+        "onset_wait": 1,
+        "min_hit_spacing_ms": 45.0,
+        "kick_refractory_ms": 90.0,
+        "snare_refractory_ms": 90.0,
+        "hat_refractory_ms": 40.0,
+        "cymbal_refractory_ms": 130.0,
+        "tom_refractory_ms": 80.0,
+        "same_transient_window_ms": 30.0,
+    },
+}
+
 
 class AudioDrumExtractionError(Exception):
     """Raised when drum extraction from audio cannot continue."""
@@ -73,11 +131,27 @@ class AudioDrumExtractionParameters:
     report_file: Path | None = None
     snare_target: SnareTarget = "clap"
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT
+    profile: ExtractionProfile = "balanced"
+    onset_pre_max: int | None = None
+    onset_post_max: int | None = None
+    onset_pre_avg: int | None = None
+    onset_post_avg: int | None = None
+    onset_delta: float | None = None
+    onset_wait: int | None = None
+    min_hit_spacing_ms: float | None = None
+    kick_refractory_ms: float | None = None
+    snare_refractory_ms: float | None = None
+    hat_refractory_ms: float | None = None
+    cymbal_refractory_ms: float | None = None
+    tom_refractory_ms: float | None = None
+    same_transient_window_ms: float | None = None
 
 
 @dataclass
 class PerHitSummary:
     onset_sec: float
+    raw_onset_sec: float
+    accepted_onset_sec: float | None
     tick: int
     class_name: DrumClass
     target_note: int
@@ -88,6 +162,11 @@ class PerHitSummary:
     high_energy_ratio: float
     spectral_centroid: float
     onset_strength: float
+    suppressed: bool
+    suppression_reason: str | None
+    grouped_transient_id: int | None
+    class_refractory_ms: float
+    nearest_previous_same_class_ms: float | None
 
 
 @dataclass
@@ -100,9 +179,21 @@ class AudioDrumExtractionReport:
     bpm_used: float
     bpm_source: Literal["detected", "forced"]
     onset_count: int
+    raw_onset_count: int
+    accepted_onset_count: int
+    suppressed_duplicate_count: int
+    suppressed_by_class: dict[str, int]
+    min_hit_spacing_ms: float
+    class_refractory_ms: dict[str, float]
+    same_transient_window_ms: float
     class_counts: dict[str, int]
     output_note_counts: dict[str, int]
     output_pitch_counts: dict[str, int]
+    notes_per_second: float
+    class_notes_per_second: dict[str, float]
+    velocity_summary: dict[str, float]
+    too_dense_warning: bool
+    duplicate_interval_summary: dict[str, dict[str, float | int | None]]
     target_map: str
     c1_midi_note: int
     synchronization_preserved: bool
@@ -114,6 +205,8 @@ class AudioDrumExtractionReport:
         payload["per_hit_summary"] = [
             {
                 "onset_sec": item.onset_sec,
+                "raw_onset_sec": item.raw_onset_sec,
+                "accepted_onset_sec": item.accepted_onset_sec,
                 "tick": item.tick,
                 "class": item.class_name,
                 "target_note": item.target_note,
@@ -124,6 +217,11 @@ class AudioDrumExtractionReport:
                 "high_energy_ratio": item.high_energy_ratio,
                 "spectral_centroid": item.spectral_centroid,
                 "onset_strength": item.onset_strength,
+                "suppressed": item.suppressed,
+                "suppression_reason": item.suppression_reason,
+                "grouped_transient_id": item.grouped_transient_id,
+                "class_refractory_ms": item.class_refractory_ms,
+                "nearest_previous_same_class_ms": item.nearest_previous_same_class_ms,
             }
             for item in self.per_hit_summary
         ]
@@ -132,9 +230,14 @@ class AudioDrumExtractionReport:
 
 @dataclass
 class _DetectedHit:
+    hit_id: int
     onset_sec: float
+    accepted_onset_sec: float | None
     tick: int
     onset_strength: float
+    low_band_onset_strength: float
+    mid_band_onset_strength: float
+    high_band_onset_strength: float
     class_name: DrumClass
     low_energy_ratio: float
     mid_energy_ratio: float
@@ -143,6 +246,18 @@ class _DetectedHit:
     confidence: float
     target_note: int
     velocity: int
+    suppressed: bool
+    suppression_reason: str | None
+    grouped_transient_id: int | None
+    class_refractory_ms: float
+    nearest_previous_same_class_ms: float | None
+
+    def score(self) -> float:
+        return (
+            0.62 * float(self.onset_strength)
+            + 0.30 * float(self.confidence)
+            + 0.08 * float(self.high_band_onset_strength)
+        )
 
 
 def _ensure_mono(audio: np.ndarray) -> np.ndarray:
@@ -168,7 +283,23 @@ def _frame_signal(audio: np.ndarray, frame_size: int, hop_size: int) -> np.ndarr
     return np.stack(frames, axis=0)
 
 
-def _onset_strength_envelope(audio: np.ndarray, sample_rate: int) -> tuple[np.ndarray, int, int]:
+def _normalize_envelope(raw: np.ndarray) -> np.ndarray:
+    if len(raw) == 0:
+        return np.zeros(0, dtype=np.float64)
+    if not np.any(raw > 0.0):
+        return np.zeros_like(raw, dtype=np.float64)
+
+    floor = float(np.percentile(raw, 5))
+    shifted = np.maximum(0.0, raw - floor)
+    p95 = float(np.percentile(shifted, 95))
+    scale = max(p95, 1e-9)
+    return np.clip(shifted / scale, 0.0, 2.5)
+
+
+def _onset_strength_envelopes(
+    audio: np.ndarray,
+    sample_rate: int,
+) -> tuple[dict[str, np.ndarray], int, int]:
     frame_size = 1024
     hop_size = 256
     frames = _frame_signal(audio, frame_size=frame_size, hop_size=hop_size)
@@ -176,17 +307,77 @@ def _onset_strength_envelope(audio: np.ndarray, sample_rate: int) -> tuple[np.nd
 
     magnitudes = np.abs(np.fft.rfft(frames * window[None, :], axis=1))
     if len(magnitudes) <= 1:
-        return np.zeros(len(magnitudes), dtype=np.float64), frame_size, hop_size
+        zeros = np.zeros(len(magnitudes), dtype=np.float64)
+        return {
+            "full": zeros,
+            "low": zeros,
+            "mid": zeros,
+            "high": zeros,
+        }, frame_size, hop_size
 
-    diff = np.diff(magnitudes, axis=0)
-    flux = np.sum(np.maximum(0.0, diff), axis=1)
-    raw = np.concatenate(([0.0], flux.astype(np.float64)))
+    freqs = np.fft.rfftfreq(frame_size, d=1.0 / float(sample_rate))
+    diff = np.maximum(0.0, np.diff(magnitudes, axis=0))
 
-    p95 = float(np.percentile(raw, 95)) if np.any(raw > 0.0) else 1.0
-    p95 = max(p95, 1e-9)
-    normalized = np.clip(raw / p95, 0.0, 2.0)
+    low_mask = (freqs >= 20.0) & (freqs < 180.0)
+    mid_mask = (freqs >= 180.0) & (freqs < 3000.0)
+    high_mask = (freqs >= 3000.0) & (freqs < 12000.0)
 
-    return normalized, frame_size, hop_size
+    full_raw = np.concatenate(([0.0], np.sum(diff, axis=1).astype(np.float64)))
+    low_raw = np.concatenate(([0.0], np.sum(diff[:, low_mask], axis=1).astype(np.float64)))
+    mid_raw = np.concatenate(([0.0], np.sum(diff[:, mid_mask], axis=1).astype(np.float64)))
+    high_raw = np.concatenate(([0.0], np.sum(diff[:, high_mask], axis=1).astype(np.float64)))
+
+    return {
+        "full": _normalize_envelope(full_raw),
+        "low": _normalize_envelope(low_raw),
+        "mid": _normalize_envelope(mid_raw),
+        "high": _normalize_envelope(high_raw),
+    }, frame_size, hop_size
+
+
+def _peak_pick_indices(
+    onset_strength: np.ndarray,
+    *,
+    pre_max: int,
+    post_max: int,
+    pre_avg: int,
+    post_avg: int,
+    delta: float,
+    wait: int,
+    min_onset_strength: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if len(onset_strength) == 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
+
+    peaks: list[int] = []
+    heights: list[float] = []
+
+    for idx in range(len(onset_strength)):
+        value = float(onset_strength[idx])
+        if value < float(min_onset_strength):
+            continue
+
+        max_start = max(0, idx - pre_max)
+        max_stop = min(len(onset_strength), idx + post_max + 1)
+        if value < float(np.max(onset_strength[max_start:max_stop])):
+            continue
+
+        avg_start = max(0, idx - pre_avg)
+        avg_stop = min(len(onset_strength), idx + post_avg + 1)
+        local_avg = float(np.mean(onset_strength[avg_start:avg_stop]))
+        if value < local_avg + float(delta):
+            continue
+
+        if peaks and (idx - peaks[-1]) <= wait:
+            if value > heights[-1]:
+                peaks[-1] = idx
+                heights[-1] = value
+            continue
+
+        peaks.append(idx)
+        heights.append(value)
+
+    return np.asarray(peaks, dtype=np.int64), np.asarray(heights, dtype=np.float64)
 
 
 def _detect_onsets(
@@ -194,29 +385,38 @@ def _detect_onsets(
     sample_rate: int,
     hop_size: int,
     min_onset_strength: float,
+    *,
+    onset_pre_max: int,
+    onset_post_max: int,
+    onset_pre_avg: int,
+    onset_post_avg: int,
+    onset_delta: float,
+    onset_wait: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    if len(onset_strength) == 0:
-        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
-
-    distance_frames = max(1, int(round((0.035 * sample_rate) / hop_size)))
-    peaks, peak_props = find_peaks(
+    peaks, strengths = _peak_pick_indices(
         onset_strength,
-        height=min_onset_strength,
-        prominence=max(0.03, min_onset_strength * 0.40),
-        distance=distance_frames,
+        pre_max=onset_pre_max,
+        post_max=onset_post_max,
+        pre_avg=onset_pre_avg,
+        post_avg=onset_post_avg,
+        delta=onset_delta,
+        wait=onset_wait,
+        min_onset_strength=min_onset_strength,
     )
 
     if len(peaks) == 0:
-        relaxed = max(0.03, min_onset_strength * 0.65)
-        peaks, peak_props = find_peaks(
+        peaks, strengths = _peak_pick_indices(
             onset_strength,
-            height=relaxed,
-            prominence=max(0.02, relaxed * 0.35),
-            distance=distance_frames,
+            pre_max=onset_pre_max,
+            post_max=onset_post_max,
+            pre_avg=onset_pre_avg,
+            post_avg=onset_post_avg,
+            delta=max(0.0, onset_delta * 0.85),
+            wait=onset_wait,
+            min_onset_strength=max(0.03, min_onset_strength * 0.75),
         )
 
     times = peaks.astype(np.float64) * (hop_size / float(sample_rate))
-    strengths = peak_props.get("peak_heights", np.zeros(len(peaks), dtype=np.float64))
     return times, strengths.astype(np.float64)
 
 
@@ -312,11 +512,11 @@ def _classify_hit(
         base_confidence = 0.70 + (low_ratio - 0.52)
         return "kick", min(1.0, base_confidence + 0.20 * onset_strength)
 
-    if high_ratio >= 0.58 and (centroid_hz >= 5200.0 or rolloff_hz >= 9000.0):
-        if high_ratio >= 0.75 or rolloff_hz >= 11000.0:
-            base_confidence = 0.65 + (high_ratio - 0.58)
+    if high_ratio >= 0.62 and (centroid_hz >= 5600.0 or rolloff_hz >= 9300.0):
+        if high_ratio >= 0.76 or rolloff_hz >= 11200.0:
+            base_confidence = 0.66 + (high_ratio - 0.62)
             return "cymbal", min(1.0, base_confidence + 0.20 * onset_strength)
-        base_confidence = 0.62 + (high_ratio - 0.58)
+        base_confidence = 0.62 + (high_ratio - 0.62)
         return "hat", min(1.0, base_confidence + 0.20 * onset_strength)
 
     if high_ratio >= 0.42 and centroid_hz >= 3200.0:
@@ -335,11 +535,6 @@ def _classify_hit(
         return "tom_or_perc", min(1.0, base_confidence + 0.15 * onset_strength)
 
     return "unknown", min(0.55, 0.25 + 0.25 * onset_strength + 0.25 * separation)
-
-
-def _velocity_from_hit(onset_strength: float, confidence: float) -> int:
-    scaled = 30.0 + (70.0 * min(1.0, onset_strength)) + (25.0 * min(1.0, confidence))
-    return max(1, min(127, int(round(scaled))))
 
 
 def _resolve_target_map_definition(params: AudioDrumExtractionParameters) -> DrumMapDefinition:
@@ -474,8 +669,257 @@ def _normalize_class_name(class_name: DrumClass) -> DrumClass:
     return class_name
 
 
+def _canonical_class(class_name: DrumClass) -> str:
+    normalized = _normalize_class_name(class_name)
+    if normalized not in _CANONICAL_CLASSES:
+        return "unknown"
+    return normalized
+
+
 def _hit_to_tick(onset_sec: float, ticks_per_second: float) -> int:
     return max(0, int(round(onset_sec * ticks_per_second)))
+
+
+def _resolve_profile_settings(params: AudioDrumExtractionParameters) -> dict[str, float | int]:
+    defaults = dict(_PROFILE_DEFAULTS[params.profile])
+
+    overrides: dict[str, float | int | None] = {
+        "onset_pre_max": params.onset_pre_max,
+        "onset_post_max": params.onset_post_max,
+        "onset_pre_avg": params.onset_pre_avg,
+        "onset_post_avg": params.onset_post_avg,
+        "onset_delta": params.onset_delta,
+        "onset_wait": params.onset_wait,
+        "min_hit_spacing_ms": params.min_hit_spacing_ms,
+        "kick_refractory_ms": params.kick_refractory_ms,
+        "snare_refractory_ms": params.snare_refractory_ms,
+        "hat_refractory_ms": params.hat_refractory_ms,
+        "cymbal_refractory_ms": params.cymbal_refractory_ms,
+        "tom_refractory_ms": params.tom_refractory_ms,
+        "same_transient_window_ms": params.same_transient_window_ms,
+    }
+
+    for key, value in overrides.items():
+        if value is not None:
+            defaults[key] = value
+
+    return defaults
+
+
+def _resolve_refractory_ms(settings: dict[str, float | int]) -> dict[str, float]:
+    return {
+        "kick": float(settings["kick_refractory_ms"]),
+        "snare_or_clap": float(settings["snare_refractory_ms"]),
+        "hat": float(settings["hat_refractory_ms"]),
+        "cymbal": float(settings["cymbal_refractory_ms"]),
+        "tom_or_perc": float(settings["tom_refractory_ms"]),
+        "unknown": float(settings["tom_refractory_ms"]),
+    }
+
+
+def _is_clear_layered_high_hit(primary: _DetectedHit, candidate: _DetectedHit) -> bool:
+    if _canonical_class(primary.class_name) not in {"hat", "cymbal"}:
+        return False
+    if _canonical_class(candidate.class_name) not in {"hat", "cymbal"}:
+        return False
+    if _canonical_class(primary.class_name) == _canonical_class(candidate.class_name):
+        return False
+
+    delta_sec = abs(candidate.onset_sec - primary.onset_sec)
+    if delta_sec < 0.010:
+        return False
+
+    strength_ratio = candidate.score() / max(primary.score(), 1e-9)
+    if strength_ratio < 0.78:
+        return False
+
+    if min(primary.high_band_onset_strength, candidate.high_band_onset_strength) < 0.45:
+        return False
+
+    return min(primary.confidence, candidate.confidence) >= 0.65
+
+
+def _suppress_hit(
+    hit: _DetectedHit,
+    reason: str,
+    *,
+    duplicate_suppressed_by_class: dict[str, int],
+) -> None:
+    if hit.suppressed:
+        return
+    hit.suppressed = True
+    hit.accepted_onset_sec = None
+    hit.suppression_reason = reason
+    if reason in {"same_transient_group", "global_min_spacing", "class_refractory"}:
+        canonical = _canonical_class(hit.class_name)
+        duplicate_suppressed_by_class[canonical] = duplicate_suppressed_by_class.get(canonical, 0) + 1
+
+
+def _group_same_transients(
+    hits: list[_DetectedHit],
+    *,
+    window_sec: float,
+    duplicate_suppressed_by_class: dict[str, int],
+) -> list[_DetectedHit]:
+    if not hits:
+        return []
+
+    groups: list[list[_DetectedHit]] = []
+    current_group: list[_DetectedHit] = [hits[0]]
+
+    for hit in hits[1:]:
+        if (hit.onset_sec - current_group[-1].onset_sec) <= window_sec:
+            current_group.append(hit)
+        else:
+            groups.append(current_group)
+            current_group = [hit]
+    groups.append(current_group)
+
+    accepted: list[_DetectedHit] = []
+    for group_id, group in enumerate(groups):
+        for hit in group:
+            hit.grouped_transient_id = group_id
+
+        for class_name in ("kick", "snare_or_clap", "tom_or_perc", "unknown"):
+            members = [hit for hit in group if _canonical_class(hit.class_name) == class_name]
+            if not members:
+                continue
+            strongest = max(members, key=lambda item: item.score())
+            for item in members:
+                if item.hit_id != strongest.hit_id:
+                    _suppress_hit(
+                        item,
+                        "same_transient_group",
+                        duplicate_suppressed_by_class=duplicate_suppressed_by_class,
+                    )
+
+        high_members = [
+            hit
+            for hit in group
+            if _canonical_class(hit.class_name) in {"hat", "cymbal"} and not hit.suppressed
+        ]
+        if high_members:
+            high_members = sorted(high_members, key=lambda item: item.score(), reverse=True)
+            allowed_high: list[_DetectedHit] = [high_members[0]]
+            for candidate in high_members[1:]:
+                if len(allowed_high) >= 2:
+                    _suppress_hit(
+                        candidate,
+                        "same_transient_group",
+                        duplicate_suppressed_by_class=duplicate_suppressed_by_class,
+                    )
+                    continue
+                if _is_clear_layered_high_hit(allowed_high[0], candidate):
+                    allowed_high.append(candidate)
+                    continue
+                _suppress_hit(
+                    candidate,
+                    "same_transient_group",
+                    duplicate_suppressed_by_class=duplicate_suppressed_by_class,
+                )
+
+        accepted.extend([item for item in group if not item.suppressed])
+
+    return sorted(accepted, key=lambda item: item.onset_sec)
+
+
+def _apply_global_min_spacing(
+    hits: list[_DetectedHit],
+    *,
+    min_spacing_sec: float,
+    duplicate_suppressed_by_class: dict[str, int],
+) -> list[_DetectedHit]:
+    if not hits:
+        return []
+
+    accepted: list[_DetectedHit] = []
+    for hit in sorted(hits, key=lambda item: item.onset_sec):
+        if not accepted:
+            accepted.append(hit)
+            continue
+
+        previous = accepted[-1]
+        if (hit.onset_sec - previous.onset_sec) < min_spacing_sec:
+            if hit.score() > previous.score():
+                _suppress_hit(
+                    previous,
+                    "global_min_spacing",
+                    duplicate_suppressed_by_class=duplicate_suppressed_by_class,
+                )
+                accepted[-1] = hit
+            else:
+                _suppress_hit(
+                    hit,
+                    "global_min_spacing",
+                    duplicate_suppressed_by_class=duplicate_suppressed_by_class,
+                )
+            continue
+
+        accepted.append(hit)
+
+    return sorted([item for item in accepted if not item.suppressed], key=lambda item: item.onset_sec)
+
+
+def _apply_class_refractory(
+    hits: list[_DetectedHit],
+    *,
+    class_refractory_sec: dict[str, float],
+    duplicate_suppressed_by_class: dict[str, int],
+) -> list[_DetectedHit]:
+    accepted: list[_DetectedHit] = []
+    last_by_class_index: dict[str, int] = {}
+
+    for hit in sorted(hits, key=lambda item: item.onset_sec):
+        canonical = _canonical_class(hit.class_name)
+        refractory_sec = float(class_refractory_sec.get(canonical, 0.0))
+        hit.class_refractory_ms = refractory_sec * 1000.0
+
+        last_index = last_by_class_index.get(canonical)
+        if last_index is None:
+            accepted.append(hit)
+            last_by_class_index[canonical] = len(accepted) - 1
+            continue
+
+        previous = accepted[last_index]
+        if (hit.onset_sec - previous.onset_sec) < refractory_sec:
+            if hit.score() > previous.score():
+                _suppress_hit(
+                    previous,
+                    "class_refractory",
+                    duplicate_suppressed_by_class=duplicate_suppressed_by_class,
+                )
+                accepted[last_index] = hit
+            else:
+                _suppress_hit(
+                    hit,
+                    "class_refractory",
+                    duplicate_suppressed_by_class=duplicate_suppressed_by_class,
+                )
+            continue
+
+        accepted.append(hit)
+        last_by_class_index[canonical] = len(accepted) - 1
+
+    return sorted([item for item in accepted if not item.suppressed], key=lambda item: item.onset_sec)
+
+
+def _assign_output_velocities(hits: list[_DetectedHit]) -> None:
+    if not hits:
+        return
+
+    strengths = np.asarray(
+        [hit.onset_strength * (0.75 + 0.25 * hit.confidence) for hit in hits],
+        dtype=np.float64,
+    )
+    low = float(np.percentile(strengths, 15))
+    high = float(np.percentile(strengths, 92))
+    span = max(high - low, 1e-9)
+
+    for hit, value in zip(hits, strengths.tolist()):
+        normalized = np.clip((value - low) / span, 0.0, 1.0)
+        confidence_gain = np.clip((float(hit.confidence) - 0.45) / 0.55, 0.0, 1.0)
+        velocity = int(round(22.0 + (84.0 * normalized) + (16.0 * confidence_gain)))
+        hit.velocity = max(1, min(127, velocity))
 
 
 def _build_midi(
@@ -562,6 +1006,13 @@ def _write_debug_csv(path: Path, hits: list[_DetectedHit]) -> None:
             handle,
             fieldnames=[
                 "onset_sec",
+                "raw_onset_sec",
+                "accepted_onset_sec",
+                "suppressed",
+                "suppression_reason",
+                "grouped_transient_id",
+                "class_refractory_ms",
+                "nearest_previous_same_class_ms",
                 "tick",
                 "class",
                 "target_note",
@@ -579,6 +1030,13 @@ def _write_debug_csv(path: Path, hits: list[_DetectedHit]) -> None:
             writer.writerow(
                 {
                     "onset_sec": hit.onset_sec,
+                    "raw_onset_sec": hit.onset_sec,
+                    "accepted_onset_sec": hit.accepted_onset_sec,
+                    "suppressed": str(hit.suppressed).lower(),
+                    "suppression_reason": hit.suppression_reason,
+                    "grouped_transient_id": hit.grouped_transient_id,
+                    "class_refractory_ms": hit.class_refractory_ms,
+                    "nearest_previous_same_class_ms": hit.nearest_previous_same_class_ms,
                     "tick": hit.tick,
                     "onset_strength": hit.onset_strength,
                     "class": hit.class_name,
@@ -609,6 +1067,35 @@ def _validate_params(params: AudioDrumExtractionParameters) -> None:
     if params.c1_midi_note < 0 or params.c1_midi_note > 127:
         raise AudioDrumExtractionError("--c1-midi-note must be in range 0..127.")
 
+    if params.profile not in {"conservative", "balanced", "sensitive"}:
+        raise AudioDrumExtractionError("--profile must be one of: conservative, balanced, sensitive.")
+
+    settings = _resolve_profile_settings(params)
+    int_fields = (
+        "onset_pre_max",
+        "onset_post_max",
+        "onset_pre_avg",
+        "onset_post_avg",
+        "onset_wait",
+    )
+    for name in int_fields:
+        if int(settings[name]) < 0:
+            raise AudioDrumExtractionError(f"--{name.replace('_', '-')} must be >= 0.")
+
+    float_fields = (
+        "onset_delta",
+        "min_hit_spacing_ms",
+        "kick_refractory_ms",
+        "snare_refractory_ms",
+        "hat_refractory_ms",
+        "cymbal_refractory_ms",
+        "tom_refractory_ms",
+        "same_transient_window_ms",
+    )
+    for name in float_fields:
+        if float(settings[name]) < 0.0:
+            raise AudioDrumExtractionError(f"--{name.replace('_', '-')} must be >= 0.")
+
 
 def _count_output_notes(hits: list[_DetectedHit]) -> dict[str, int]:
     counts: dict[int, int] = {}
@@ -630,15 +1117,130 @@ def _count_classes(hits: list[_DetectedHit]) -> dict[str, int]:
         "unknown": 0,
     }
     for hit in hits:
-        normalized = _normalize_class_name(hit.class_name)
+        normalized = _canonical_class(hit.class_name)
         counts[normalized] += 1
     return counts
+
+
+def _class_notes_per_second(class_counts: dict[str, int], duration_sec: float) -> dict[str, float]:
+    safe_duration = max(duration_sec, 1e-9)
+    return {
+        name: float(count) / safe_duration
+        for name, count in class_counts.items()
+    }
+
+
+def _velocity_summary(hits: list[_DetectedHit]) -> dict[str, float]:
+    if not hits:
+        return {
+            "min": 0.0,
+            "median": 0.0,
+            "max": 0.0,
+            "p90": 0.0,
+        }
+
+    velocities = np.asarray([int(hit.velocity) for hit in hits], dtype=np.float64)
+    return {
+        "min": float(np.min(velocities)),
+        "median": float(np.median(velocities)),
+        "max": float(np.max(velocities)),
+        "p90": float(np.percentile(velocities, 90)),
+    }
+
+
+def _duplicate_interval_summary(
+    hits: list[_DetectedHit],
+    class_refractory_ms: dict[str, float],
+) -> dict[str, dict[str, float | int | None]]:
+    by_class: dict[str, list[float]] = {
+        "kick": [],
+        "snare_or_clap": [],
+        "hat": [],
+        "cymbal": [],
+        "tom_or_perc": [],
+        "unknown": [],
+    }
+
+    for hit in sorted(hits, key=lambda item: item.onset_sec):
+        by_class[_canonical_class(hit.class_name)].append(float(hit.onset_sec))
+
+    summary: dict[str, dict[str, float | int | None]] = {}
+    for class_name, onsets in by_class.items():
+        if len(onsets) < 2:
+            summary[class_name] = {
+                "min_interval_ms": None,
+                "median_interval_ms": None,
+                "count_under_80ms": 0,
+                "count_under_class_refractory": 0,
+                "interval_count": 0,
+            }
+            continue
+
+        intervals_ms = np.diff(np.asarray(onsets, dtype=np.float64)) * 1000.0
+        refractory = float(class_refractory_ms.get(class_name, 0.0))
+        summary[class_name] = {
+            "min_interval_ms": float(np.min(intervals_ms)),
+            "median_interval_ms": float(np.median(intervals_ms)),
+            "count_under_80ms": int(np.sum(intervals_ms < 80.0)),
+            "count_under_class_refractory": int(np.sum(intervals_ms < refractory)),
+            "interval_count": int(len(intervals_ms)),
+        }
+
+    return summary
+
+
+def _evaluate_density_warnings(
+    *,
+    duration_sec: float,
+    class_counts: dict[str, int],
+    duplicate_interval_summary: dict[str, dict[str, float | int | None]],
+) -> tuple[bool, list[str]]:
+    warnings: list[str] = []
+    too_dense = False
+
+    if class_counts.get("kick", 0) > 700:
+        too_dense = True
+        warnings.append(
+            "Strong warning: kick count exceeds 700; output is likely too dense."
+        )
+
+    if class_counts.get("cymbal", 0) > 400:
+        too_dense = True
+        warnings.append(
+            "Strong warning: cymbal count exceeds 400; output is likely too dense."
+        )
+
+    for class_name, item in duplicate_interval_summary.items():
+        interval_count = int(item.get("interval_count") or 0)
+        under_ref = int(item.get("count_under_class_refractory") or 0)
+        if interval_count <= 0:
+            continue
+        ratio = under_ref / float(interval_count)
+        if ratio > 0.10:
+            too_dense = True
+            warnings.append(
+                "Strong warning: more than 10% of "
+                f"{class_name} intervals are under class refractory."
+            )
+
+    notes_total = sum(class_counts.values())
+    notes_per_second = notes_total / max(duration_sec, 1e-9)
+    if notes_per_second > 14.0:
+        warnings.append(
+            "Warning: overall notes_per_second is unusually high for drum extraction."
+        )
+
+    return too_dense, warnings
 
 
 def _to_per_hit_summary(hits: list[_DetectedHit]) -> list[PerHitSummary]:
     return [
         PerHitSummary(
             onset_sec=float(hit.onset_sec),
+            raw_onset_sec=float(hit.onset_sec),
+            accepted_onset_sec=(
+                None if hit.accepted_onset_sec is None else float(hit.accepted_onset_sec)
+            ),
             tick=int(hit.tick),
             class_name=_normalize_class_name(hit.class_name),
             target_note=int(hit.target_note),
@@ -649,9 +1251,59 @@ def _to_per_hit_summary(hits: list[_DetectedHit]) -> list[PerHitSummary]:
             high_energy_ratio=float(hit.high_energy_ratio),
             spectral_centroid=float(hit.spectral_centroid),
             onset_strength=float(hit.onset_strength),
+            suppressed=bool(hit.suppressed),
+            suppression_reason=hit.suppression_reason,
+            grouped_transient_id=hit.grouped_transient_id,
+            class_refractory_ms=float(hit.class_refractory_ms),
+            nearest_previous_same_class_ms=(
+                None
+                if hit.nearest_previous_same_class_ms is None
+                else float(hit.nearest_previous_same_class_ms)
+            ),
         )
         for hit in hits
     ]
+
+
+def _adjust_class_with_band_evidence(
+    *,
+    class_name: DrumClass,
+    onset_strength: float,
+    low_band_onset_strength: float,
+    mid_band_onset_strength: float,
+    high_band_onset_strength: float,
+    low_ratio: float,
+    mid_ratio: float,
+    high_ratio: float,
+    centroid_hz: float,
+    previous_high_hit: _DetectedHit | None,
+    onset_sec: float,
+) -> DrumClass:
+    normalized = _normalize_class_name(class_name)
+
+    if normalized == "kick":
+        if low_band_onset_strength < 0.20 and mid_band_onset_strength > (low_band_onset_strength + 0.08):
+            return "tom_or_perc"
+
+    if normalized in {"hat", "cymbal"}:
+        if high_band_onset_strength < 0.16 and mid_ratio >= 0.45:
+            return "snare_or_clap"
+
+        if normalized == "cymbal":
+            if high_band_onset_strength < 0.30 and onset_strength < 0.65:
+                return "hat"
+            if centroid_hz < 5200.0 and high_ratio < 0.62:
+                return "hat"
+            if previous_high_hit is not None:
+                delta_sec = onset_sec - previous_high_hit.onset_sec
+                if 0.0 < delta_sec < 0.14 and onset_strength < (previous_high_hit.onset_strength * 0.82):
+                    return "hat"
+
+    if normalized == "tom_or_perc":
+        if low_ratio > 0.55 and low_band_onset_strength > (mid_band_onset_strength + 0.10):
+            return "kick"
+
+    return normalized
 
 
 def extract_drums_from_audio(
@@ -675,16 +1327,23 @@ def extract_drums_from_audio(
 
     map_definition = _resolve_target_map_definition(params)
     class_targets = _resolve_class_targets(map_definition, params)
+    settings = _resolve_profile_settings(params)
 
-    onset_strength_envelope, _frame_size, hop_size = _onset_strength_envelope(
+    onset_envelopes, _frame_size, hop_size = _onset_strength_envelopes(
         mono,
         sample_rate,
     )
     onset_times, onset_strengths = _detect_onsets(
-        onset_strength_envelope,
+        onset_envelopes["full"],
         sample_rate,
         hop_size,
         params.min_onset_strength,
+        onset_pre_max=int(settings["onset_pre_max"]),
+        onset_post_max=int(settings["onset_post_max"]),
+        onset_pre_avg=int(settings["onset_pre_avg"]),
+        onset_post_avg=int(settings["onset_post_avg"]),
+        onset_delta=float(settings["onset_delta"]),
+        onset_wait=int(settings["onset_wait"]),
     )
 
     detected_bpm = _estimate_bpm(onset_times)
@@ -698,10 +1357,36 @@ def extract_drums_from_audio(
     if len(onset_times) == 0:
         warnings.append("No onsets detected above threshold.")
 
-    hits: list[_DetectedHit] = []
-    emitted_hits: list[_DetectedHit] = []
-    skipped_unknown_count = 0
-    for onset_sec, onset_strength in zip(onset_times.tolist(), onset_strengths.tolist()):
+    class_refractory_ms = _resolve_refractory_ms(settings)
+    class_refractory_sec = {
+        class_name: value / 1000.0 for class_name, value in class_refractory_ms.items()
+    }
+    min_hit_spacing_sec = float(settings["min_hit_spacing_ms"]) / 1000.0
+    same_transient_window_sec = float(settings["same_transient_window_ms"]) / 1000.0
+
+    raw_hits: list[_DetectedHit] = []
+    duplicate_suppressed_by_class: dict[str, int] = {
+        "kick": 0,
+        "snare_or_clap": 0,
+        "hat": 0,
+        "cymbal": 0,
+        "tom_or_perc": 0,
+        "unknown": 0,
+    }
+
+    last_seen_same_class_time: dict[str, float] = {}
+    previous_high_hit: _DetectedHit | None = None
+
+    for hit_id, (onset_sec, onset_strength) in enumerate(
+        zip(onset_times.tolist(), onset_strengths.tolist())
+    ):
+        frame_idx = int(round((float(onset_sec) * sample_rate) / hop_size))
+        frame_idx = max(0, min(frame_idx, len(onset_envelopes["full"]) - 1))
+
+        low_onset_strength = float(onset_envelopes["low"][frame_idx])
+        mid_onset_strength = float(onset_envelopes["mid"][frame_idx])
+        high_onset_strength = float(onset_envelopes["high"][frame_idx])
+
         (
             low_ratio,
             mid_ratio,
@@ -713,8 +1398,9 @@ def extract_drums_from_audio(
         ) = _extract_hit_spectral_features(
             mono,
             sample_rate,
-            onset_sec,
+            float(onset_sec),
         )
+
         class_name, confidence = _classify_hit(
             onset_strength=float(onset_strength),
             low_ratio=low_ratio,
@@ -723,6 +1409,21 @@ def extract_drums_from_audio(
             centroid_hz=centroid_hz,
             rolloff_hz=rolloff_hz,
         )
+
+        class_name = _adjust_class_with_band_evidence(
+            class_name=class_name,
+            onset_strength=float(onset_strength),
+            low_band_onset_strength=low_onset_strength,
+            mid_band_onset_strength=mid_onset_strength,
+            high_band_onset_strength=high_onset_strength,
+            low_ratio=low_ratio,
+            mid_ratio=mid_ratio,
+            high_ratio=high_ratio,
+            centroid_hz=centroid_hz,
+            previous_high_hit=previous_high_hit,
+            onset_sec=float(onset_sec),
+        )
+
         class_name = _normalize_class_name(class_name)
 
         target_note = int(class_targets[class_name])
@@ -730,10 +1431,24 @@ def extract_drums_from_audio(
             candy_layout = resolve_ujam_candy_layout_notes(params.c1_midi_note)
             target_note = candy_layout["F2"]
 
+        canonical_class = _canonical_class(class_name)
+        previous_time = last_seen_same_class_time.get(canonical_class)
+        nearest_previous_same_class_ms = (
+            None
+            if previous_time is None
+            else (float(onset_sec) - previous_time) * 1000.0
+        )
+        last_seen_same_class_time[canonical_class] = float(onset_sec)
+
         hit = _DetectedHit(
+            hit_id=int(hit_id),
             onset_sec=float(onset_sec),
+            accepted_onset_sec=float(onset_sec),
             tick=_hit_to_tick(float(onset_sec), ticks_per_second),
             onset_strength=float(onset_strength),
+            low_band_onset_strength=low_onset_strength,
+            mid_band_onset_strength=mid_onset_strength,
+            high_band_onset_strength=high_onset_strength,
             class_name=class_name,
             low_energy_ratio=float(low_ratio),
             mid_energy_ratio=float(mid_ratio),
@@ -741,26 +1456,69 @@ def extract_drums_from_audio(
             spectral_centroid=float(centroid_hz),
             confidence=float(confidence),
             target_note=target_note,
-            velocity=_velocity_from_hit(float(onset_strength), confidence),
+            velocity=1,
+            suppressed=False,
+            suppression_reason=None,
+            grouped_transient_id=None,
+            class_refractory_ms=float(class_refractory_ms[canonical_class]),
+            nearest_previous_same_class_ms=nearest_previous_same_class_ms,
         )
-        if class_name == "unknown" and float(confidence) < 0.80:
+
+        raw_hits.append(hit)
+
+        if canonical_class in {"hat", "cymbal"}:
+            previous_high_hit = hit
+
+    grouped_hits = _group_same_transients(
+        raw_hits,
+        window_sec=same_transient_window_sec,
+        duplicate_suppressed_by_class=duplicate_suppressed_by_class,
+    )
+    spacing_filtered_hits = _apply_global_min_spacing(
+        grouped_hits,
+        min_spacing_sec=min_hit_spacing_sec,
+        duplicate_suppressed_by_class=duplicate_suppressed_by_class,
+    )
+    refractory_filtered_hits = _apply_class_refractory(
+        spacing_filtered_hits,
+        class_refractory_sec=class_refractory_sec,
+        duplicate_suppressed_by_class=duplicate_suppressed_by_class,
+    )
+
+    emitted_hits: list[_DetectedHit] = []
+    skipped_unknown_count = 0
+    for hit in sorted(refractory_filtered_hits, key=lambda item: item.onset_sec):
+        if _canonical_class(hit.class_name) == "unknown" and float(hit.confidence) < 0.80:
             skipped_unknown_count += 1
             hit.target_note = -1
-        else:
-            emitted_hits.append(hit)
+            _suppress_hit(
+                hit,
+                "low_confidence_unknown",
+                duplicate_suppressed_by_class=duplicate_suppressed_by_class,
+            )
+            continue
+        emitted_hits.append(hit)
 
-        hits.append(hit)
+    _assign_output_velocities(emitted_hits)
 
-    hits.sort(key=lambda item: item.onset_sec)
-    emitted_hits.sort(key=lambda item: item.onset_sec)
+    suppressed_duplicate_count = int(sum(duplicate_suppressed_by_class.values()))
 
     if skipped_unknown_count > 0:
         warnings.append(
             f"Skipped {skipped_unknown_count} low-confidence unknown hits from MIDI output."
         )
 
+    class_counts = _count_classes(emitted_hits)
+    duplicate_interval_summary = _duplicate_interval_summary(emitted_hits, class_refractory_ms)
+    too_dense_warning, density_warnings = _evaluate_density_warnings(
+        duration_sec=duration_sec,
+        class_counts=class_counts,
+        duplicate_interval_summary=duplicate_interval_summary,
+    )
+    warnings.extend(density_warnings)
+
     if params.debug_csv is not None:
-        _write_debug_csv(params.debug_csv, hits)
+        _write_debug_csv(params.debug_csv, sorted(raw_hits, key=lambda item: item.onset_sec))
 
     output_file = params.output_file
     synchronization_preserved = True
@@ -787,7 +1545,7 @@ def extract_drums_from_audio(
                 "tom_or_perc": [],
             }
             for hit in emitted_hits:
-                bucket = hit.class_name
+                bucket = _canonical_class(hit.class_name)
                 if bucket == "unknown":
                     bucket = "tom_or_perc"
                 by_class[bucket].append(hit)
@@ -817,6 +1575,9 @@ def extract_drums_from_audio(
         output_length_ticks = source_length_ticks
         synchronization_preserved = source_length_ticks == output_length_ticks
 
+    safe_duration = max(duration_sec, 1e-9)
+    notes_per_second = float(sum(class_counts.values()) / safe_duration)
+
     report = AudioDrumExtractionReport(
         wav_file=str(wav_file),
         output_file=None if params.dry_run else str(output_file),
@@ -826,14 +1587,32 @@ def extract_drums_from_audio(
         bpm_used=float(bpm_used),
         bpm_source=bpm_source,
         onset_count=len(onset_times),
-        class_counts=_count_classes(hits),
+        raw_onset_count=len(raw_hits),
+        accepted_onset_count=len(emitted_hits),
+        suppressed_duplicate_count=suppressed_duplicate_count,
+        suppressed_by_class=duplicate_suppressed_by_class,
+        min_hit_spacing_ms=float(settings["min_hit_spacing_ms"]),
+        class_refractory_ms={
+            "kick": float(class_refractory_ms["kick"]),
+            "snare_or_clap": float(class_refractory_ms["snare_or_clap"]),
+            "hat": float(class_refractory_ms["hat"]),
+            "cymbal": float(class_refractory_ms["cymbal"]),
+            "tom_or_perc": float(class_refractory_ms["tom_or_perc"]),
+        },
+        same_transient_window_ms=float(settings["same_transient_window_ms"]),
+        class_counts=class_counts,
         output_note_counts=_count_output_notes(emitted_hits),
         output_pitch_counts=_count_output_notes(emitted_hits),
+        notes_per_second=notes_per_second,
+        class_notes_per_second=_class_notes_per_second(class_counts, duration_sec),
+        velocity_summary=_velocity_summary(emitted_hits),
+        too_dense_warning=too_dense_warning,
+        duplicate_interval_summary=duplicate_interval_summary,
         target_map=map_definition.name,
         c1_midi_note=int(params.c1_midi_note),
         synchronization_preserved=bool(synchronization_preserved),
         warnings=warnings,
-        per_hit_summary=_to_per_hit_summary(hits),
+        per_hit_summary=_to_per_hit_summary(sorted(raw_hits, key=lambda item: item.onset_sec)),
     )
 
     if params.report_file is not None:

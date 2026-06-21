@@ -110,6 +110,7 @@ class HermesWorkflowService:
             bpm=bpm_override,
             channel=9,
             min_onset_strength=0.20,
+            profile="conservative",
             dry_run=False,
             separate_files=False,
             report_file=report_file,
