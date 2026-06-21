@@ -622,6 +622,26 @@ def drums_extract_from_audio_command(
         "--profile",
         help="Extraction profile: conservative|balanced|sensitive.",
     ),
+    detection_mode: str = typer.Option(
+        "multi-detector",
+        "--detection-mode",
+        help="Detection mode: global|multi-detector.",
+    ),
+    min_class_confidence: float | None = typer.Option(
+        None,
+        "--min-class-confidence",
+        help="Minimum class confidence required to emit a detected hit.",
+    ),
+    emit_unknown: bool = typer.Option(
+        False,
+        "--emit-unknown",
+        help="Emit unknown-class hits instead of skipping them.",
+    ),
+    unknown_target_note: int | None = typer.Option(
+        None,
+        "--unknown-target-note",
+        help="Target note for unknown hits when --emit-unknown is enabled.",
+    ),
     onset_pre_max: int | None = typer.Option(
         None,
         "--onset-pre-max",
@@ -726,6 +746,10 @@ def drums_extract_from_audio_command(
         channel=channel - 1,
         min_onset_strength=min_onset_strength,
         profile=profile,
+        detection_mode=detection_mode,
+        min_class_confidence=min_class_confidence,
+        emit_unknown=emit_unknown,
+        unknown_target_note=unknown_target_note,
         onset_pre_max=onset_pre_max,
         onset_post_max=onset_post_max,
         onset_pre_avg=onset_pre_avg,

@@ -97,6 +97,40 @@ def _patch_detected_hits(
     confidence_values = confidences or [0.90 for _ in onset_times]
     frame_count = max(8, int(round((max(onset_times) if onset_times else 0.0) * 44100 / 256.0)) + 8)
 
+    candidate_id = {"value": 0}
+
+    def _build_candidates(detector_name: str) -> list[drums_extract_audio._HitCandidate]:
+        candidates: list[drums_extract_audio._HitCandidate] = []
+        for idx, onset_sec in enumerate(onset_times):
+            class_name = class_names[idx] if idx < len(class_names) else class_names[-1]
+            confidence = confidence_values[idx] if idx < len(confidence_values) else confidence_values[-1]
+            strength = strengths[idx] if idx < len(strengths) else strengths[-1]
+            cid = candidate_id["value"]
+            candidate_id["value"] += 1
+            candidates.append(
+                drums_extract_audio._HitCandidate(
+                    candidate_id=cid,
+                    detector_name=detector_name,
+                    onset_sec=float(onset_sec),
+                    onset_strength=float(strength),
+                    class_name=class_name,
+                    low_peak_strength=0.85 if class_name == "kick" else 0.25,
+                    mid_peak_strength=0.78 if class_name in {"snare_or_clap", "tom_or_perc"} else 0.30,
+                    high_peak_strength=0.86 if class_name in {"hat", "cymbal"} else 0.20,
+                    attack_score=0.75,
+                    decay_score=0.35 if class_name != "cymbal" else 0.80,
+                    band_dominance_score=0.72,
+                    confidence=float(confidence),
+                    competing_class="hat" if class_name == "cymbal" else "cymbal",
+                    competing_class_score=0.30,
+                    low_energy_ratio=low_ratio,
+                    mid_energy_ratio=mid_ratio,
+                    high_energy_ratio=high_ratio,
+                    spectral_centroid=1500.0,
+                )
+            )
+        return candidates
+
     monkeypatch.setattr(
         drums_extract_audio,
         "_onset_strength_envelopes",
@@ -106,6 +140,12 @@ def _patch_detected_hits(
                 "low": np.full(frame_count, 0.85, dtype=np.float64),
                 "mid": np.full(frame_count, 0.35, dtype=np.float64),
                 "high": np.full(frame_count, 0.25, dtype=np.float64),
+                "upper": np.full(frame_count, 0.22, dtype=np.float64),
+                "kick": np.full(frame_count, 0.85, dtype=np.float64),
+                "snare": np.full(frame_count, 0.50, dtype=np.float64),
+                "hat": np.full(frame_count, 0.55, dtype=np.float64),
+                "cymbal": np.full(frame_count, 0.48, dtype=np.float64),
+                "tom": np.full(frame_count, 0.45, dtype=np.float64),
             },
             1024,
             256,
@@ -121,6 +161,16 @@ def _patch_detected_hits(
     )
     monkeypatch.setattr(
         drums_extract_audio,
+        "_collect_multidetector_candidates",
+        lambda **kwargs: _build_candidates("kick"),
+    )
+    monkeypatch.setattr(
+        drums_extract_audio,
+        "_collect_global_candidates",
+        lambda **kwargs: _build_candidates("global"),
+    )
+    monkeypatch.setattr(
+        drums_extract_audio,
         "_extract_hit_spectral_features",
         lambda audio, sample_rate, onset_sec: (
             low_ratio,
@@ -131,30 +181,6 @@ def _patch_detected_hits(
             0.20,
             0.70,
         ),
-    )
-
-    state = {"index": 0}
-
-    def _classify(
-        onset_strength: float,
-        low_ratio: float,
-        mid_ratio: float,
-        high_ratio: float,
-        centroid_hz: float,
-        rolloff_hz: float,
-    ) -> tuple[str, float]:
-        idx = state["index"]
-        state["index"] += 1
-        if idx >= len(class_names):
-            idx = len(class_names) - 1
-        confidence = confidence_values[idx] if idx < len(confidence_values) else confidence_values[-1]
-        return class_names[idx], confidence
-
-    monkeypatch.setattr(drums_extract_audio, "_classify_hit", _classify)
-    monkeypatch.setattr(
-        drums_extract_audio,
-        "_adjust_class_with_band_evidence",
-        lambda **kwargs: kwargs["class_name"],
     )
 
 
@@ -203,6 +229,9 @@ def test_drums_extract_command_is_registered() -> None:
     assert "--wav" in result.stdout
     assert "--output" in result.stdout
     assert "--target-map" in result.stdout
+    assert "--detection-mode" in result.stdout
+    assert "--min-class-confidence" in result.stdout
+    assert "--emit-unknown" in result.stdout
 
 
 def test_output_note_timing_follows_detected_onset_times(
@@ -383,6 +412,65 @@ def test_auto_bpm_path_is_used_when_bpm_is_omitted(
     assert payload["bpm_used"] == 120.0
     assert len(tempo_events) == 1
     assert int(tempo_events[0].tempo) == int(round(60_000_000.0 / 120.0))
+
+
+def test_multi_detector_is_default_mode(tmp_path: Path) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "default_mode.mid"
+    report_path = tmp_path / "default_mode_report.json"
+    _build_drum_like_wav(wav_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "gm",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert result.exit_code == 0
+    assert payload["detection_mode"] == "multi-detector"
+
+
+def test_global_mode_still_works_as_fallback(tmp_path: Path) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "global_mode.mid"
+    report_path = tmp_path / "global_mode_report.json"
+    _build_drum_like_wav(wav_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "gm",
+            "--detection-mode",
+            "global",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert result.exit_code == 0
+    assert payload["detection_mode"] == "global"
+    assert output_midi.exists()
 
 
 def test_report_includes_bpm_fields(tmp_path: Path) -> None:
@@ -586,9 +674,321 @@ def test_report_and_debug_csv_are_written(tmp_path: Path) -> None:
     assert "grouped_transient_id" in header
     assert "class_refractory_ms" in header
     assert "nearest_previous_same_class_ms" in header
+    assert "detection_mode" in header
+    assert "detector_name" in header
+    assert "candidate_class" in header
+    assert "accepted_class" in header
+    assert "class_confidence" in header
+    assert "competing_class" in header
+    assert "competing_class_score" in header
+    assert "accepted" in header
+    assert "rejection_reason" in header
+    assert "merged_with_transient_id" in header
+    assert "detector_candidate_counts" in payload
+    assert "detector_accepted_counts" in payload
+    assert "detector_rejected_counts" in payload
+    assert "low_confidence_rejected_count" in payload
+    assert "rejected_by_reason" in payload
+    assert "multi_detector_merge_conflicts" in payload
     assert "tick" in header
     assert "spectral_centroid" in header
     assert "onset_strength" in header
+
+
+def test_kick_detector_detects_low_band_synthetic_hits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "kick_detector.mid"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10, 0.35],
+        class_names=["kick", "kick"],
+        onset_strengths=[0.75, 0.78],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "ujam-candy",
+            "--c1-midi-note",
+            "36",
+            "--detection-mode",
+            "multi-detector",
+            "--bpm",
+            "120",
+        ],
+    )
+
+    notes = [note for _tick, note, _channel, _velocity in _note_on_events(output_midi)]
+
+    assert result.exit_code == 0
+    assert notes == [36, 36]
+
+
+def test_snare_detector_detects_broadband_snare_hits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "snare_detector.mid"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.12, 0.36],
+        class_names=["snare_or_clap", "snare_or_clap"],
+        onset_strengths=[0.72, 0.74],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "ujam-candy",
+            "--c1-midi-note",
+            "36",
+            "--detection-mode",
+            "multi-detector",
+            "--bpm",
+            "120",
+        ],
+    )
+
+    notes = [note for _tick, note, _channel, _velocity in _note_on_events(output_midi)]
+
+    assert result.exit_code == 0
+    assert notes == [43, 43]
+
+
+def test_hat_detector_detects_repeated_short_high_ticks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "hat_detector.mid"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10, 0.18, 0.26],
+        class_names=["hat", "hat", "hat"],
+        onset_strengths=[0.70, 0.68, 0.66],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "ujam-candy",
+            "--c1-midi-note",
+            "36",
+            "--detection-mode",
+            "multi-detector",
+            "--bpm",
+            "120",
+        ],
+    )
+
+    notes = [note for _tick, note, _channel, _velocity in _note_on_events(output_midi)]
+
+    assert result.exit_code == 0
+    assert notes == [48, 48, 48]
+
+
+def test_tom_is_not_catch_all_when_confidence_is_low(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "tom_not_catchall.mid"
+    report_path = tmp_path / "tom_not_catchall_report.json"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10, 0.24, 0.39],
+        class_names=["tom_or_perc", "tom_or_perc", "tom_or_perc"],
+        onset_strengths=[0.25, 0.22, 0.20],
+        confidences=[0.42, 0.40, 0.38],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "gm",
+            "--detection-mode",
+            "multi-detector",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert result.exit_code == 0
+    assert payload["class_counts"]["tom_or_perc"] == 0
+    assert payload["low_confidence_rejected_count"] >= 1
+
+
+def test_low_confidence_candidates_are_skipped_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "low_conf_skip.mid"
+    report_path = tmp_path / "low_conf_skip_report.json"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.14, 0.33],
+        class_names=["kick", "snare_or_clap"],
+        onset_strengths=[0.18, 0.21],
+        confidences=[0.45, 0.47],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "gm",
+            "--detection-mode",
+            "multi-detector",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    events = _note_on_events(output_midi)
+
+    assert result.exit_code == 0
+    assert len(events) == 0
+    assert payload["accepted_onset_count"] == 0
+    assert payload["low_confidence_rejected_count"] >= 2
+
+
+def test_same_transient_allows_kick_hat_layering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "layer_kick_hat.mid"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10, 0.12],
+        class_names=["kick", "hat"],
+        onset_strengths=[0.78, 0.70],
+        confidences=[0.88, 0.82],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "ujam-candy",
+            "--c1-midi-note",
+            "36",
+            "--detection-mode",
+            "multi-detector",
+            "--bpm",
+            "120",
+        ],
+    )
+
+    notes = sorted(note for _tick, note, _channel, _velocity in _note_on_events(output_midi))
+
+    assert result.exit_code == 0
+    assert notes == [36, 48]
+
+
+def test_same_transient_does_not_create_duplicate_same_class(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "no_dupe_same_class.mid"
+    report_path = tmp_path / "no_dupe_same_class_report.json"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10, 0.12],
+        class_names=["snare_or_clap", "snare_or_clap"],
+        onset_strengths=[0.74, 0.72],
+        confidences=[0.84, 0.82],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "gm",
+            "--detection-mode",
+            "multi-detector",
+            "--bpm",
+            "120",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    notes = _note_on_events(output_midi)
+
+    assert result.exit_code == 0
+    assert len(notes) == 1
+    assert payload["suppressed_duplicate_count"] >= 1
 
 
 def test_duplicate_kick_hits_inside_refractory_window_are_suppressed(
@@ -814,7 +1214,7 @@ def test_conservative_profile_reduces_dense_repeated_hits(
     output_conservative = tmp_path / "conservative.mid"
     _build_drum_like_wav(wav_path)
 
-    onset_times = [0.10, 0.23, 0.36, 0.49, 0.62, 0.75]
+    onset_times = [0.10, 0.25, 0.40, 0.55, 0.70, 0.85]
     class_names = ["kick", "kick", "kick", "kick", "kick", "kick"]
 
     _patch_detected_hits(
