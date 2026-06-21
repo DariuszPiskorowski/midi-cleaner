@@ -6,6 +6,7 @@ from midi_cleaner.gui.controller import (
     ACTION_MAKE_MIDI_FROM_WAV,
     ACTION_SET_BPM,
     ACTION_SYNCHRONIZE_MIDI_WITH_WAV,
+    HermesDrumsRequest,
     ROLE_BASS,
     ROLE_DRUMS,
     HermesActionRequest,
@@ -52,6 +53,17 @@ class _FakeWorkflowService:
         output_file: Path,
         report_file: Path | None,
         bpm_override: float | None,
+        output_dir: Path | None,
+        debug_csv_file: Path | None,
+        output_layout: str,
+        profile: str,
+        detection_mode: str,
+        mapping_file: Path | None,
+        mapping_payload: dict[str, object] | None,
+        write_empty_layers: bool,
+        clean_output_folder: bool,
+        c1_midi_note: int,
+        target_map: str,
         log,
     ) -> HermesWorkflowResult:
         self.calls.append(
@@ -62,12 +74,37 @@ class _FakeWorkflowService:
                     "output_file": output_file,
                     "report_file": report_file,
                     "bpm_override": bpm_override,
+                    "output_dir": output_dir,
+                    "debug_csv_file": debug_csv_file,
+                    "output_layout": output_layout,
+                    "profile": profile,
+                    "detection_mode": detection_mode,
+                    "mapping_file": mapping_file,
+                    "mapping_payload": mapping_payload,
+                    "write_empty_layers": write_empty_layers,
+                    "clean_output_folder": clean_output_folder,
+                    "c1_midi_note": c1_midi_note,
+                    "target_map": target_map,
                 },
             )
         )
         return HermesWorkflowResult(
-            output_file=output_file,
+            output_file=None,
             report_file=report_file,
+            output_dir=output_dir,
+            debug_csv_file=debug_csv_file,
+            created_files=(
+                (output_dir / "01_Kick1_C1.mid") if output_dir is not None else Path("01_Kick1_C1.mid"),
+                (output_dir / "02_Clap1_G1.mid") if output_dir is not None else Path("02_Clap1_G1.mid"),
+            ),
+            warnings=("duplicate target note",),
+            mapping_name="test_mapping",
+            duplicate_target_notes={"48": ["hh_1", "hh_open_1"]},
+            layer_counts={"kick_1": 1, "clap_1": 1},
+            populated_semantic_layers=("kick_1", "clap_1"),
+            unpopulated_enabled_layers=("snare_1",),
+            disabled_layers=("kick_2",),
+            output_layout="separate-files",
             message="ok",
         )
 
@@ -125,6 +162,43 @@ class _FakeWorkflowService:
             message="ok",
         )
 
+    def default_drums_mapping(self, *, target_map: str, c1_midi_note: int) -> dict[str, object]:
+        return {
+            "name": "default_map",
+            "c1_midi_note": c1_midi_note,
+            "layers": {
+                "kick_1": {
+                    "enabled": True,
+                    "note_name": "C1",
+                    "note": 36,
+                    "track_name": "Kick1",
+                }
+            },
+        }
+
+    def load_drums_mapping(self, *, mapping_file: Path, fallback_c1_midi_note: int) -> dict[str, object]:
+        self.calls.append(("load_mapping", {"mapping_file": mapping_file, "fallback": fallback_c1_midi_note}))
+        return self.default_drums_mapping(target_map="ujam-candy", c1_midi_note=fallback_c1_midi_note)
+
+    def save_drums_mapping(
+        self,
+        *,
+        mapping_payload: dict[str, object],
+        destination_file: Path,
+        fallback_c1_midi_note: int,
+    ) -> Path:
+        self.calls.append(
+            (
+                "save_mapping",
+                {
+                    "mapping_payload": mapping_payload,
+                    "destination_file": destination_file,
+                    "fallback": fallback_c1_midi_note,
+                },
+            )
+        )
+        return destination_file
+
 
 def test_unique_output_path_suffixing(tmp_path: Path) -> None:
     controller = HermesGuiController(desktop_dir=tmp_path)
@@ -167,6 +241,43 @@ def test_bass_make_midi_calls_bass_workflow(tmp_path: Path) -> None:
     assert payload["wav_file"] == wav
     assert payload["midi_file"] == midi
     assert payload["output_file"] == tmp_path / "hermes_bass_working.mid"
+
+
+def test_drums_make_midi_uses_output_folder_and_returns_created_files(tmp_path: Path) -> None:
+    wav = tmp_path / "drums.wav"
+    wav.write_bytes(b"wav")
+
+    output_dir = tmp_path / "layers"
+    service = _FakeWorkflowService()
+    controller = HermesGuiController(service=service, desktop_dir=tmp_path)
+
+    request = HermesActionRequest(
+        role=ROLE_DRUMS,
+        action=ACTION_MAKE_MIDI_FROM_WAV,
+        wav_file=wav,
+        midi_file=None,
+        bpm_text=None,
+        drums=HermesDrumsRequest(
+            output_dir=output_dir,
+            output_layout="separate-files",
+            profile="conservative",
+            detection_mode="multi-detector",
+            write_empty_layers=False,
+            clean_output_folder=False,
+            c1_midi_note=36,
+            target_map="ujam-candy",
+        ),
+    )
+
+    result = controller.execute(request=request, log=lambda _message: None)
+
+    assert result.success is True
+    assert result.output_dir == output_dir
+    assert result.output_file is None
+    assert result.report_file == output_dir / "drums_layers_report.json"
+    assert result.debug_csv_file == output_dir / "drums_layers_hits.csv"
+    assert len(result.created_files) == 2
+    assert result.output_layout == "separate-files"
 
 
 def test_drums_make_midi_returns_not_implemented_without_fallback(tmp_path: Path) -> None:
@@ -269,3 +380,25 @@ def test_set_bpm_filename_uses_decimal_token(tmp_path: Path) -> None:
 
     plan = controller.build_action_plan(request)
     assert plan.output_file.name == "hermes_set_bpm_124_529.mid"
+
+
+def test_controller_exposes_drums_mapping_helpers(tmp_path: Path) -> None:
+    service = _FakeWorkflowService()
+    controller = HermesGuiController(service=service, desktop_dir=tmp_path)
+
+    payload = controller.default_drums_mapping(target_map="ujam-candy", c1_midi_note=36)
+    assert payload["name"] == "default_map"
+
+    loaded = controller.load_drums_mapping(
+        mapping_file=tmp_path / "mapping.json",
+        fallback_c1_midi_note=36,
+    )
+    assert loaded["c1_midi_note"] == 36
+
+    saved_path = controller.save_drums_mapping(
+        mapping_payload=payload,
+        destination_file=tmp_path / "saved_mapping.json",
+        fallback_c1_midi_note=36,
+    )
+    assert saved_path == tmp_path / "saved_mapping.json"
+    assert any(call[0] == "save_mapping" for call in service.calls)

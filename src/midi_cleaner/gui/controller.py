@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -18,6 +18,25 @@ ACTION_SET_BPM = "set_bpm"
 
 _COMING_SOON_ROLES = {ROLE_SYNTH, ROLE_GUITAR, ROLE_OTHER}
 
+_DRUMS_OUTPUT_LAYOUTS = {"separate-files", "multitrack", "single-track"}
+_DRUMS_PROFILES = {"conservative", "balanced", "sensitive"}
+_DRUMS_DETECTION_MODES = {"multi-detector", "global"}
+_TARGET_MAPS = {"gm", "sitala", "ujam-candy", "custom"}
+
+
+@dataclass(frozen=True)
+class HermesDrumsRequest:
+    output_dir: Path | None = None
+    output_layout: str = "separate-files"
+    profile: str = "conservative"
+    detection_mode: str = "multi-detector"
+    mapping_file: Path | None = None
+    mapping_payload: dict[str, object] | None = None
+    write_empty_layers: bool = False
+    clean_output_folder: bool = False
+    c1_midi_note: int = 36
+    target_map: str = "ujam-candy"
+
 
 @dataclass(frozen=True)
 class HermesActionRequest:
@@ -26,6 +45,7 @@ class HermesActionRequest:
     wav_file: Path | None
     midi_file: Path | None
     bpm_text: str | None = None
+    drums: HermesDrumsRequest | None = None
 
 
 @dataclass(frozen=True)
@@ -37,7 +57,10 @@ class HermesActionPlan:
     midi_file: Path | None
     bpm: float | None
     output_file: Path
-    report_file: Path
+    report_file: Path | None
+    output_dir: Path | None = None
+    debug_csv_file: Path | None = None
+    drums: HermesDrumsRequest | None = None
 
 
 @dataclass(frozen=True)
@@ -46,6 +69,17 @@ class HermesActionResult:
     message: str
     output_file: Path | None
     report_file: Path | None
+    output_dir: Path | None = None
+    debug_csv_file: Path | None = None
+    created_files: tuple[Path, ...] = ()
+    warnings: tuple[str, ...] = ()
+    mapping_name: str | None = None
+    duplicate_target_notes: dict[str, list[str]] = field(default_factory=dict)
+    layer_counts: dict[str, int] = field(default_factory=dict)
+    populated_semantic_layers: tuple[str, ...] = ()
+    unpopulated_enabled_layers: tuple[str, ...] = ()
+    disabled_layers: tuple[str, ...] = ()
+    output_layout: str | None = None
 
 
 class HermesGuiController:
@@ -60,6 +94,33 @@ class HermesGuiController:
     @property
     def desktop_dir(self) -> Path:
         return self._desktop_dir
+
+    def default_drums_mapping(self, *, target_map: str, c1_midi_note: int) -> dict[str, object]:
+        return self._service.default_drums_mapping(target_map=target_map, c1_midi_note=c1_midi_note)
+
+    def load_drums_mapping(
+        self,
+        *,
+        mapping_file: Path,
+        fallback_c1_midi_note: int,
+    ) -> dict[str, object]:
+        return self._service.load_drums_mapping(
+            mapping_file=mapping_file,
+            fallback_c1_midi_note=fallback_c1_midi_note,
+        )
+
+    def save_drums_mapping(
+        self,
+        *,
+        mapping_payload: dict[str, object],
+        destination_file: Path,
+        fallback_c1_midi_note: int,
+    ) -> Path:
+        return self._service.save_drums_mapping(
+            mapping_payload=mapping_payload,
+            destination_file=destination_file,
+            fallback_c1_midi_note=fallback_c1_midi_note,
+        )
 
     @staticmethod
     def _parse_bpm_text(bpm_text: str | None) -> float | None:
@@ -113,9 +174,35 @@ class HermesGuiController:
             return True
         if action == ACTION_SYNCHRONIZE_MIDI_WITH_WAV:
             return True
-        if action == ACTION_MAKE_MIDI_FROM_WAV and role == ROLE_DRUMS:
-            return True
         return False
+
+    @staticmethod
+    def _validate_drums_request(drums: HermesDrumsRequest) -> None:
+        if drums.output_layout not in _DRUMS_OUTPUT_LAYOUTS:
+            raise ValueError("Output layout must be separate-files, multitrack, or single-track.")
+
+        if drums.profile not in _DRUMS_PROFILES:
+            raise ValueError("Drums profile must be conservative, balanced, or sensitive.")
+
+        if drums.detection_mode not in _DRUMS_DETECTION_MODES:
+            raise ValueError("Detection mode must be multi-detector or global.")
+
+        if drums.c1_midi_note < 0 or drums.c1_midi_note > 127:
+            raise ValueError("C1 MIDI note must be in range 0..127.")
+
+        if drums.target_map not in _TARGET_MAPS:
+            raise ValueError("Target map must be one of: gm, sitala, ujam-candy, custom.")
+
+        if drums.mapping_file is not None and (
+            not drums.mapping_file.exists() or not drums.mapping_file.is_file()
+        ):
+            raise ValueError(f"Mapping file does not exist: {drums.mapping_file}")
+
+        if drums.target_map == "custom" and drums.mapping_file is None and drums.mapping_payload is None:
+            raise ValueError("Custom target map requires a mapping file or edited mapping payload.")
+
+        if drums.output_dir is not None and drums.output_dir.exists() and not drums.output_dir.is_dir():
+            raise ValueError(f"Output folder is not a directory: {drums.output_dir}")
 
     def _validate_inputs(self, request: HermesActionRequest) -> float | None:
         if request.role in _COMING_SOON_ROLES:
@@ -155,6 +242,9 @@ class HermesGuiController:
         if bpm is not None and not self.supports_bpm(request.role, request.action):
             raise ValueError("BPM override is not supported for the selected role/action.")
 
+        if request.role == ROLE_DRUMS and request.action == ACTION_MAKE_MIDI_FROM_WAV:
+            self._validate_drums_request(request.drums if request.drums is not None else HermesDrumsRequest())
+
         return bpm
 
     def _build_filenames(self, role: str, action: str, bpm: float | None) -> tuple[str, str]:
@@ -178,6 +268,27 @@ class HermesGuiController:
 
     def build_action_plan(self, request: HermesActionRequest) -> HermesActionPlan:
         bpm = self._validate_inputs(request)
+
+        if request.role == ROLE_DRUMS and request.action == ACTION_MAKE_MIDI_FROM_WAV:
+            drums = request.drums if request.drums is not None else HermesDrumsRequest()
+            output_dir = drums.output_dir if drums.output_dir is not None else (self._desktop_dir / "hermes_drums_layers")
+            output_file = output_dir / "hermes_drums_from_audio.mid"
+            report_file = output_dir / "drums_layers_report.json"
+            debug_csv = output_dir / "drums_layers_hits.csv"
+            return HermesActionPlan(
+                workflow="make_drums",
+                role=request.role,
+                action=request.action,
+                wav_file=request.wav_file,
+                midi_file=request.midi_file,
+                bpm=bpm,
+                output_file=output_file,
+                report_file=report_file,
+                output_dir=output_dir,
+                debug_csv_file=debug_csv,
+                drums=drums,
+            )
+
         output_name, report_name = self._build_filenames(
             role=request.role,
             action=request.action,
@@ -234,6 +345,17 @@ class HermesGuiController:
                     output_file=plan.output_file,
                     report_file=plan.report_file,
                     bpm_override=plan.bpm,
+                    output_dir=plan.output_dir,
+                    debug_csv_file=plan.debug_csv_file,
+                    output_layout=(plan.drums.output_layout if plan.drums is not None else "separate-files"),
+                    profile=(plan.drums.profile if plan.drums is not None else "conservative"),
+                    detection_mode=(plan.drums.detection_mode if plan.drums is not None else "multi-detector"),
+                    mapping_file=(plan.drums.mapping_file if plan.drums is not None else None),
+                    mapping_payload=(plan.drums.mapping_payload if plan.drums is not None else None),
+                    write_empty_layers=(plan.drums.write_empty_layers if plan.drums is not None else False),
+                    clean_output_folder=(plan.drums.clean_output_folder if plan.drums is not None else False),
+                    c1_midi_note=(plan.drums.c1_midi_note if plan.drums is not None else 36),
+                    target_map=(plan.drums.target_map if plan.drums is not None else "ujam-candy"),
                     log=log,
                 )
             elif plan.workflow == "make_bass":
@@ -278,4 +400,15 @@ class HermesGuiController:
             message=workflow_result.message,
             output_file=workflow_result.output_file,
             report_file=workflow_result.report_file,
+            output_dir=workflow_result.output_dir,
+            debug_csv_file=workflow_result.debug_csv_file,
+            created_files=tuple(workflow_result.created_files),
+            warnings=tuple(workflow_result.warnings),
+            mapping_name=workflow_result.mapping_name,
+            duplicate_target_notes=dict(workflow_result.duplicate_target_notes),
+            layer_counts=dict(workflow_result.layer_counts),
+            populated_semantic_layers=tuple(workflow_result.populated_semantic_layers),
+            unpopulated_enabled_layers=tuple(workflow_result.unpopulated_enabled_layers),
+            disabled_layers=tuple(workflow_result.disabled_layers),
+            output_layout=workflow_result.output_layout,
         )
