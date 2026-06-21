@@ -78,6 +78,8 @@ class HermesGuiPanel:
         self._running = False
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._log_poll_after_id: str | None = None
+        self._worker_result_queue: queue.Queue[object] = queue.Queue()
+        self._worker_poll_after_id: str | None = None
 
         self._build_ui()
         self._bind_events()
@@ -698,6 +700,12 @@ class HermesGuiPanel:
         self._created_files_count_var.set("0")
         self._created_files_text.delete("1.0", tk.END)
 
+        while True:
+            try:
+                self._worker_result_queue.get_nowait()
+            except queue.Empty:
+                break
+
         self._append_log("Starting Hermes workflow.")
 
         def _on_worker_done(result) -> None:
@@ -716,12 +724,25 @@ class HermesGuiPanel:
             self._running = False
             self._run_button.configure(state=tk.NORMAL)
 
+        def _poll_worker_done() -> None:
+            self._worker_poll_after_id = None
+
+            try:
+                result = self._worker_result_queue.get_nowait()
+            except queue.Empty:
+                if self._running:
+                    self._worker_poll_after_id = self._root.after(50, _poll_worker_done)
+                return
+
+            _on_worker_done(result)
+
         def _worker() -> None:
             result = self._controller.execute(request=request, log=self._log)
-            self._root.after(0, lambda: _on_worker_done(result))
+            self._worker_result_queue.put(result)
 
         thread = threading.Thread(target=_worker, daemon=True)
         thread.start()
+        self._worker_poll_after_id = self._root.after(0, _poll_worker_done)
 
     def _open_output_folder(self) -> None:
         selected_dir = self._output_dir_var.get().strip()
@@ -764,6 +785,12 @@ class HermesGuiPanel:
         self._root.mainloop()
 
     def close(self) -> None:
+        if self._worker_poll_after_id is not None:
+            try:
+                self._root.after_cancel(self._worker_poll_after_id)
+            except Exception:
+                pass
+            self._worker_poll_after_id = None
         if self._log_poll_after_id is not None:
             try:
                 self._root.after_cancel(self._log_poll_after_id)
