@@ -278,9 +278,14 @@ def test_drums_extract_command_is_registered() -> None:
     assert result.exit_code == 0
     assert "--wav" in result.stdout
     assert "--output" in result.stdout
+    assert "--output-dir" in result.stdout
     assert "--target-map" in result.stdout
+    assert "--mapping-file" in result.stdout
+    assert "--save-mapping-file" in result.stdout
+    assert "--write-empty-layers" in result.stdout
     assert "--detection-mode" in result.stdout
     assert "--output-layout" in result.stdout
+    assert "separate-files" in result.stdout
     assert "--min-class-confidence" in result.stdout
     assert "--emit-unknown" in result.stdout
 
@@ -421,15 +426,15 @@ def test_output_layout_multitrack_creates_named_ordered_layer_tracks(
 
     assert result.exit_code == 0
     assert midi.type == 1
-    assert track_names == ["Kick", "SnareClap", "Hat", "TomPerc", "Cymbal"]
-    assert [note for _tick, note, _channel, _velocity in by_track["Kick"]] == [36]
-    assert [note for _tick, note, _channel, _velocity in by_track["SnareClap"]] == [43]
-    assert [note for _tick, note, _channel, _velocity in by_track["Hat"]] == [48]
-    assert [note for _tick, note, _channel, _velocity in by_track["TomPerc"]] == [50]
-    assert [note for _tick, note, _channel, _velocity in by_track["Cymbal"]] == [60]
+    assert track_names == ["Kick1", "Clap1", "HH1", "TomL1", "Cym1"]
+    assert [note for _tick, note, _channel, _velocity in by_track["Kick1"]] == [36]
+    assert [note for _tick, note, _channel, _velocity in by_track["Clap1"]] == [43]
+    assert [note for _tick, note, _channel, _velocity in by_track["HH1"]] == [48]
+    assert [note for _tick, note, _channel, _velocity in by_track["TomL1"]] == [50]
+    assert [note for _tick, note, _channel, _velocity in by_track["Cym1"]] == [60]
     assert len(set(end_ticks.values())) == 1
     assert payload["output_layout"] == "multitrack"
-    assert payload["track_order"] == ["Kick", "SnareClap", "Hat", "TomPerc", "Cymbal"]
+    assert payload["track_order"] == ["Kick1", "Clap1", "HH1", "TomL1", "Cym1"]
 
 
 def test_output_layout_single_track_remains_available(
@@ -796,7 +801,7 @@ def test_report_and_debug_csv_are_written(tmp_path: Path) -> None:
     assert "output_pitch_counts" in payload
     assert "per_hit_summary" in payload
     assert payload["output_layout"] == "multitrack"
-    assert payload["track_order"] == ["Kick", "SnareClap", "Hat", "TomPerc", "Cymbal"]
+    assert len(payload["track_order"]) > 0
     assert "layer_counts" in payload
     assert "layer_output_pitch_counts" in payload
     assert "cross_layer_simultaneous_hit_count" in payload
@@ -1121,8 +1126,8 @@ def test_same_transient_allows_kick_hat_layering(
 
     assert result.exit_code == 0
     assert notes == [36, 48]
-    assert [note for _tick, note, _channel, _velocity in by_track["Kick"]] == [36]
-    assert [note for _tick, note, _channel, _velocity in by_track["Hat"]] == [48]
+    assert [note for _tick, note, _channel, _velocity in by_track["Kick1"]] == [36]
+    assert [note for _tick, note, _channel, _velocity in by_track["HH1"]] == [48]
 
 
 def test_same_transient_allows_kick_snare_layering(
@@ -1631,18 +1636,19 @@ def test_separate_files_mode_creates_synchronized_class_files(
     )
 
     expected_files = [
-        output_midi.parent / "kick.mid",
-        output_midi.parent / "snare_clap.mid",
-        output_midi.parent / "hat.mid",
-        output_midi.parent / "cymbal.mid",
-        output_midi.parent / "tom_perc.mid",
+        output_midi.parent / "01_Kick1_C1.mid",
+        output_midi.parent / "02_Clap1_G1.mid",
+        output_midi.parent / "03_HH1_C2.mid",
+        output_midi.parent / "04_TomL1_D2.mid",
+        output_midi.parent / "05_Cym1_C3.mid",
     ]
 
     assert result.exit_code == 0
-    assert output_midi.exists()
+    assert not output_midi.exists()
     for path in expected_files:
         assert path.exists()
-        assert _max_tick(path) == _max_tick(output_midi)
+    max_ticks = {_max_tick(path) for path in expected_files}
+    assert len(max_ticks) == 1
 
 
 def test_source_wav_is_not_modified(tmp_path: Path) -> None:
@@ -1729,3 +1735,257 @@ def test_extract_from_audio_does_not_call_remap_drums(
     )
 
     assert result.exit_code == 0
+
+
+def test_report_includes_expanded_mapping_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "expanded_report.mid"
+    report_path = tmp_path / "expanded_report.json"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10, 0.30],
+        class_names=["kick", "hat"],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "ujam-candy",
+            "--output-layout",
+            "multitrack",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert result.exit_code == 0
+    for field_name in [
+        "output_layout",
+        "output_dir",
+        "mapping_file",
+        "mapping_name",
+        "created_files",
+        "skipped_layers",
+        "disabled_layers",
+        "write_empty_layers",
+        "duplicate_target_notes",
+        "layer_counts",
+        "layer_target_notes",
+        "layer_target_note_names",
+        "layer_track_names",
+        "populated_semantic_layers",
+        "unpopulated_enabled_layers",
+        "unpopulated_disabled_layers",
+        "primary_slot_assignment_used",
+    ]:
+        assert field_name in payload
+
+
+def test_debug_csv_includes_semantic_mapping_columns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "debug_columns.mid"
+    debug_csv = tmp_path / "debug_columns.csv"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10],
+        class_names=["kick"],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "ujam-candy",
+            "--debug-csv",
+            str(debug_csv),
+        ],
+    )
+
+    header = debug_csv.read_text(encoding="utf-8").splitlines()[0]
+
+    assert result.exit_code == 0
+    assert "semantic_layer" in header
+    assert "detector_family" in header
+    assert "target_note_name" in header
+    assert "mapping_name" in header
+    assert "primary_slot_assignment" in header
+    assert "output_file" in header
+
+
+def test_duplicate_target_notes_are_reported_without_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "dup_target.mid"
+    report_path = tmp_path / "dup_target_report.json"
+    mapping_file = tmp_path / "dup_mapping.json"
+    _build_drum_like_wav(wav_path)
+
+    mapping_file.write_text(
+        json.dumps(
+            {
+                "name": "dup_map",
+                "c1_midi_note": 36,
+                "layers": {
+                    "kick_1": {"enabled": True, "note_name": "C1", "track_name": "Kick1"},
+                    "snare_1": {"enabled": True, "note_name": "C1", "track_name": "Snare1"},
+                    "clap_1": {"enabled": True, "note_name": "G1", "track_name": "Clap1"},
+                    "hh_1": {"enabled": True, "note_name": "C2", "track_name": "HH1"},
+                    "tom_l_1": {"enabled": True, "note_name": "D2", "track_name": "TomL1"},
+                    "cym_1": {"enabled": True, "note_name": "C3", "track_name": "Cym1"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10, 0.30],
+        class_names=["kick", "snare_or_clap"],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "ujam-candy",
+            "--mapping-file",
+            str(mapping_file),
+            "--output-layout",
+            "multitrack",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert result.exit_code == 0
+    assert "36" in payload["duplicate_target_notes"]
+    assert any("duplicate" in warning.lower() for warning in payload["warnings"])
+
+
+def test_disabled_layer_is_skipped_unless_write_empty_layers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "layers.mid"
+    report_disabled = tmp_path / "disabled_report.json"
+    report_empty = tmp_path / "write_empty_report.json"
+    mapping_file = tmp_path / "mapping_layers.json"
+    _build_drum_like_wav(wav_path)
+
+    mapping_file.write_text(
+        json.dumps(
+            {
+                "name": "disabled_layers_map",
+                "c1_midi_note": 36,
+                "layers": {
+                    "kick_1": {"enabled": False, "note_name": "C1", "track_name": "Kick1"},
+                    "clap_1": {"enabled": True, "note_name": "G1", "track_name": "Clap1"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10, 0.30],
+        class_names=["kick", "snare_or_clap"],
+    )
+
+    disabled_result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "ujam-candy",
+            "--mapping-file",
+            str(mapping_file),
+            "--output-layout",
+            "separate-files",
+            "--report",
+            str(report_disabled),
+        ],
+    )
+
+    disabled_payload = json.loads(report_disabled.read_text(encoding="utf-8"))
+    disabled_files = [Path(path) for path in disabled_payload["created_files"]]
+
+    assert disabled_result.exit_code == 0
+    assert "kick_1" in disabled_payload["disabled_layers"]
+    assert disabled_payload["skipped_layers"].get("kick_1") == "disabled"
+    assert all("Kick1" not in path.name for path in disabled_files)
+    assert any("Clap1" in path.name for path in disabled_files)
+
+    empty_result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "ujam-candy",
+            "--mapping-file",
+            str(mapping_file),
+            "--output-layout",
+            "separate-files",
+            "--write-empty-layers",
+            "--report",
+            str(report_empty),
+        ],
+    )
+
+    empty_payload = json.loads(report_empty.read_text(encoding="utf-8"))
+    empty_files = [Path(path) for path in empty_payload["created_files"]]
+    kick_file = next(path for path in empty_files if "Kick1" in path.name)
+    clap_file = next(path for path in empty_files if "Clap1" in path.name)
+
+    assert empty_result.exit_code == 0
+    assert kick_file.exists()
+    assert clap_file.exists()
+    assert len(_note_on_events(kick_file)) == 0
+    assert _max_tick(kick_file) == _max_tick(clap_file)

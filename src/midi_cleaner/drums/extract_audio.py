@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -18,6 +19,15 @@ from midi_cleaner.midi.drum_maps import (
     load_preset_drum_map,
     resolve_ujam_candy_layout_notes,
 )
+from midi_cleaner.drums.layer_mapping import (
+    DrumLayerMapping,
+    DrumLayerMappingError,
+    build_default_layer_mapping,
+    duplicate_target_notes,
+    load_layer_mapping,
+    ordered_layers,
+    save_layer_mapping,
+)
 
 DrumClass = Literal[
     "kick",
@@ -31,7 +41,7 @@ DrumClass = Literal[
 SnareTarget = Literal["sn1", "sn2", "clap"]
 ExtractionProfile = Literal["conservative", "balanced", "sensitive"]
 DetectionMode = Literal["global", "multi-detector"]
-OutputLayout = Literal["multitrack", "single-track"]
+OutputLayout = Literal["separate-files", "multitrack", "single-track"]
 DetectorName = Literal["global", "kick", "snare", "hat", "cymbal", "tom"]
 LayerName = Literal["kick", "snare_clap", "hat", "tom_perc", "cymbal", "unknown"]
 
@@ -169,9 +179,13 @@ class AudioDrumExtractionError(Exception):
 
 @dataclass(frozen=True)
 class AudioDrumExtractionParameters:
-    output_file: Path
+    output_file: Path | None
     target_map: str
     map_file: Path | None = None
+    output_dir: Path | None = None
+    mapping_file: Path | None = None
+    save_mapping_file: Path | None = None
+    write_empty_layers: bool = False
     c1_midi_note: int = 36
     bpm: float | None = None
     channel: int = 9
@@ -184,7 +198,7 @@ class AudioDrumExtractionParameters:
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT
     profile: ExtractionProfile = "balanced"
     detection_mode: DetectionMode = "multi-detector"
-    output_layout: OutputLayout = "multitrack"
+    output_layout: OutputLayout = "separate-files"
     min_class_confidence: float | None = None
     emit_unknown: bool = False
     unknown_target_note: int | None = None
@@ -226,7 +240,12 @@ class PerHitSummary:
     detection_mode: str
     detector_name: str
     layer_name: str
+    semantic_layer: str
     target_track_name: str
+    target_note_name: str
+    output_file: str | None
+    mapping_name: str | None
+    primary_slot_assignment: bool
     candidate_class: str
     accepted_class: str | None
     class_confidence: float
@@ -258,7 +277,15 @@ class AudioDrumExtractionReport:
     bpm_source: Literal["detected", "forced"]
     detection_mode: DetectionMode
     output_layout: OutputLayout
+    output_dir: str | None
+    mapping_file: str | None
+    mapping_name: str
     track_order: list[str]
+    created_files: list[str]
+    skipped_layers: dict[str, str]
+    disabled_layers: list[str]
+    write_empty_layers: bool
+    duplicate_target_notes: dict[str, list[str]]
     onset_count: int
     raw_onset_count: int
     accepted_onset_count: int
@@ -271,7 +298,14 @@ class AudioDrumExtractionReport:
     output_note_counts: dict[str, int]
     output_pitch_counts: dict[str, int]
     layer_counts: dict[str, int]
+    layer_target_notes: dict[str, int]
+    layer_target_note_names: dict[str, str]
+    layer_track_names: dict[str, str]
     layer_output_pitch_counts: dict[str, dict[str, int]]
+    populated_semantic_layers: list[str]
+    unpopulated_enabled_layers: list[str]
+    unpopulated_disabled_layers: list[str]
+    primary_slot_assignment_used: bool
     cross_layer_simultaneous_hit_count: int
     same_layer_suppressed_count: int
     cross_layer_suppressed_count: int
@@ -317,7 +351,12 @@ class AudioDrumExtractionReport:
                 "detection_mode": item.detection_mode,
                 "detector_name": item.detector_name,
                 "layer_name": item.layer_name,
+                "semantic_layer": item.semantic_layer,
                 "target_track_name": item.target_track_name,
+                "target_note_name": item.target_note_name,
+                "output_file": item.output_file,
+                "mapping_name": item.mapping_name,
+                "primary_slot_assignment": item.primary_slot_assignment,
                 "candidate_class": item.candidate_class,
                 "accepted_class": item.accepted_class,
                 "class_confidence": item.class_confidence,
@@ -402,7 +441,12 @@ class _DetectedHit:
     detection_mode: DetectionMode
     detector_name: DetectorName
     layer_name: LayerName
+    semantic_layer: str
     target_track_name: str
+    target_note_name: str
+    output_file: str | None
+    mapping_name: str | None
+    primary_slot_assignment: bool
     candidate_class: DrumClass
     accepted_class: DrumClass | None
     class_confidence: float
@@ -837,6 +881,134 @@ def _layer_sort_key(layer_name: str) -> int:
     return len(_LAYER_ORDER)
 
 
+def _semantic_slot_for_hit(hit: _DetectedHit, *, snare_target: SnareTarget) -> str | None:
+    canonical = _canonical_class(hit.class_name)
+    if canonical == "kick":
+        return "kick_1"
+
+    if canonical == "snare_or_clap":
+        if snare_target == "clap":
+            return "clap_1"
+        if hit.high_peak_strength >= 0.65 and hit.attack_score >= 0.58 and hit.decay_score <= 0.60:
+            return "clap_1"
+        return "snare_1"
+
+    if canonical == "hat":
+        if hit.decay_score >= 0.62 and hit.high_peak_strength >= 0.30:
+            return "hh_open_1"
+        return "hh_1"
+
+    if canonical == "cymbal":
+        return "cym_1"
+
+    if canonical == "tom_or_perc":
+        if hit.high_peak_strength >= 0.82:
+            return "perc_1"
+        if hit.spectral_centroid < 600.0 or hit.low_peak_strength > (hit.mid_peak_strength * 1.35):
+            return "tom_l_1"
+        if hit.spectral_centroid < 1400.0 and hit.mid_peak_strength > 0.90:
+            return "tom_m_1"
+        if hit.spectral_centroid < 3000.0 and hit.mid_peak_strength > 1.10:
+            return "tom_h_1"
+        return "tom_l_1"
+
+    return None
+
+
+def _resolve_layer_mapping(
+    params: AudioDrumExtractionParameters,
+) -> tuple[DrumLayerMapping, dict[str, list[str]], list[str]]:
+    mapping_warnings: list[str] = []
+    if params.mapping_file is not None:
+        try:
+            mapping = load_layer_mapping(
+                params.mapping_file,
+                fallback_c1_midi_note=params.c1_midi_note,
+            )
+        except DrumLayerMappingError as exc:
+            raise AudioDrumExtractionError(str(exc)) from exc
+    else:
+        mapping = build_default_layer_mapping(
+            target_map=params.target_map,
+            c1_midi_note=params.c1_midi_note,
+            name=f"{params.target_map}_expanded_default_mapping",
+        )
+        mapping_warnings.append(
+            "No mapping file was supplied; using expanded default semantic layer mapping."
+        )
+
+    if params.save_mapping_file is not None:
+        save_layer_mapping(mapping, params.save_mapping_file)
+
+    duplicate_notes = duplicate_target_notes(mapping)
+    if duplicate_notes:
+        mapping_warnings.append(
+            "Enabled semantic layers map to duplicate target notes; review duplicate_target_notes in report."
+        )
+
+    return mapping, duplicate_notes, mapping_warnings
+
+
+def _resolve_output_target(
+    params: AudioDrumExtractionParameters,
+    wav_file: Path,
+) -> tuple[Path, Path]:
+    default_output = wav_file.with_suffix(".mid")
+    output_file = params.output_file if params.output_file is not None else default_output
+
+    if params.output_dir is not None:
+        output_dir = params.output_dir
+    elif params.output_layout == "separate-files":
+        output_dir = output_file.parent
+    else:
+        output_dir = output_file.parent
+
+    return output_file, output_dir
+
+
+def _sanitize_file_token(value: str) -> str:
+    compact = re.sub(r"[^A-Za-z0-9]+", "", value.strip())
+    return compact or "Layer"
+
+
+def _slot_to_class_for_duration(slot_name: str) -> DrumClass:
+    family = slot_name.rsplit("_", 1)[0]
+    if family == "kick":
+        return "kick"
+    if family in {"snare", "clap"}:
+        return "snare_or_clap"
+    if family in {"hh", "hh_open"}:
+        return "hat"
+    if family in {"tom_l", "tom_m", "tom_h", "perc"}:
+        return "tom_or_perc"
+    if family == "cym":
+        return "cymbal"
+    return "unknown"
+
+
+def _slot_export_file_name(index: int, track_name: str, note_name: str) -> str:
+    return f"{index:02d}_{_sanitize_file_token(track_name)}_{_sanitize_file_token(note_name)}.mid"
+
+
+def _layer_statistics(
+    mapping: DrumLayerMapping,
+    layer_hits: dict[str, list[DrumLayerHit]],
+) -> tuple[list[str], list[str], list[str]]:
+    populated = sorted([layer for layer, hits in layer_hits.items() if len(hits) > 0])
+
+    unpopulated_enabled: list[str] = []
+    unpopulated_disabled: list[str] = []
+    for layer_name, slot in mapping.layers.items():
+        if layer_hits.get(layer_name):
+            continue
+        if slot.enabled:
+            unpopulated_enabled.append(layer_name)
+        else:
+            unpopulated_disabled.append(layer_name)
+
+    return populated, sorted(unpopulated_enabled), sorted(unpopulated_disabled)
+
+
 def _hit_to_tick(onset_sec: float, ticks_per_second: float) -> int:
     return max(0, int(round(onset_sec * ticks_per_second)))
 
@@ -901,8 +1073,16 @@ def _validate_params(params: AudioDrumExtractionParameters) -> None:
     if params.detection_mode not in {"global", "multi-detector"}:
         raise AudioDrumExtractionError("--detection-mode must be one of: global, multi-detector.")
 
-    if params.output_layout not in {"multitrack", "single-track"}:
-        raise AudioDrumExtractionError("--output-layout must be one of: multitrack, single-track.")
+    if params.output_layout not in {"separate-files", "multitrack", "single-track"}:
+        raise AudioDrumExtractionError(
+            "--output-layout must be one of: separate-files, multitrack, single-track."
+        )
+
+    if params.mapping_file is not None and params.mapping_file.suffix.lower() != ".json":
+        raise AudioDrumExtractionError("--mapping-file must point to a .json file.")
+
+    if params.save_mapping_file is not None and params.save_mapping_file.suffix.lower() != ".json":
+        raise AudioDrumExtractionError("--save-mapping-file must point to a .json file.")
 
     if params.unknown_target_note is not None and (params.unknown_target_note < 0 or params.unknown_target_note > 127):
         raise AudioDrumExtractionError("--unknown-target-note must be in range 0..127.")
@@ -1209,7 +1389,12 @@ def _candidate_to_hit(
         detection_mode=detection_mode,
         detector_name=candidate.detector_name,
         layer_name=layer_name,
+        semantic_layer="",
         target_track_name=_track_name_from_layer(layer_name),
+        target_note_name="",
+        output_file=None,
+        mapping_name=None,
+        primary_slot_assignment=True,
         candidate_class=class_name,
         accepted_class=class_name,
         class_confidence=float(candidate.confidence),
@@ -1463,19 +1648,45 @@ def _assign_output_velocities(hits: list[_DetectedHit]) -> None:
         hit.velocity = max(1, min(127, velocity))
 
 
-def _to_layered_hits(hits: list[_DetectedHit]) -> dict[str, list[DrumLayerHit]]:
-    layered_hits: dict[str, list[DrumLayerHit]] = {layer: [] for layer in _LAYER_ORDER}
-    for hit in sorted(hits, key=lambda item: item.onset_sec):
-        layer_name = str(hit.layer_name)
-        if layer_name not in _LAYER_ORDER:
-            layer_name = "tom_perc"
+def _to_layered_hits(
+    hits: list[_DetectedHit],
+    *,
+    mapping: DrumLayerMapping,
+    snare_target: SnareTarget,
+    warnings: list[str],
+) -> dict[str, list[DrumLayerHit]]:
+    layered_hits: dict[str, list[DrumLayerHit]] = {
+        layer_name: [] for layer_name in ordered_layers(mapping)
+    }
+    warned_missing_layers: set[str] = set()
 
-        layered_hits[layer_name].append(
+    for hit in sorted(hits, key=lambda item: item.onset_sec):
+        semantic_layer = _semantic_slot_for_hit(hit, snare_target=snare_target)
+        if semantic_layer is None:
+            continue
+
+        slot = mapping.layers.get(semantic_layer)
+        if slot is None:
+            if semantic_layer not in warned_missing_layers:
+                warnings.append(
+                    f"Detected semantic layer '{semantic_layer}' is not present in mapping and was skipped."
+                )
+                warned_missing_layers.add(semantic_layer)
+            continue
+
+        hit.semantic_layer = semantic_layer
+        hit.primary_slot_assignment = True
+        hit.target_note = int(slot.note)
+        hit.target_note_name = str(slot.note_name)
+        hit.target_track_name = str(slot.track_name)
+        hit.mapping_name = mapping.name
+
+        layered_hits.setdefault(semantic_layer, []).append(
             DrumLayerHit(
                 onset_sec=float(hit.onset_sec),
                 tick=int(hit.tick),
-                instrument=layer_name,
-                target_note=int(hit.target_note),
+                instrument=semantic_layer,
+                target_note=int(slot.note),
                 velocity=int(hit.velocity),
                 confidence=float(hit.class_confidence),
                 detector_name=str(hit.detector_name),
@@ -1493,7 +1704,7 @@ def _to_layered_hits(hits: list[_DetectedHit]) -> dict[str, list[DrumLayerHit]]:
 
 
 def _layer_duration_sec(layer_name: str) -> float:
-    mapped_class = _LAYER_TO_CLASS.get(layer_name, "tom_or_perc")
+    mapped_class = _slot_to_class_for_duration(layer_name)
     return float(_CLASS_NOTE_DURATIONS_SEC.get(mapped_class, 0.10))
 
 
@@ -1545,9 +1756,20 @@ def _layer_absolute_events(
     return absolute_events
 
 
+def _flatten_layer_hits(
+    layered_hits: dict[str, list[DrumLayerHit]],
+    layer_order: list[str],
+) -> list[DrumLayerHit]:
+    flattened: list[DrumLayerHit] = []
+    for layer_name in layer_order:
+        flattened.extend(layered_hits.get(layer_name, []))
+    return sorted(flattened, key=lambda item: (item.onset_sec, item.target_note))
+
+
 def _build_single_track_midi(
     *,
-    hits: list[_DetectedHit],
+    layered_hits: dict[str, list[DrumLayerHit]],
+    layer_order: list[str],
     output_path: Path,
     ticks_per_beat: int,
     bpm_used: float,
@@ -1566,19 +1788,7 @@ def _build_single_track_midi(
     track.append(mido.MetaMessage("track_name", name=track_name, time=0))
     track.append(mido.MetaMessage("set_tempo", tempo=tempo_us_per_beat, time=0))
 
-    layer_hits = [
-        DrumLayerHit(
-            onset_sec=float(hit.onset_sec),
-            tick=int(hit.tick),
-            instrument=str(hit.layer_name),
-            target_note=int(hit.target_note),
-            velocity=int(hit.velocity),
-            confidence=float(hit.class_confidence),
-            detector_name=str(hit.detector_name),
-            evidence={},
-        )
-        for hit in hits
-    ]
+    layer_hits = _flatten_layer_hits(layered_hits, layer_order)
     absolute_events = _layer_absolute_events(
         layer_hits=layer_hits,
         ticks_per_second=ticks_per_second,
@@ -1603,6 +1813,8 @@ def _build_single_track_midi(
 def _build_multitrack_midi(
     *,
     layered_hits: dict[str, list[DrumLayerHit]],
+    layer_order: list[str],
+    mapping: DrumLayerMapping,
     output_path: Path,
     ticks_per_beat: int,
     bpm_used: float,
@@ -1617,8 +1829,9 @@ def _build_multitrack_midi(
     output_tracks: list[str] = []
     final_tick = source_length_ticks
 
-    for layer_name in _LAYER_ORDER:
-        track_name = _track_name_from_layer(layer_name)
+    for layer_name in layer_order:
+        slot = mapping.layers[layer_name]
+        track_name = slot.track_name
         output_tracks.append(track_name)
 
         track = mido.MidiTrack()
@@ -1646,21 +1859,97 @@ def _build_multitrack_midi(
     return source_length_ticks, max(final_tick, source_length_ticks), output_tracks
 
 
-def _build_midi(
-    hits: list[_DetectedHit],
+def _select_export_layers(
+    *,
+    mapping: DrumLayerMapping,
+    layered_hits: dict[str, list[DrumLayerHit]],
+    write_empty_layers: bool,
+) -> tuple[list[str], list[str], dict[str, str]]:
+    selected_layers: list[str] = []
+    disabled_layers: list[str] = []
+    skipped_layers: dict[str, str] = {}
+
+    for layer_name in ordered_layers(mapping):
+        slot = mapping.layers[layer_name]
+        hit_count = len(layered_hits.get(layer_name, []))
+
+        if not slot.enabled:
+            disabled_layers.append(layer_name)
+            if write_empty_layers:
+                selected_layers.append(layer_name)
+            else:
+                skipped_layers[layer_name] = "disabled"
+            continue
+
+        if hit_count == 0 and not write_empty_layers:
+            skipped_layers[layer_name] = "empty"
+            continue
+
+        selected_layers.append(layer_name)
+
+    return selected_layers, sorted(disabled_layers), skipped_layers
+
+
+def _build_separate_files_midi(
     *,
     layered_hits: dict[str, list[DrumLayerHit]],
+    layer_order: list[str],
+    mapping: DrumLayerMapping,
+    output_dir: Path,
+    ticks_per_beat: int,
+    bpm_used: float,
+    duration_sec: float,
+    channel: int,
+) -> tuple[int, int, list[str], list[Path], dict[str, Path]]:
+    created_files: list[Path] = []
+    tracks: list[str] = []
+    source_length_ticks = 0
+    output_length_ticks = 0
+    by_layer_output: dict[str, Path] = {}
+
+    for index, layer_name in enumerate(layer_order, start=1):
+        slot = mapping.layers[layer_name]
+        layer_file = output_dir / _slot_export_file_name(index, slot.track_name, slot.note_name)
+        layer_track_name = slot.track_name
+        layer_hits_only = {layer_name: layered_hits.get(layer_name, [])}
+
+        src_ticks, out_ticks, _tracks = _build_single_track_midi(
+            layered_hits=layer_hits_only,
+            layer_order=[layer_name],
+            output_path=layer_file,
+            ticks_per_beat=ticks_per_beat,
+            bpm_used=bpm_used,
+            duration_sec=duration_sec,
+            channel=channel,
+            track_name=layer_track_name,
+        )
+        source_length_ticks = max(source_length_ticks, src_ticks)
+        output_length_ticks = max(output_length_ticks, out_ticks)
+        created_files.append(layer_file)
+        tracks.append(layer_track_name)
+        by_layer_output[layer_name] = layer_file
+
+    return source_length_ticks, output_length_ticks, tracks, created_files, by_layer_output
+
+
+def _build_midi(
+    *,
+    layered_hits: dict[str, list[DrumLayerHit]],
+    layer_order: list[str],
+    mapping: DrumLayerMapping,
     output_layout: OutputLayout,
     output_path: Path,
+    output_dir: Path,
     ticks_per_beat: int,
     bpm_used: float,
     duration_sec: float,
     channel: int,
     track_name: str,
-) -> tuple[int, int, list[str]]:
+) -> tuple[int, int, list[str], list[Path], dict[str, Path]]:
     if output_layout == "single-track":
-        return _build_single_track_midi(
-            hits=hits,
+        src, out, tracks = _build_single_track_midi(
+            layered_hits=layered_hits,
+            layer_order=layer_order,
             output_path=output_path,
             ticks_per_beat=ticks_per_beat,
             bpm_used=bpm_used,
@@ -1668,10 +1957,26 @@ def _build_midi(
             channel=channel,
             track_name=track_name,
         )
+        return src, out, tracks, [output_path], {}
 
-    return _build_multitrack_midi(
+    if output_layout == "multitrack":
+        src, out, tracks = _build_multitrack_midi(
+            layered_hits=layered_hits,
+            layer_order=layer_order,
+            mapping=mapping,
+            output_path=output_path,
+            ticks_per_beat=ticks_per_beat,
+            bpm_used=bpm_used,
+            duration_sec=duration_sec,
+            channel=channel,
+        )
+        return src, out, tracks, [output_path], {}
+
+    return _build_separate_files_midi(
         layered_hits=layered_hits,
-        output_path=output_path,
+        layer_order=layer_order,
+        mapping=mapping,
+        output_dir=output_dir,
         ticks_per_beat=ticks_per_beat,
         bpm_used=bpm_used,
         duration_sec=duration_sec,
@@ -1680,14 +1985,14 @@ def _build_midi(
 
 
 def _count_layer_hits(layered_hits: dict[str, list[DrumLayerHit]]) -> dict[str, int]:
-    return {layer: len(layered_hits.get(layer, [])) for layer in _LAYER_ORDER}
+    return {layer: len(hits) for layer, hits in layered_hits.items()}
 
 
 def _count_layer_output_pitch_counts(
     layered_hits: dict[str, list[DrumLayerHit]],
 ) -> dict[str, dict[str, int]]:
     summary: dict[str, dict[str, int]] = {}
-    for layer in _LAYER_ORDER:
+    for layer in sorted(layered_hits):
         notes: dict[str, int] = {}
         for hit in layered_hits.get(layer, []):
             note = str(int(hit.target_note))
@@ -1849,7 +2154,12 @@ def _to_per_hit_summary(hits: list[_DetectedHit]) -> list[PerHitSummary]:
             detection_mode=hit.detection_mode,
             detector_name=hit.detector_name,
             layer_name=hit.layer_name,
+            semantic_layer=hit.semantic_layer,
             target_track_name=hit.target_track_name,
+            target_note_name=hit.target_note_name,
+            output_file=hit.output_file,
+            mapping_name=hit.mapping_name,
+            primary_slot_assignment=bool(hit.primary_slot_assignment),
             candidate_class=hit.candidate_class,
             accepted_class=hit.accepted_class,
             class_confidence=float(hit.class_confidence),
@@ -1901,8 +2211,11 @@ def _write_debug_csv(path: Path, hits: list[_DetectedHit]) -> None:
                 "onset_strength",
                 "detection_mode",
                 "detector_name",
+                "detector_family",
                 "layer_name",
+                "semantic_layer",
                 "target_track_name",
+                "target_note_name",
                 "candidate_class",
                 "accepted_class",
                 "class_confidence",
@@ -1921,6 +2234,9 @@ def _write_debug_csv(path: Path, hits: list[_DetectedHit]) -> None:
                 "attack_score",
                 "decay_score",
                 "band_dominance_score",
+                "mapping_name",
+                "primary_slot_assignment",
+                "output_file",
             ],
         )
         writer.writeheader()
@@ -1947,8 +2263,11 @@ def _write_debug_csv(path: Path, hits: list[_DetectedHit]) -> None:
                     "spectral_centroid": hit.spectral_centroid,
                     "detection_mode": hit.detection_mode,
                     "detector_name": hit.detector_name,
+                    "detector_family": hit.detector_name,
                     "layer_name": hit.layer_name,
+                    "semantic_layer": hit.semantic_layer,
                     "target_track_name": hit.target_track_name,
+                    "target_note_name": hit.target_note_name,
                     "candidate_class": hit.candidate_class,
                     "accepted_class": hit.accepted_class,
                     "class_confidence": hit.class_confidence,
@@ -1967,6 +2286,9 @@ def _write_debug_csv(path: Path, hits: list[_DetectedHit]) -> None:
                     "attack_score": hit.attack_score,
                     "decay_score": hit.decay_score,
                     "band_dominance_score": hit.band_dominance_score,
+                    "mapping_name": hit.mapping_name,
+                    "primary_slot_assignment": str(hit.primary_slot_assignment).lower(),
+                    "output_file": hit.output_file,
                 }
             )
 
@@ -1990,9 +2312,13 @@ def extract_drums_from_audio(
     mono = _ensure_mono(np.asarray(audio))
     duration_sec = float(len(mono) / sample_rate) if sample_rate > 0 else 0.0
 
+    output_file, output_dir = _resolve_output_target(params, wav_file)
+
     map_definition = _resolve_target_map_definition(params)
     class_targets = _resolve_class_targets(map_definition, params)
     settings = _resolve_profile_settings(params)
+
+    layer_mapping, duplicate_target_notes_by_note, mapping_warnings = _resolve_layer_mapping(params)
 
     envelopes, _frame_size, hop_size = _onset_strength_envelopes(mono, sample_rate)
 
@@ -2032,6 +2358,11 @@ def extract_drums_from_audio(
     ticks_per_second = (params.ticks_per_beat * bpm_used) / 60.0
 
     warnings: list[str] = []
+    warnings.extend(mapping_warnings)
+    if params.mapping_file is not None and layer_mapping.c1_midi_note != params.c1_midi_note:
+        warnings.append(
+            "Mapping c1_midi_note differs from CLI --c1-midi-note; mapping-local value is used for note-name conversion."
+        )
     if detected_bpm is None:
         warnings.append("Could not confidently estimate BPM from onsets; defaulted to stable fallback.")
     if len(candidates) == 0:
@@ -2195,7 +2526,41 @@ def extract_drums_from_audio(
             _increment_counter(detector_rejected_counts, hit.detector_name)
 
     _assign_output_velocities(emitted_hits)
-    layered_hits = _to_layered_hits(emitted_hits)
+    layered_hits = _to_layered_hits(
+        emitted_hits,
+        mapping=layer_mapping,
+        snare_target=params.snare_target,
+        warnings=warnings,
+    )
+
+    selected_layers, disabled_layers, skipped_layers = _select_export_layers(
+        mapping=layer_mapping,
+        layered_hits=layered_hits,
+        write_empty_layers=params.write_empty_layers,
+    )
+
+    effective_output_layout: OutputLayout = (
+        "separate-files" if params.separate_files else params.output_layout
+    )
+    if params.separate_files and params.output_layout != "separate-files":
+        warnings.append("--separate-files is deprecated; using output layout 'separate-files'.")
+
+    if effective_output_layout in {"single-track", "multitrack"} and not selected_layers:
+        ordered = ordered_layers(layer_mapping)
+        if ordered:
+            selected_layers = [ordered[0]]
+            skipped_layers.pop(ordered[0], None)
+            warnings.append(
+                "No populated enabled semantic layer was selected for export; wrote synchronized empty container MIDI."
+            )
+
+    export_layered_hits: dict[str, list[DrumLayerHit]] = {}
+    for layer_name in selected_layers:
+        slot = layer_mapping.layers[layer_name]
+        if slot.enabled:
+            export_layered_hits[layer_name] = list(layered_hits.get(layer_name, []))
+        else:
+            export_layered_hits[layer_name] = []
 
     suppressed_duplicate_count = int(sum(duplicate_suppressed_by_class.values()))
     same_layer_suppressed_count = int(
@@ -2214,6 +2579,10 @@ def extract_drums_from_audio(
     class_counts = _count_classes(emitted_hits)
     layer_counts = _count_layer_hits(layered_hits)
     layer_output_pitch_counts = _count_layer_output_pitch_counts(layered_hits)
+    populated_semantic_layers, unpopulated_enabled_layers, unpopulated_disabled_layers = _layer_statistics(
+        layer_mapping,
+        layered_hits,
+    )
     duplicate_interval_summary = _duplicate_interval_summary(emitted_hits, class_refractory_ms)
     too_dense_warning, density_warnings = _evaluate_density_warnings(
         duration_sec=duration_sec,
@@ -2230,20 +2599,23 @@ def extract_drums_from_audio(
     if not params.emit_unknown:
         warnings.append("Unknown hits are skipped by default; use --emit-unknown to include them.")
 
-    if params.debug_csv is not None:
-        _write_debug_csv(params.debug_csv, sorted(raw_hits, key=lambda item: item.onset_sec))
+    output_tracks_created: list[str] = [layer_mapping.layers[layer].track_name for layer in selected_layers]
+    created_files: list[Path] = []
+    layer_output_files: dict[str, Path] = {}
 
-    output_file = params.output_file
     synchronization_preserved = True
-    output_tracks_created = [_track_name_from_layer(layer) for layer in _LAYER_ORDER]
+    if effective_output_layout == "separate-files":
+        output_tracks_created = [layer_mapping.layers[layer].track_name for layer in selected_layers]
 
     if not params.dry_run:
         track_name = f"drums_from_audio_{params.target_map.replace('-', '_')}"
-        source_length_ticks, output_length_ticks, output_tracks_created = _build_midi(
-            emitted_hits,
-            layered_hits=layered_hits,
-            output_layout=params.output_layout,
+        source_length_ticks, output_length_ticks, output_tracks_created, created_files, layer_output_files = _build_midi(
+            layered_hits=export_layered_hits,
+            layer_order=selected_layers,
+            mapping=layer_mapping,
+            output_layout=effective_output_layout,
             output_path=output_file,
+            output_dir=output_dir,
             ticks_per_beat=params.ticks_per_beat,
             bpm_used=bpm_used,
             duration_sec=duration_sec,
@@ -2252,57 +2624,77 @@ def extract_drums_from_audio(
         )
         synchronization_preserved = source_length_ticks == output_length_ticks
 
-        if params.separate_files:
-            by_class: dict[str, list[_DetectedHit]] = {
-                "kick": [],
-                "snare_or_clap": [],
-                "hat": [],
-                "cymbal": [],
-                "tom_or_perc": [],
-            }
+        if effective_output_layout == "separate-files":
             for hit in emitted_hits:
-                bucket = _canonical_class(hit.class_name)
-                if bucket == "unknown":
-                    bucket = "tom_or_perc"
-                by_class[bucket].append(hit)
-
-            for class_name, file_name in _CLASS_FILE_NAMES.items():
-                class_track_name = f"drums_from_audio_{params.target_map.replace('-', '_')}_{class_name}"
-                class_output = output_file.parent / file_name
-                class_source_ticks, class_output_ticks, _class_tracks = _build_single_track_midi(
-                    hits=by_class[class_name],
-                    output_path=class_output,
-                    ticks_per_beat=params.ticks_per_beat,
-                    bpm_used=bpm_used,
-                    duration_sec=duration_sec,
-                    channel=params.channel,
-                    track_name=class_track_name,
-                )
-                synchronization_preserved = (
-                    synchronization_preserved
-                    and class_source_ticks == source_length_ticks
-                    and class_output_ticks == output_length_ticks
-                )
+                if hit.semantic_layer in layer_output_files:
+                    hit.output_file = str(layer_output_files[hit.semantic_layer])
+        else:
+            for hit in emitted_hits:
+                if hit.semantic_layer in selected_layers:
+                    hit.output_file = str(output_file)
     else:
         ticks_per_second = (params.ticks_per_beat * bpm_used) / 60.0
         source_length_ticks = max(0, int(round(duration_sec * ticks_per_second)))
         output_length_ticks = source_length_ticks
         synchronization_preserved = source_length_ticks == output_length_ticks
 
+    exported_hits: list[_DetectedHit] = [
+        hit
+        for hit in emitted_hits
+        if hit.semantic_layer in export_layered_hits
+        and hit.semantic_layer in layer_mapping.layers
+        and layer_mapping.layers[hit.semantic_layer].enabled
+    ]
+
+    if params.debug_csv is not None:
+        _write_debug_csv(params.debug_csv, sorted(raw_hits, key=lambda item: item.onset_sec))
+
     safe_duration = max(duration_sec, 1e-9)
     notes_per_second = float(sum(class_counts.values()) / safe_duration)
 
+    ordered_layer_names = ordered_layers(layer_mapping)
+    layer_target_notes = {
+        layer: int(layer_mapping.layers[layer].note)
+        for layer in ordered_layer_names
+    }
+    layer_target_note_names = {
+        layer: str(layer_mapping.layers[layer].note_name)
+        for layer in ordered_layer_names
+    }
+    layer_track_names = {
+        layer: str(layer_mapping.layers[layer].track_name)
+        for layer in ordered_layer_names
+    }
+    primary_slot_assignment_used = all(
+        (not hit.semantic_layer) or hit.semantic_layer.endswith("_1")
+        for hit in emitted_hits
+    )
+    if primary_slot_assignment_used:
+        warnings.append("Primary slot assignment used: detector populated only primary semantic slots.")
+
     report = AudioDrumExtractionReport(
         wav_file=str(wav_file),
-        output_file=None if params.dry_run else str(output_file),
+        output_file=(
+            None
+            if params.dry_run or effective_output_layout == "separate-files"
+            else str(output_file)
+        ),
         duration_sec=float(duration_sec),
         sample_rate=int(sample_rate),
         detected_bpm=float(detected_bpm) if detected_bpm is not None else None,
         bpm_used=float(bpm_used),
         bpm_source=bpm_source,
         detection_mode=params.detection_mode,
-        output_layout=params.output_layout,
-        track_order=[_track_name_from_layer(layer) for layer in _LAYER_ORDER],
+        output_layout=effective_output_layout,
+        output_dir=str(output_dir),
+        mapping_file=(None if params.mapping_file is None else str(params.mapping_file)),
+        mapping_name=layer_mapping.name,
+        track_order=output_tracks_created,
+        created_files=[str(path) for path in created_files],
+        skipped_layers=dict(sorted(skipped_layers.items())),
+        disabled_layers=disabled_layers,
+        write_empty_layers=bool(params.write_empty_layers),
+        duplicate_target_notes=duplicate_target_notes_by_note,
         onset_count=len(raw_onset_times),
         raw_onset_count=len(raw_hits),
         accepted_onset_count=len(emitted_hits),
@@ -2318,10 +2710,17 @@ def extract_drums_from_audio(
         },
         same_transient_window_ms=float(settings["same_transient_window_ms"]),
         class_counts=class_counts,
-        output_note_counts=_count_output_notes(emitted_hits),
-        output_pitch_counts=_count_output_notes(emitted_hits),
+        output_note_counts=_count_output_notes(exported_hits),
+        output_pitch_counts=_count_output_notes(exported_hits),
         layer_counts=layer_counts,
+        layer_target_notes=layer_target_notes,
+        layer_target_note_names=layer_target_note_names,
+        layer_track_names=layer_track_names,
         layer_output_pitch_counts=layer_output_pitch_counts,
+        populated_semantic_layers=populated_semantic_layers,
+        unpopulated_enabled_layers=unpopulated_enabled_layers,
+        unpopulated_disabled_layers=unpopulated_disabled_layers,
+        primary_slot_assignment_used=bool(primary_slot_assignment_used),
         cross_layer_simultaneous_hit_count=int(cross_layer_simultaneous_hit_count),
         same_layer_suppressed_count=same_layer_suppressed_count,
         cross_layer_suppressed_count=cross_layer_suppressed_count,
@@ -2337,7 +2736,7 @@ def extract_drums_from_audio(
         rejected_by_reason=rejected_by_reason,
         multi_detector_merge_conflicts=merge_conflicts,
         target_map=map_definition.name,
-        c1_midi_note=int(params.c1_midi_note),
+        c1_midi_note=int(layer_mapping.c1_midi_note),
         synchronization_preserved=bool(synchronization_preserved),
         warnings=warnings,
         per_hit_summary=_to_per_hit_summary(sorted(raw_hits, key=lambda item: item.onset_sec)),

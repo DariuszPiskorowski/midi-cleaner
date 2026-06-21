@@ -106,6 +106,7 @@ class HermesWorkflowService:
 
         params = AudioDrumExtractionParameters(
             output_file=output_file,
+            output_dir=output_file.parent,
             target_map="gm",
             bpm=bpm_override,
             channel=9,
@@ -113,6 +114,8 @@ class HermesWorkflowService:
             profile="conservative",
             dry_run=False,
             separate_files=False,
+            output_layout="separate-files",
+            write_empty_layers=False,
             report_file=report_file,
             snare_target="clap",
         )

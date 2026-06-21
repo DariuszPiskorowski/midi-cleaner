@@ -585,7 +585,12 @@ def midi_set_bpm_command(
 @drums_app.command("extract-from-audio")
 def drums_extract_from_audio_command(
     wav: Path = typer.Option(..., "--wav", help="Path to source drum WAV stem."),
-    output: Path = typer.Option(..., "--output", help="Output MIDI file path."),
+    output: Path | None = typer.Option(None, "--output", help="Output MIDI file path."),
+    output_dir: Path | None = typer.Option(
+        None,
+        "--output-dir",
+        help="Output directory for separate layer files and reports.",
+    ),
     target_map: str = typer.Option(
         ..., "--target-map", help="Target map: gm|sitala|ujam-candy|custom."
     ),
@@ -612,6 +617,21 @@ def drums_extract_from_audio_command(
         "--map-file",
         help="Custom map JSON path (required for --target-map custom).",
     ),
+    mapping_file: Path | None = typer.Option(
+        None,
+        "--mapping-file",
+        help="Editable semantic-layer mapping JSON path.",
+    ),
+    save_mapping_file: Path | None = typer.Option(
+        None,
+        "--save-mapping-file",
+        help="Optional path to save the active semantic-layer mapping JSON.",
+    ),
+    write_empty_layers: bool = typer.Option(
+        False,
+        "--write-empty-layers",
+        help="Write synchronized empty MIDI outputs for unpopulated/disabled layers.",
+    ),
     min_onset_strength: float = typer.Option(
         0.20,
         "--min-onset-strength",
@@ -630,7 +650,7 @@ def drums_extract_from_audio_command(
     output_layout: str = typer.Option(
         "multitrack",
         "--output-layout",
-        help="MIDI output layout: multitrack|single-track.",
+        help="MIDI output layout: separate-files|multitrack|single-track.",
     ),
     min_class_confidence: float | None = typer.Option(
         None,
@@ -744,8 +764,12 @@ def drums_extract_from_audio_command(
 
     params = AudioDrumExtractionParameters(
         output_file=output,
+        output_dir=output_dir,
         target_map=target_map,
         map_file=map_file,
+        mapping_file=mapping_file,
+        save_mapping_file=save_mapping_file,
+        write_empty_layers=write_empty_layers,
         c1_midi_note=c1_midi_note,
         bpm=bpm,
         channel=channel - 1,
@@ -784,13 +808,15 @@ def drums_extract_from_audio_command(
 
     typer.echo(
         "Drum extraction summary: "
-        f"target_map={extraction_report.target_map}, "
-        f"onset_count={extraction_report.onset_count}, "
-        f"bpm_used={extraction_report.bpm_used:.3f}, "
-        f"notes={sum(extraction_report.output_note_counts.values())}, "
-        f"sync={str(extraction_report.synchronization_preserved).lower()}, "
-        f"warnings={len(extraction_report.warnings)}, "
-        f"dry_run={str(dry_run).lower()}"
+        f"output_dir={extraction_report.output_dir}, "
+        f"mapping_name={extraction_report.mapping_name}, "
+        f"output_layout={extraction_report.output_layout}, "
+        f"created_files={len(extraction_report.created_files)}, "
+        f"populated_semantic_layers={','.join(extraction_report.populated_semantic_layers)}, "
+        f"layer_counts={json.dumps(extraction_report.layer_counts, sort_keys=True)}, "
+        f"layer_target_notes={json.dumps(extraction_report.layer_target_notes, sort_keys=True)}, "
+        f"duplicate_target_notes={json.dumps(extraction_report.duplicate_target_notes, sort_keys=True)}, "
+        f"warnings={json.dumps(extraction_report.warnings)}"
     )
 
 
