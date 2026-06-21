@@ -627,6 +627,11 @@ def drums_extract_from_audio_command(
         "--detection-mode",
         help="Detection mode: global|multi-detector.",
     ),
+    output_layout: str = typer.Option(
+        "multitrack",
+        "--output-layout",
+        help="MIDI output layout: multitrack|single-track.",
+    ),
     min_class_confidence: float | None = typer.Option(
         None,
         "--min-class-confidence",
@@ -747,6 +752,7 @@ def drums_extract_from_audio_command(
         min_onset_strength=min_onset_strength,
         profile=profile,
         detection_mode=detection_mode,
+        output_layout=output_layout,
         min_class_confidence=min_class_confidence,
         emit_unknown=emit_unknown,
         unknown_target_note=unknown_target_note,

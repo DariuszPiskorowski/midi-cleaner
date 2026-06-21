@@ -71,6 +71,42 @@ def _note_on_events(midi_path: Path) -> list[tuple[int, int, int, int]]:
     return sorted(events, key=lambda item: (item[0], item[1], item[2]))
 
 
+def _track_name(track: mido.MidiTrack, fallback_index: int) -> str:
+    for message in track:
+        if message.is_meta and message.type == "track_name":
+            return str(message.name)
+    return f"Track{fallback_index}"
+
+
+def _track_note_on_events(midi_path: Path) -> dict[str, list[tuple[int, int, int, int]]]:
+    midi = mido.MidiFile(str(midi_path))
+    by_track: dict[str, list[tuple[int, int, int, int]]] = {}
+    for index, track in enumerate(midi.tracks):
+        name = _track_name(track, index)
+        tick = 0
+        events: list[tuple[int, int, int, int]] = []
+        for message in track:
+            tick += int(message.time)
+            if message.is_meta:
+                continue
+            if message.type == "note_on" and message.velocity > 0:
+                events.append((tick, int(message.note), int(message.channel), int(message.velocity)))
+        by_track[name] = events
+    return by_track
+
+
+def _track_end_ticks(midi_path: Path) -> dict[str, int]:
+    midi = mido.MidiFile(str(midi_path))
+    by_track: dict[str, int] = {}
+    for index, track in enumerate(midi.tracks):
+        name = _track_name(track, index)
+        tick = 0
+        for message in track:
+            tick += int(message.time)
+        by_track[name] = tick
+    return by_track
+
+
 def _max_tick(midi_path: Path) -> int:
     midi = mido.MidiFile(str(midi_path))
     max_tick = 0
@@ -99,10 +135,24 @@ def _patch_detected_hits(
 
     candidate_id = {"value": 0}
 
+    def _detector_for_class(class_name: str) -> str:
+        if class_name == "kick":
+            return "kick"
+        if class_name == "snare_or_clap":
+            return "snare"
+        if class_name == "hat":
+            return "hat"
+        if class_name == "cymbal":
+            return "cymbal"
+        return "tom"
+
     def _build_candidates(detector_name: str) -> list[drums_extract_audio._HitCandidate]:
         candidates: list[drums_extract_audio._HitCandidate] = []
         for idx, onset_sec in enumerate(onset_times):
             class_name = class_names[idx] if idx < len(class_names) else class_names[-1]
+            resolved_detector = (
+                _detector_for_class(class_name) if detector_name == "multi" else detector_name
+            )
             confidence = confidence_values[idx] if idx < len(confidence_values) else confidence_values[-1]
             strength = strengths[idx] if idx < len(strengths) else strengths[-1]
             cid = candidate_id["value"]
@@ -110,7 +160,7 @@ def _patch_detected_hits(
             candidates.append(
                 drums_extract_audio._HitCandidate(
                     candidate_id=cid,
-                    detector_name=detector_name,
+                    detector_name=resolved_detector,
                     onset_sec=float(onset_sec),
                     onset_strength=float(strength),
                     class_name=class_name,
@@ -162,7 +212,7 @@ def _patch_detected_hits(
     monkeypatch.setattr(
         drums_extract_audio,
         "_collect_multidetector_candidates",
-        lambda **kwargs: _build_candidates("kick"),
+        lambda **kwargs: _build_candidates("multi"),
     )
     monkeypatch.setattr(
         drums_extract_audio,
@@ -230,6 +280,7 @@ def test_drums_extract_command_is_registered() -> None:
     assert "--output" in result.stdout
     assert "--target-map" in result.stdout
     assert "--detection-mode" in result.stdout
+    assert "--output-layout" in result.stdout
     assert "--min-class-confidence" in result.stdout
     assert "--emit-unknown" in result.stdout
 
@@ -321,6 +372,116 @@ def test_target_map_ujam_candy_maps_classes_to_expected_notes(
     assert note_numbers == [36, 43, 48, 60, 50]
 
 
+def test_output_layout_multitrack_creates_named_ordered_layer_tracks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "layout_multitrack.mid"
+    report_path = tmp_path / "layout_multitrack_report.json"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10, 0.20, 0.30, 0.40, 0.50],
+        class_names=["kick", "snare_or_clap", "hat", "tom_or_perc", "cymbal"],
+        onset_strengths=[0.80, 0.78, 0.76, 0.74, 0.82],
+        confidences=[0.90, 0.88, 0.86, 0.84, 0.91],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "ujam-candy",
+            "--c1-midi-note",
+            "36",
+            "--detection-mode",
+            "multi-detector",
+            "--output-layout",
+            "multitrack",
+            "--bpm",
+            "120",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    midi = mido.MidiFile(str(output_midi))
+    track_names = [_track_name(track, idx) for idx, track in enumerate(midi.tracks)]
+    by_track = _track_note_on_events(output_midi)
+    end_ticks = _track_end_ticks(output_midi)
+
+    assert result.exit_code == 0
+    assert midi.type == 1
+    assert track_names == ["Kick", "SnareClap", "Hat", "TomPerc", "Cymbal"]
+    assert [note for _tick, note, _channel, _velocity in by_track["Kick"]] == [36]
+    assert [note for _tick, note, _channel, _velocity in by_track["SnareClap"]] == [43]
+    assert [note for _tick, note, _channel, _velocity in by_track["Hat"]] == [48]
+    assert [note for _tick, note, _channel, _velocity in by_track["TomPerc"]] == [50]
+    assert [note for _tick, note, _channel, _velocity in by_track["Cymbal"]] == [60]
+    assert len(set(end_ticks.values())) == 1
+    assert payload["output_layout"] == "multitrack"
+    assert payload["track_order"] == ["Kick", "SnareClap", "Hat", "TomPerc", "Cymbal"]
+
+
+def test_output_layout_single_track_remains_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "layout_single_track.mid"
+    report_path = tmp_path / "layout_single_track_report.json"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10, 0.20],
+        class_names=["kick", "snare_or_clap"],
+        onset_strengths=[0.79, 0.77],
+        confidences=[0.90, 0.88],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "ujam-candy",
+            "--c1-midi-note",
+            "36",
+            "--detection-mode",
+            "multi-detector",
+            "--output-layout",
+            "single-track",
+            "--bpm",
+            "120",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    midi = mido.MidiFile(str(output_midi))
+
+    assert result.exit_code == 0
+    assert midi.type == 0
+    assert len(midi.tracks) == 1
+    assert payload["output_layout"] == "single-track"
+
+
 def test_forced_bpm_is_respected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     wav_path = tmp_path / "Drums.wav"
     output_midi = tmp_path / "forced_bpm.mid"
@@ -361,8 +522,8 @@ def test_forced_bpm_is_respected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     payload = json.loads(report_path.read_text(encoding="utf-8"))
 
     assert result.exit_code == 0
-    assert len(tempo_events) == 1
-    assert int(tempo_events[0].tempo) == int(round(60_000_000.0 / 123.0))
+    assert len(tempo_events) >= 1
+    assert all(int(item.tempo) == int(round(60_000_000.0 / 123.0)) for item in tempo_events)
     assert payload["bpm_used"] == 123.0
     assert payload["bpm_source"] == "forced"
 
@@ -410,8 +571,8 @@ def test_auto_bpm_path_is_used_when_bpm_is_omitted(
     assert payload["bpm_source"] == "detected"
     assert payload["detected_bpm"] == 120.0
     assert payload["bpm_used"] == 120.0
-    assert len(tempo_events) == 1
-    assert int(tempo_events[0].tempo) == int(round(60_000_000.0 / 120.0))
+    assert len(tempo_events) >= 1
+    assert all(int(item.tempo) == int(round(60_000_000.0 / 120.0)) for item in tempo_events)
 
 
 def test_multi_detector_is_default_mode(tmp_path: Path) -> None:
@@ -634,6 +795,13 @@ def test_report_and_debug_csv_are_written(tmp_path: Path) -> None:
     assert debug_csv.exists()
     assert "output_pitch_counts" in payload
     assert "per_hit_summary" in payload
+    assert payload["output_layout"] == "multitrack"
+    assert payload["track_order"] == ["Kick", "SnareClap", "Hat", "TomPerc", "Cymbal"]
+    assert "layer_counts" in payload
+    assert "layer_output_pitch_counts" in payload
+    assert "cross_layer_simultaneous_hit_count" in payload
+    assert "same_layer_suppressed_count" in payload
+    assert "cross_layer_suppressed_count" in payload
     assert len(payload["per_hit_summary"]) > 0
     assert all(
         key in payload["per_hit_summary"][0]
@@ -676,6 +844,8 @@ def test_report_and_debug_csv_are_written(tmp_path: Path) -> None:
     assert "nearest_previous_same_class_ms" in header
     assert "detection_mode" in header
     assert "detector_name" in header
+    assert "layer_name" in header
+    assert "target_track_name" in header
     assert "candidate_class" in header
     assert "accepted_class" in header
     assert "class_confidence" in header
@@ -683,6 +853,10 @@ def test_report_and_debug_csv_are_written(tmp_path: Path) -> None:
     assert "competing_class_score" in header
     assert "accepted" in header
     assert "rejection_reason" in header
+    assert "same_layer_duplicate" in header
+    assert "cross_layer_allowed" in header
+    assert "nearest_previous_same_layer_ms" in header
+    assert "simultaneous_layers_at_time" in header
     assert "merged_with_transient_id" in header
     assert "detector_candidate_counts" in payload
     assert "detector_accepted_counts" in payload
@@ -935,6 +1109,55 @@ def test_same_transient_allows_kick_hat_layering(
             "36",
             "--detection-mode",
             "multi-detector",
+            "--output-layout",
+            "multitrack",
+            "--bpm",
+            "120",
+        ],
+    )
+
+    notes = sorted(note for _tick, note, _channel, _velocity in _note_on_events(output_midi))
+    by_track = _track_note_on_events(output_midi)
+
+    assert result.exit_code == 0
+    assert notes == [36, 48]
+    assert [note for _tick, note, _channel, _velocity in by_track["Kick"]] == [36]
+    assert [note for _tick, note, _channel, _velocity in by_track["Hat"]] == [48]
+
+
+def test_same_transient_allows_kick_snare_layering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "layer_kick_snare.mid"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10, 0.10],
+        class_names=["kick", "snare_or_clap"],
+        onset_strengths=[0.80, 0.78],
+        confidences=[0.90, 0.86],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "ujam-candy",
+            "--c1-midi-note",
+            "36",
+            "--detection-mode",
+            "multi-detector",
+            "--output-layout",
+            "multitrack",
             "--bpm",
             "120",
         ],
@@ -943,7 +1166,103 @@ def test_same_transient_allows_kick_hat_layering(
     notes = sorted(note for _tick, note, _channel, _velocity in _note_on_events(output_midi))
 
     assert result.exit_code == 0
+    assert notes == [36, 43]
+
+
+def test_same_transient_allows_kick_cymbal_layering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "layer_kick_cymbal.mid"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[0.10, 0.10],
+        class_names=["kick", "cymbal"],
+        onset_strengths=[0.79, 0.76],
+        confidences=[0.88, 0.87],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "ujam-candy",
+            "--c1-midi-note",
+            "36",
+            "--detection-mode",
+            "multi-detector",
+            "--output-layout",
+            "multitrack",
+            "--bpm",
+            "120",
+        ],
+    )
+
+    notes = sorted(note for _tick, note, _channel, _velocity in _note_on_events(output_midi))
+
+    assert result.exit_code == 0
+    assert notes == [36, 60]
+
+
+def test_cross_layer_hits_are_not_suppressed_by_spacing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wav_path = tmp_path / "Drums.wav"
+    output_midi = tmp_path / "cross_layer_spacing.mid"
+    report_path = tmp_path / "cross_layer_spacing_report.json"
+    _build_drum_like_wav(wav_path)
+
+    _patch_detected_hits(
+        monkeypatch,
+        onset_times=[1.000, 1.005],
+        class_names=["kick", "hat"],
+        onset_strengths=[0.82, 0.71],
+        confidences=[0.90, 0.85],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "drums",
+            "extract-from-audio",
+            "--wav",
+            str(wav_path),
+            "--output",
+            str(output_midi),
+            "--target-map",
+            "ujam-candy",
+            "--c1-midi-note",
+            "36",
+            "--detection-mode",
+            "multi-detector",
+            "--output-layout",
+            "multitrack",
+            "--profile",
+            "conservative",
+            "--bpm",
+            "120",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    notes = sorted(note for _tick, note, _channel, _velocity in _note_on_events(output_midi))
+
+    assert result.exit_code == 0
     assert notes == [36, 48]
+    assert payload["cross_layer_simultaneous_hit_count"] >= 1
+    assert payload["cross_layer_suppressed_count"] == 0
 
 
 def test_same_transient_does_not_create_duplicate_same_class(

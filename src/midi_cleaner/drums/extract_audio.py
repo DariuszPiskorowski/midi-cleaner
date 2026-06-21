@@ -31,7 +31,9 @@ DrumClass = Literal[
 SnareTarget = Literal["sn1", "sn2", "clap"]
 ExtractionProfile = Literal["conservative", "balanced", "sensitive"]
 DetectionMode = Literal["global", "multi-detector"]
+OutputLayout = Literal["multitrack", "single-track"]
 DetectorName = Literal["global", "kick", "snare", "hat", "cymbal", "tom"]
+LayerName = Literal["kick", "snare_clap", "hat", "tom_perc", "cymbal", "unknown"]
 
 DEFAULT_TICKS_PER_BEAT = 480
 DEFAULT_MIN_ONSET_STRENGTH = 0.20
@@ -63,6 +65,41 @@ _CANONICAL_CLASSES: tuple[str, ...] = (
     "tom_or_perc",
     "unknown",
 )
+
+_LAYER_ORDER: tuple[str, ...] = (
+    "kick",
+    "snare_clap",
+    "hat",
+    "tom_perc",
+    "cymbal",
+)
+
+_LAYER_TRACK_NAMES: dict[str, str] = {
+    "kick": "Kick",
+    "snare_clap": "SnareClap",
+    "hat": "Hat",
+    "tom_perc": "TomPerc",
+    "cymbal": "Cymbal",
+    "unknown": "TomPerc",
+}
+
+_LAYER_TO_CLASS: dict[str, DrumClass] = {
+    "kick": "kick",
+    "snare_clap": "snare_or_clap",
+    "hat": "hat",
+    "tom_perc": "tom_or_perc",
+    "cymbal": "cymbal",
+    "unknown": "unknown",
+}
+
+_CLASS_TO_LAYER: dict[str, str] = {
+    "kick": "kick",
+    "snare_or_clap": "snare_clap",
+    "hat": "hat",
+    "cymbal": "cymbal",
+    "tom_or_perc": "tom_perc",
+    "unknown": "unknown",
+}
 
 _PROFILE_DEFAULTS: dict[str, dict[str, float | int]] = {
     "conservative": {
@@ -147,6 +184,7 @@ class AudioDrumExtractionParameters:
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT
     profile: ExtractionProfile = "balanced"
     detection_mode: DetectionMode = "multi-detector"
+    output_layout: OutputLayout = "multitrack"
     min_class_confidence: float | None = None
     emit_unknown: bool = False
     unknown_target_note: int | None = None
@@ -187,6 +225,8 @@ class PerHitSummary:
     nearest_previous_same_class_ms: float | None
     detection_mode: str
     detector_name: str
+    layer_name: str
+    target_track_name: str
     candidate_class: str
     accepted_class: str | None
     class_confidence: float
@@ -201,6 +241,10 @@ class PerHitSummary:
     accepted: bool
     rejection_reason: str | None
     merged_with_transient_id: int | None
+    same_layer_duplicate: bool
+    cross_layer_allowed: bool
+    nearest_previous_same_layer_ms: float | None
+    simultaneous_layers_at_time: str
 
 
 @dataclass
@@ -213,6 +257,8 @@ class AudioDrumExtractionReport:
     bpm_used: float
     bpm_source: Literal["detected", "forced"]
     detection_mode: DetectionMode
+    output_layout: OutputLayout
+    track_order: list[str]
     onset_count: int
     raw_onset_count: int
     accepted_onset_count: int
@@ -224,6 +270,11 @@ class AudioDrumExtractionReport:
     class_counts: dict[str, int]
     output_note_counts: dict[str, int]
     output_pitch_counts: dict[str, int]
+    layer_counts: dict[str, int]
+    layer_output_pitch_counts: dict[str, dict[str, int]]
+    cross_layer_simultaneous_hit_count: int
+    same_layer_suppressed_count: int
+    cross_layer_suppressed_count: int
     notes_per_second: float
     class_notes_per_second: dict[str, float]
     velocity_summary: dict[str, float]
@@ -265,6 +316,8 @@ class AudioDrumExtractionReport:
                 "nearest_previous_same_class_ms": item.nearest_previous_same_class_ms,
                 "detection_mode": item.detection_mode,
                 "detector_name": item.detector_name,
+                "layer_name": item.layer_name,
+                "target_track_name": item.target_track_name,
                 "candidate_class": item.candidate_class,
                 "accepted_class": item.accepted_class,
                 "class_confidence": item.class_confidence,
@@ -279,10 +332,26 @@ class AudioDrumExtractionReport:
                 "accepted": item.accepted,
                 "rejection_reason": item.rejection_reason,
                 "merged_with_transient_id": item.merged_with_transient_id,
+                "same_layer_duplicate": item.same_layer_duplicate,
+                "cross_layer_allowed": item.cross_layer_allowed,
+                "nearest_previous_same_layer_ms": item.nearest_previous_same_layer_ms,
+                "simultaneous_layers_at_time": item.simultaneous_layers_at_time,
             }
             for item in self.per_hit_summary
         ]
         return payload
+
+
+@dataclass
+class DrumLayerHit:
+    onset_sec: float
+    tick: int
+    instrument: str
+    target_note: int
+    velocity: int
+    confidence: float
+    detector_name: str
+    evidence: dict[str, object]
 
 
 @dataclass
@@ -332,6 +401,8 @@ class _DetectedHit:
     nearest_previous_same_class_ms: float | None
     detection_mode: DetectionMode
     detector_name: DetectorName
+    layer_name: LayerName
+    target_track_name: str
     candidate_class: DrumClass
     accepted_class: DrumClass | None
     class_confidence: float
@@ -346,6 +417,10 @@ class _DetectedHit:
     accepted: bool
     rejection_reason: str | None
     merged_with_transient_id: int | None
+    same_layer_duplicate: bool
+    cross_layer_allowed: bool
+    nearest_previous_same_layer_ms: float | None
+    simultaneous_layers_at_time: str
 
     def score(self) -> float:
         return (
@@ -747,6 +822,21 @@ def _canonical_class(class_name: DrumClass) -> str:
     return normalized
 
 
+def _layer_from_class(class_name: DrumClass) -> LayerName:
+    canonical = _canonical_class(class_name)
+    return _CLASS_TO_LAYER.get(canonical, "unknown")  # type: ignore[return-value]
+
+
+def _track_name_from_layer(layer_name: LayerName) -> str:
+    return _LAYER_TRACK_NAMES.get(layer_name, "TomPerc")
+
+
+def _layer_sort_key(layer_name: str) -> int:
+    if layer_name in _LAYER_ORDER:
+        return _LAYER_ORDER.index(layer_name)
+    return len(_LAYER_ORDER)
+
+
 def _hit_to_tick(onset_sec: float, ticks_per_second: float) -> int:
     return max(0, int(round(onset_sec * ticks_per_second)))
 
@@ -810,6 +900,9 @@ def _validate_params(params: AudioDrumExtractionParameters) -> None:
 
     if params.detection_mode not in {"global", "multi-detector"}:
         raise AudioDrumExtractionError("--detection-mode must be one of: global, multi-detector.")
+
+    if params.output_layout not in {"multitrack", "single-track"}:
+        raise AudioDrumExtractionError("--output-layout must be one of: multitrack, single-track.")
 
     if params.unknown_target_note is not None and (params.unknown_target_note < 0 or params.unknown_target_note > 127):
         raise AudioDrumExtractionError("--unknown-target-note must be in range 0..127.")
@@ -1085,6 +1178,7 @@ def _candidate_to_hit(
     unknown_target_note: int,
 ) -> _DetectedHit:
     class_name = _normalize_class_name(candidate.class_name)
+    layer_name = _layer_from_class(class_name)
     target = int(class_targets.get(class_name, unknown_target_note))
     if class_name == "unknown":
         target = int(unknown_target_note)
@@ -1114,6 +1208,8 @@ def _candidate_to_hit(
         nearest_previous_same_class_ms=None,
         detection_mode=detection_mode,
         detector_name=candidate.detector_name,
+        layer_name=layer_name,
+        target_track_name=_track_name_from_layer(layer_name),
         candidate_class=class_name,
         accepted_class=class_name,
         class_confidence=float(candidate.confidence),
@@ -1128,6 +1224,10 @@ def _candidate_to_hit(
         accepted=True,
         rejection_reason=None,
         merged_with_transient_id=None,
+        same_layer_duplicate=False,
+        cross_layer_allowed=False,
+        nearest_previous_same_layer_ms=None,
+        simultaneous_layers_at_time=layer_name,
     )
 
 
@@ -1141,6 +1241,7 @@ def _suppress_hit(
     *,
     duplicate_suppressed_by_class: dict[str, int],
     rejected_by_reason: dict[str, int],
+    same_layer_duplicate: bool = False,
 ) -> None:
     if hit.suppressed:
         return
@@ -1150,20 +1251,29 @@ def _suppress_hit(
     hit.rejection_reason = reason
     hit.accepted = False
     hit.accepted_class = None
+    if same_layer_duplicate:
+        hit.same_layer_duplicate = True
     _increment_counter(rejected_by_reason, reason)
     if reason in {"same_transient_group", "global_min_spacing", "class_refractory", "merge_conflict"}:
         canonical = _canonical_class(hit.class_name)
         duplicate_suppressed_by_class[canonical] = duplicate_suppressed_by_class.get(canonical, 0) + 1
 
 
-def _allow_layering(class_a: str, class_b: str) -> bool:
-    pair = {class_a, class_b}
-    return pair in (
-        {"kick", "snare_or_clap"},
-        {"kick", "hat"},
-        {"kick", "cymbal"},
-        {"snare_or_clap", "hat"},
-    )
+def _group_by_transient_window(hits: list[_DetectedHit], window_sec: float) -> list[list[_DetectedHit]]:
+    if not hits:
+        return []
+
+    sorted_hits = sorted(hits, key=lambda item: (item.onset_sec, -item.score()))
+    groups: list[list[_DetectedHit]] = []
+    current: list[_DetectedHit] = [sorted_hits[0]]
+    for hit in sorted_hits[1:]:
+        if (hit.onset_sec - current[-1].onset_sec) <= window_sec:
+            current.append(hit)
+        else:
+            groups.append(current)
+            current = [hit]
+    groups.append(current)
+    return groups
 
 
 def _merge_same_transient_candidates(
@@ -1176,82 +1286,28 @@ def _merge_same_transient_candidates(
     if not hits:
         return [], 0
 
-    sorted_hits = sorted(hits, key=lambda item: (item.onset_sec, -item.score()))
-    groups: list[list[_DetectedHit]] = []
-    current: list[_DetectedHit] = [sorted_hits[0]]
-    for hit in sorted_hits[1:]:
-        if (hit.onset_sec - current[-1].onset_sec) <= window_sec:
-            current.append(hit)
-        else:
-            groups.append(current)
-            current = [hit]
-    groups.append(current)
-
-    conflicts = 0
+    groups = _group_by_transient_window(hits, window_sec)
+    suppressed_count = 0
     accepted_all: list[_DetectedHit] = []
     for group_id, group in enumerate(groups):
         for hit in group:
             hit.grouped_transient_id = group_id
             hit.merged_with_transient_id = group_id
 
-        chosen: list[_DetectedHit] = []
-        for candidate in sorted(group, key=lambda item: item.score(), reverse=True):
-            if candidate.suppressed:
-                continue
-            candidate_class = _canonical_class(candidate.class_name)
-
-            duplicate_same = next(
-                (item for item in chosen if _canonical_class(item.class_name) == candidate_class),
-                None,
+        ranked = sorted(group, key=lambda item: item.score(), reverse=True)
+        chosen = ranked[0]
+        accepted_all.append(chosen)
+        for candidate in ranked[1:]:
+            suppressed_count += 1
+            _suppress_hit(
+                candidate,
+                "same_transient_group",
+                duplicate_suppressed_by_class=duplicate_suppressed_by_class,
+                rejected_by_reason=rejected_by_reason,
+                same_layer_duplicate=True,
             )
-            if duplicate_same is not None:
-                conflicts += 1
-                _suppress_hit(
-                    candidate,
-                    "same_transient_group",
-                    duplicate_suppressed_by_class=duplicate_suppressed_by_class,
-                    rejected_by_reason=rejected_by_reason,
-                )
-                continue
 
-            blocked = False
-            for existing in chosen:
-                existing_class = _canonical_class(existing.class_name)
-                if candidate_class == existing_class:
-                    continue
-                if _allow_layering(candidate_class, existing_class):
-                    continue
-                if {candidate_class, existing_class} == {"hat", "cymbal"}:
-                    # Allow one high-class event only unless cymbal is clearly stronger.
-                    if candidate_class == "cymbal" and candidate.score() > existing.score() * 1.05:
-                        _suppress_hit(
-                            existing,
-                            "merge_conflict",
-                            duplicate_suppressed_by_class=duplicate_suppressed_by_class,
-                            rejected_by_reason=rejected_by_reason,
-                        )
-                        chosen.remove(existing)
-                        break
-                    blocked = True
-                    break
-                blocked = True
-                break
-
-            if blocked:
-                conflicts += 1
-                _suppress_hit(
-                    candidate,
-                    "merge_conflict",
-                    duplicate_suppressed_by_class=duplicate_suppressed_by_class,
-                    rejected_by_reason=rejected_by_reason,
-                )
-                continue
-
-            chosen.append(candidate)
-
-        accepted_all.extend([item for item in chosen if not item.suppressed])
-
-    return sorted(accepted_all, key=lambda item: item.onset_sec), conflicts
+    return sorted([item for item in accepted_all if not item.suppressed], key=lambda item: item.onset_sec), suppressed_count
 
 
 def _apply_global_min_spacing(
@@ -1272,24 +1328,13 @@ def _apply_global_min_spacing(
 
         previous = accepted[-1]
         if (hit.onset_sec - previous.onset_sec) < min_spacing_sec:
-            prev_class = _canonical_class(previous.class_name)
-            curr_class = _canonical_class(hit.class_name)
-            if (
-                previous.grouped_transient_id is not None
-                and hit.grouped_transient_id is not None
-                and previous.grouped_transient_id == hit.grouped_transient_id
-                and prev_class != curr_class
-                and _allow_layering(prev_class, curr_class)
-            ):
-                accepted.append(hit)
-                continue
-
             if hit.score() > previous.score():
                 _suppress_hit(
                     previous,
                     "global_min_spacing",
                     duplicate_suppressed_by_class=duplicate_suppressed_by_class,
                     rejected_by_reason=rejected_by_reason,
+                    same_layer_duplicate=True,
                 )
                 accepted[-1] = hit
             else:
@@ -1298,6 +1343,7 @@ def _apply_global_min_spacing(
                     "global_min_spacing",
                     duplicate_suppressed_by_class=duplicate_suppressed_by_class,
                     rejected_by_reason=rejected_by_reason,
+                    same_layer_duplicate=True,
                 )
             continue
 
@@ -1335,6 +1381,7 @@ def _apply_class_refractory(
                     "class_refractory",
                     duplicate_suppressed_by_class=duplicate_suppressed_by_class,
                     rejected_by_reason=rejected_by_reason,
+                    same_layer_duplicate=True,
                 )
                 accepted[last_index] = hit
             else:
@@ -1343,6 +1390,7 @@ def _apply_class_refractory(
                     "class_refractory",
                     duplicate_suppressed_by_class=duplicate_suppressed_by_class,
                     rejected_by_reason=rejected_by_reason,
+                    same_layer_duplicate=True,
                 )
             continue
 
@@ -1355,13 +1403,41 @@ def _apply_class_refractory(
 def _assign_nearest_same_class_ms(hits: list[_DetectedHit]) -> None:
     last_seen: dict[str, float] = {}
     for hit in sorted(hits, key=lambda item: item.onset_sec):
-        canonical = _canonical_class(hit.class_name)
-        previous = last_seen.get(canonical)
-        hit.nearest_previous_same_class_ms = (
+        key = str(hit.layer_name)
+        previous = last_seen.get(key)
+        interval_ms = (
             None if previous is None else (hit.onset_sec - previous) * 1000.0
         )
+        hit.nearest_previous_same_class_ms = interval_ms
+        hit.nearest_previous_same_layer_ms = interval_ms
         if not hit.suppressed:
-            last_seen[canonical] = hit.onset_sec
+            last_seen[key] = hit.onset_sec
+
+
+def _split_hits_by_layer(hits: list[_DetectedHit]) -> dict[str, list[_DetectedHit]]:
+    by_layer: dict[str, list[_DetectedHit]] = {layer: [] for layer in (*_LAYER_ORDER, "unknown")}
+    for hit in hits:
+        by_layer.setdefault(str(hit.layer_name), []).append(hit)
+    return by_layer
+
+
+def _annotate_simultaneous_layers(hits: list[_DetectedHit], *, window_sec: float) -> int:
+    if not hits:
+        return 0
+
+    cross_layer_group_count = 0
+    for group in _group_by_transient_window(hits, window_sec):
+        layers = sorted({str(hit.layer_name) for hit in group}, key=_layer_sort_key)
+        layer_token = "|".join(layers) if layers else "unknown"
+        is_cross = len(layers) > 1
+        if is_cross:
+            cross_layer_group_count += 1
+
+        for hit in group:
+            hit.cross_layer_allowed = bool(is_cross and hit.detection_mode == "multi-detector")
+            hit.simultaneous_layers_at_time = layer_token
+
+    return cross_layer_group_count
 
 
 def _assign_output_velocities(hits: list[_DetectedHit]) -> None:
@@ -1387,34 +1463,51 @@ def _assign_output_velocities(hits: list[_DetectedHit]) -> None:
         hit.velocity = max(1, min(127, velocity))
 
 
-def _build_midi(
-    hits: list[_DetectedHit],
-    *,
-    output_path: Path,
-    ticks_per_beat: int,
-    bpm_used: float,
-    duration_sec: float,
-    channel: int,
-    track_name: str,
-) -> tuple[int, int]:
-    tempo_us_per_beat = int(round(60_000_000.0 / max(bpm_used, 1e-9)))
-    ticks_per_second = (ticks_per_beat * bpm_used) / 60.0
-    source_length_ticks = max(0, int(round(duration_sec * ticks_per_second)))
+def _to_layered_hits(hits: list[_DetectedHit]) -> dict[str, list[DrumLayerHit]]:
+    layered_hits: dict[str, list[DrumLayerHit]] = {layer: [] for layer in _LAYER_ORDER}
+    for hit in sorted(hits, key=lambda item: item.onset_sec):
+        layer_name = str(hit.layer_name)
+        if layer_name not in _LAYER_ORDER:
+            layer_name = "tom_perc"
 
-    midi_file = mido.MidiFile(type=0, ticks_per_beat=ticks_per_beat)
-    track = mido.MidiTrack()
-    midi_file.tracks.append(track)
-
-    track.append(mido.MetaMessage("track_name", name=track_name, time=0))
-    track.append(mido.MetaMessage("set_tempo", tempo=tempo_us_per_beat, time=0))
-
-    absolute_events: list[tuple[int, int, mido.Message]] = []
-    for hit in hits:
-        start_tick = _hit_to_tick(hit.onset_sec, ticks_per_second)
-        duration_ticks = max(
-            1,
-            int(round(_CLASS_NOTE_DURATIONS_SEC[hit.class_name] * ticks_per_second)),
+        layered_hits[layer_name].append(
+            DrumLayerHit(
+                onset_sec=float(hit.onset_sec),
+                tick=int(hit.tick),
+                instrument=layer_name,
+                target_note=int(hit.target_note),
+                velocity=int(hit.velocity),
+                confidence=float(hit.class_confidence),
+                detector_name=str(hit.detector_name),
+                evidence={
+                    "class_name": str(hit.class_name),
+                    "onset_strength": float(hit.onset_strength),
+                    "attack_score": float(hit.attack_score),
+                    "decay_score": float(hit.decay_score),
+                    "band_dominance_score": float(hit.band_dominance_score),
+                },
+            )
         )
+
+    return layered_hits
+
+
+def _layer_duration_sec(layer_name: str) -> float:
+    mapped_class = _LAYER_TO_CLASS.get(layer_name, "tom_or_perc")
+    return float(_CLASS_NOTE_DURATIONS_SEC.get(mapped_class, 0.10))
+
+
+def _layer_absolute_events(
+    *,
+    layer_hits: list[DrumLayerHit],
+    ticks_per_second: float,
+    source_length_ticks: int,
+    channel: int,
+) -> list[tuple[int, int, mido.Message]]:
+    absolute_events: list[tuple[int, int, mido.Message]] = []
+    for hit in layer_hits:
+        start_tick = _hit_to_tick(hit.onset_sec, ticks_per_second)
+        duration_ticks = max(1, int(round(_layer_duration_sec(hit.instrument) * ticks_per_second)))
         end_tick = min(source_length_ticks, start_tick + duration_ticks)
         if end_tick <= start_tick:
             if start_tick >= source_length_ticks:
@@ -1449,6 +1542,49 @@ def _build_midi(
         )
 
     absolute_events.sort(key=lambda item: (item[0], item[1]))
+    return absolute_events
+
+
+def _build_single_track_midi(
+    *,
+    hits: list[_DetectedHit],
+    output_path: Path,
+    ticks_per_beat: int,
+    bpm_used: float,
+    duration_sec: float,
+    channel: int,
+    track_name: str,
+) -> tuple[int, int, list[str]]:
+    tempo_us_per_beat = int(round(60_000_000.0 / max(bpm_used, 1e-9)))
+    ticks_per_second = (ticks_per_beat * bpm_used) / 60.0
+    source_length_ticks = max(0, int(round(duration_sec * ticks_per_second)))
+
+    midi_file = mido.MidiFile(type=0, ticks_per_beat=ticks_per_beat)
+    track = mido.MidiTrack()
+    midi_file.tracks.append(track)
+
+    track.append(mido.MetaMessage("track_name", name=track_name, time=0))
+    track.append(mido.MetaMessage("set_tempo", tempo=tempo_us_per_beat, time=0))
+
+    layer_hits = [
+        DrumLayerHit(
+            onset_sec=float(hit.onset_sec),
+            tick=int(hit.tick),
+            instrument=str(hit.layer_name),
+            target_note=int(hit.target_note),
+            velocity=int(hit.velocity),
+            confidence=float(hit.class_confidence),
+            detector_name=str(hit.detector_name),
+            evidence={},
+        )
+        for hit in hits
+    ]
+    absolute_events = _layer_absolute_events(
+        layer_hits=layer_hits,
+        ticks_per_second=ticks_per_second,
+        source_length_ticks=source_length_ticks,
+        channel=channel,
+    )
 
     previous_tick = 0
     for tick, _priority, message in absolute_events:
@@ -1461,7 +1597,103 @@ def _build_midi(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     midi_file.save(str(output_path))
 
-    return source_length_ticks, final_tick
+    return source_length_ticks, final_tick, [track_name]
+
+
+def _build_multitrack_midi(
+    *,
+    layered_hits: dict[str, list[DrumLayerHit]],
+    output_path: Path,
+    ticks_per_beat: int,
+    bpm_used: float,
+    duration_sec: float,
+    channel: int,
+) -> tuple[int, int, list[str]]:
+    tempo_us_per_beat = int(round(60_000_000.0 / max(bpm_used, 1e-9)))
+    ticks_per_second = (ticks_per_beat * bpm_used) / 60.0
+    source_length_ticks = max(0, int(round(duration_sec * ticks_per_second)))
+
+    midi_file = mido.MidiFile(type=1, ticks_per_beat=ticks_per_beat)
+    output_tracks: list[str] = []
+    final_tick = source_length_ticks
+
+    for layer_name in _LAYER_ORDER:
+        track_name = _track_name_from_layer(layer_name)
+        output_tracks.append(track_name)
+
+        track = mido.MidiTrack()
+        midi_file.tracks.append(track)
+        track.append(mido.MetaMessage("track_name", name=track_name, time=0))
+        track.append(mido.MetaMessage("set_tempo", tempo=tempo_us_per_beat, time=0))
+
+        absolute_events = _layer_absolute_events(
+            layer_hits=layered_hits.get(layer_name, []),
+            ticks_per_second=ticks_per_second,
+            source_length_ticks=source_length_ticks,
+            channel=channel,
+        )
+
+        previous_tick = 0
+        for tick, _priority, message in absolute_events:
+            track.append(message.copy(time=tick - previous_tick))
+            previous_tick = tick
+
+        track.append(mido.MetaMessage("end_of_track", time=max(0, source_length_ticks - previous_tick)))
+        final_tick = max(final_tick, previous_tick)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    midi_file.save(str(output_path))
+    return source_length_ticks, max(final_tick, source_length_ticks), output_tracks
+
+
+def _build_midi(
+    hits: list[_DetectedHit],
+    *,
+    layered_hits: dict[str, list[DrumLayerHit]],
+    output_layout: OutputLayout,
+    output_path: Path,
+    ticks_per_beat: int,
+    bpm_used: float,
+    duration_sec: float,
+    channel: int,
+    track_name: str,
+) -> tuple[int, int, list[str]]:
+    if output_layout == "single-track":
+        return _build_single_track_midi(
+            hits=hits,
+            output_path=output_path,
+            ticks_per_beat=ticks_per_beat,
+            bpm_used=bpm_used,
+            duration_sec=duration_sec,
+            channel=channel,
+            track_name=track_name,
+        )
+
+    return _build_multitrack_midi(
+        layered_hits=layered_hits,
+        output_path=output_path,
+        ticks_per_beat=ticks_per_beat,
+        bpm_used=bpm_used,
+        duration_sec=duration_sec,
+        channel=channel,
+    )
+
+
+def _count_layer_hits(layered_hits: dict[str, list[DrumLayerHit]]) -> dict[str, int]:
+    return {layer: len(layered_hits.get(layer, [])) for layer in _LAYER_ORDER}
+
+
+def _count_layer_output_pitch_counts(
+    layered_hits: dict[str, list[DrumLayerHit]],
+) -> dict[str, dict[str, int]]:
+    summary: dict[str, dict[str, int]] = {}
+    for layer in _LAYER_ORDER:
+        notes: dict[str, int] = {}
+        for hit in layered_hits.get(layer, []):
+            note = str(int(hit.target_note))
+            notes[note] = notes.get(note, 0) + 1
+        summary[layer] = dict(sorted(notes.items(), key=lambda item: int(item[0])))
+    return summary
 
 
 def _count_output_notes(hits: list[_DetectedHit]) -> dict[str, int]:
@@ -1616,6 +1848,8 @@ def _to_per_hit_summary(hits: list[_DetectedHit]) -> list[PerHitSummary]:
             ),
             detection_mode=hit.detection_mode,
             detector_name=hit.detector_name,
+            layer_name=hit.layer_name,
+            target_track_name=hit.target_track_name,
             candidate_class=hit.candidate_class,
             accepted_class=hit.accepted_class,
             class_confidence=float(hit.class_confidence),
@@ -1630,6 +1864,12 @@ def _to_per_hit_summary(hits: list[_DetectedHit]) -> list[PerHitSummary]:
             accepted=bool(hit.accepted),
             rejection_reason=hit.rejection_reason,
             merged_with_transient_id=hit.merged_with_transient_id,
+            same_layer_duplicate=bool(hit.same_layer_duplicate),
+            cross_layer_allowed=bool(hit.cross_layer_allowed),
+            nearest_previous_same_layer_ms=(
+                None if hit.nearest_previous_same_layer_ms is None else float(hit.nearest_previous_same_layer_ms)
+            ),
+            simultaneous_layers_at_time=str(hit.simultaneous_layers_at_time),
         )
         for hit in hits
     ]
@@ -1661,6 +1901,8 @@ def _write_debug_csv(path: Path, hits: list[_DetectedHit]) -> None:
                 "onset_strength",
                 "detection_mode",
                 "detector_name",
+                "layer_name",
+                "target_track_name",
                 "candidate_class",
                 "accepted_class",
                 "class_confidence",
@@ -1668,6 +1910,10 @@ def _write_debug_csv(path: Path, hits: list[_DetectedHit]) -> None:
                 "competing_class_score",
                 "accepted",
                 "rejection_reason",
+                "same_layer_duplicate",
+                "cross_layer_allowed",
+                "nearest_previous_same_layer_ms",
+                "simultaneous_layers_at_time",
                 "merged_with_transient_id",
                 "low_peak_strength",
                 "mid_peak_strength",
@@ -1701,6 +1947,8 @@ def _write_debug_csv(path: Path, hits: list[_DetectedHit]) -> None:
                     "spectral_centroid": hit.spectral_centroid,
                     "detection_mode": hit.detection_mode,
                     "detector_name": hit.detector_name,
+                    "layer_name": hit.layer_name,
+                    "target_track_name": hit.target_track_name,
                     "candidate_class": hit.candidate_class,
                     "accepted_class": hit.accepted_class,
                     "class_confidence": hit.class_confidence,
@@ -1708,6 +1956,10 @@ def _write_debug_csv(path: Path, hits: list[_DetectedHit]) -> None:
                     "competing_class_score": hit.competing_class_score,
                     "accepted": str(hit.accepted).lower(),
                     "rejection_reason": hit.rejection_reason,
+                    "same_layer_duplicate": str(hit.same_layer_duplicate).lower(),
+                    "cross_layer_allowed": str(hit.cross_layer_allowed).lower(),
+                    "nearest_previous_same_layer_ms": hit.nearest_previous_same_layer_ms,
+                    "simultaneous_layers_at_time": hit.simultaneous_layers_at_time,
                     "merged_with_transient_id": hit.merged_with_transient_id,
                     "low_peak_strength": hit.low_peak_strength,
                     "mid_peak_strength": hit.mid_peak_strength,
@@ -1851,7 +2103,6 @@ def extract_drums_from_audio(
 
         if hit.class_confidence < min_class_confidence:
             low_confidence_rejected_count += 1
-            _increment_counter(detector_rejected_counts, candidate.detector_name)
             _suppress_hit(
                 hit,
                 "low_confidence",
@@ -1865,7 +2116,6 @@ def extract_drums_from_audio(
             hit.competing_class in {"kick", "snare_or_clap"}
             and hit.competing_class_score >= hit.class_confidence * 0.92
         ):
-            _increment_counter(detector_rejected_counts, candidate.detector_name)
             _suppress_hit(
                 hit,
                 "tom_not_clear",
@@ -1876,7 +2126,6 @@ def extract_drums_from_audio(
             continue
 
         if _canonical_class(hit.class_name) == "unknown" and not params.emit_unknown:
-            _increment_counter(detector_rejected_counts, candidate.detector_name)
             _suppress_hit(
                 hit,
                 "unknown_skipped",
@@ -1889,26 +2138,37 @@ def extract_drums_from_audio(
         raw_hits.append(hit)
 
     premerge_hits = [item for item in raw_hits if not item.suppressed]
-    merged_hits, merge_conflicts = _merge_same_transient_candidates(
-        premerge_hits,
-        window_sec=same_transient_window_sec,
-        duplicate_suppressed_by_class=duplicate_suppressed_by_class,
-        rejected_by_reason=rejected_by_reason,
-    )
-    spaced_hits = _apply_global_min_spacing(
-        merged_hits,
-        min_spacing_sec=min_hit_spacing_sec,
-        duplicate_suppressed_by_class=duplicate_suppressed_by_class,
-        rejected_by_reason=rejected_by_reason,
-    )
-    accepted_hits = _apply_class_refractory(
-        spaced_hits,
-        class_refractory_sec=class_refractory_sec,
-        duplicate_suppressed_by_class=duplicate_suppressed_by_class,
-        rejected_by_reason=rejected_by_reason,
-    )
+    merge_conflicts = 0
+    accepted_hits: list[_DetectedHit] = []
+    for layer_name, layer_hits in _split_hits_by_layer(premerge_hits).items():
+        if not layer_hits:
+            continue
 
+        merged_hits, layer_conflicts = _merge_same_transient_candidates(
+            layer_hits,
+            window_sec=same_transient_window_sec,
+            duplicate_suppressed_by_class=duplicate_suppressed_by_class,
+            rejected_by_reason=rejected_by_reason,
+        )
+        merge_conflicts += layer_conflicts
+
+        spaced_hits = _apply_global_min_spacing(
+            merged_hits,
+            min_spacing_sec=min_hit_spacing_sec,
+            duplicate_suppressed_by_class=duplicate_suppressed_by_class,
+            rejected_by_reason=rejected_by_reason,
+        )
+        filtered_hits = _apply_class_refractory(
+            spaced_hits,
+            class_refractory_sec=class_refractory_sec,
+            duplicate_suppressed_by_class=duplicate_suppressed_by_class,
+            rejected_by_reason=rejected_by_reason,
+        )
+        accepted_hits.extend(filtered_hits)
+
+    accepted_hits = sorted(accepted_hits, key=lambda item: item.onset_sec)
     _assign_nearest_same_class_ms(sorted(raw_hits, key=lambda item: item.onset_sec))
+    _annotate_simultaneous_layers(sorted(raw_hits, key=lambda item: item.onset_sec), window_sec=same_transient_window_sec)
 
     emitted_hits: list[_DetectedHit] = []
     for hit in accepted_hits:
@@ -1922,6 +2182,12 @@ def extract_drums_from_audio(
             continue
         emitted_hits.append(hit)
 
+    emitted_hits = sorted(emitted_hits, key=lambda item: item.onset_sec)
+    cross_layer_simultaneous_hit_count = _annotate_simultaneous_layers(
+        emitted_hits,
+        window_sec=same_transient_window_sec,
+    )
+
     for hit in raw_hits:
         if not hit.suppressed:
             _increment_counter(detector_accepted_counts, hit.detector_name)
@@ -1929,10 +2195,25 @@ def extract_drums_from_audio(
             _increment_counter(detector_rejected_counts, hit.detector_name)
 
     _assign_output_velocities(emitted_hits)
+    layered_hits = _to_layered_hits(emitted_hits)
 
     suppressed_duplicate_count = int(sum(duplicate_suppressed_by_class.values()))
+    same_layer_suppressed_count = int(
+        sum(1 for hit in raw_hits if hit.suppressed and bool(hit.same_layer_duplicate))
+    )
+    cross_layer_suppressed_count = int(
+        sum(
+            1
+            for hit in raw_hits
+            if hit.suppressed
+            and not bool(hit.same_layer_duplicate)
+            and hit.suppression_reason in {"merge_conflict", "global_min_spacing"}
+        )
+    )
 
     class_counts = _count_classes(emitted_hits)
+    layer_counts = _count_layer_hits(layered_hits)
+    layer_output_pitch_counts = _count_layer_output_pitch_counts(layered_hits)
     duplicate_interval_summary = _duplicate_interval_summary(emitted_hits, class_refractory_ms)
     too_dense_warning, density_warnings = _evaluate_density_warnings(
         duration_sec=duration_sec,
@@ -1940,6 +2221,11 @@ def extract_drums_from_audio(
         duplicate_interval_summary=duplicate_interval_summary,
     )
     warnings.extend(density_warnings)
+
+    if cross_layer_suppressed_count > 0:
+        warnings.append(
+            "Cross-layer suppression detected; inspect debug CSV for reasons because layered hits should normally coexist."
+        )
 
     if not params.emit_unknown:
         warnings.append("Unknown hits are skipped by default; use --emit-unknown to include them.")
@@ -1949,11 +2235,14 @@ def extract_drums_from_audio(
 
     output_file = params.output_file
     synchronization_preserved = True
+    output_tracks_created = [_track_name_from_layer(layer) for layer in _LAYER_ORDER]
 
     if not params.dry_run:
         track_name = f"drums_from_audio_{params.target_map.replace('-', '_')}"
-        source_length_ticks, output_length_ticks = _build_midi(
+        source_length_ticks, output_length_ticks, output_tracks_created = _build_midi(
             emitted_hits,
+            layered_hits=layered_hits,
+            output_layout=params.output_layout,
             output_path=output_file,
             ticks_per_beat=params.ticks_per_beat,
             bpm_used=bpm_used,
@@ -1980,8 +2269,8 @@ def extract_drums_from_audio(
             for class_name, file_name in _CLASS_FILE_NAMES.items():
                 class_track_name = f"drums_from_audio_{params.target_map.replace('-', '_')}_{class_name}"
                 class_output = output_file.parent / file_name
-                class_source_ticks, class_output_ticks = _build_midi(
-                    by_class[class_name],
+                class_source_ticks, class_output_ticks, _class_tracks = _build_single_track_midi(
+                    hits=by_class[class_name],
                     output_path=class_output,
                     ticks_per_beat=params.ticks_per_beat,
                     bpm_used=bpm_used,
@@ -2012,6 +2301,8 @@ def extract_drums_from_audio(
         bpm_used=float(bpm_used),
         bpm_source=bpm_source,
         detection_mode=params.detection_mode,
+        output_layout=params.output_layout,
+        track_order=[_track_name_from_layer(layer) for layer in _LAYER_ORDER],
         onset_count=len(raw_onset_times),
         raw_onset_count=len(raw_hits),
         accepted_onset_count=len(emitted_hits),
@@ -2029,6 +2320,11 @@ def extract_drums_from_audio(
         class_counts=class_counts,
         output_note_counts=_count_output_notes(emitted_hits),
         output_pitch_counts=_count_output_notes(emitted_hits),
+        layer_counts=layer_counts,
+        layer_output_pitch_counts=layer_output_pitch_counts,
+        cross_layer_simultaneous_hit_count=int(cross_layer_simultaneous_hit_count),
+        same_layer_suppressed_count=same_layer_suppressed_count,
+        cross_layer_suppressed_count=cross_layer_suppressed_count,
         notes_per_second=notes_per_second,
         class_notes_per_second=_class_notes_per_second(class_counts, duration_sec),
         velocity_summary=_velocity_summary(emitted_hits),
