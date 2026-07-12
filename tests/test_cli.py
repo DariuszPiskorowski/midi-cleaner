@@ -228,6 +228,33 @@ def test_midi_set_bpm_help_lists_required_options() -> None:
     assert "--output" in result.stdout
 
 
+def test_midi_split_init_help_lists_required_options() -> None:
+    result = runner.invoke(
+        app,
+        ["midi", "split-init", "--help"],
+        env={"COLUMNS": "240", "LINES": "120"},
+    )
+
+    assert result.exit_code == 0
+    assert "--input" in result.stdout
+    assert "--session" in result.stdout
+    assert "--preview" in result.stdout
+
+
+def test_midi_split_export_help_lists_output_options() -> None:
+    result = runner.invoke(
+        app,
+        ["midi", "split-export", "--help"],
+        env={"COLUMNS": "240", "LINES": "120"},
+    )
+
+    assert result.exit_code == 0
+    assert "--session" in result.stdout
+    assert "--multitrack" in result.stdout
+    assert "--separate-dir" in result.stdout
+    assert "--skip-empty" in result.stdout
+
+
 def test_midi_sync_with_wav_help_lists_required_options() -> None:
     result = runner.invoke(
         app,

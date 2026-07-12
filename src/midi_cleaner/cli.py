@@ -54,6 +54,20 @@ from midi_cleaner.midi.remap_drums import (
     MidiRemapDrumsError,
     remap_drums_file,
 )
+from midi_cleaner.midi_split import (
+    DEFAULT_MAX_TRACKS,
+    MidiSplitExportError,
+    MidiSplitSessionError,
+    add_empty_track,
+    create_split_session,
+    export_split_multitrack_midi,
+    export_split_separate_midi_files,
+    generate_piano_roll_preview,
+    load_session,
+    merge_tracks,
+    move_notes_to_track,
+    save_session,
+)
 from midi_cleaner.midi.set_bpm import MidiSetBpmError, set_midi_bpm
 from midi_cleaner.midi.sync_with_audio import (
     MidiSyncWithAudioError,
@@ -259,6 +273,188 @@ def import_candidate(
         f"notes={import_report.note_count}, "
         f"tracks={import_report.track_count}, "
         f"warnings={import_report.warning_count}"
+    )
+
+
+@midi_app.command("split-init")
+def split_init_command(
+    input_midi: Path = typer.Option(..., "--input", help="Path to input MIDI file."),
+    session: Path = typer.Option(..., "--session", help="Output path for split session JSON."),
+    preview: Path | None = typer.Option(
+        None,
+        "--preview",
+        help="Optional output path for split-session piano-roll preview HTML.",
+    ),
+    source: str = typer.Option("manual", "--source", help="Source label for imported MIDI."),
+    layer: str = typer.Option("midi", "--layer", help="Layer label for imported MIDI."),
+) -> None:
+    try:
+        split_session = create_split_session(input_midi=input_midi, source=source, layer=layer)
+        save_session(split_session, session)
+        if preview is not None:
+            generate_piano_roll_preview(split_session, preview)
+    except MidiSplitSessionError as exc:
+        typer.echo(f"Split session init failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        "Split session created: "
+        f"tracks={len(split_session.tracks)}, "
+        f"notes={len(split_session.notes)}, "
+        f"session={session}, "
+        f"preview={preview if preview is not None else 'none'}"
+    )
+
+
+@midi_app.command("split-add-track")
+def split_add_track_command(
+    session: Path = typer.Option(..., "--session", help="Path to split session JSON."),
+    name: str | None = typer.Option(None, "--name", help="Optional editable track name."),
+    max_tracks: int = typer.Option(
+        DEFAULT_MAX_TRACKS,
+        "--max-tracks",
+        help="Maximum editable track count allowed in the session.",
+    ),
+) -> None:
+    try:
+        split_session = load_session(session)
+        existing_indices = {track.editable_track_index for track in split_session.tracks}
+        updated_session = add_empty_track(split_session, name=name, max_tracks=max_tracks)
+        updated_indices = {track.editable_track_index for track in updated_session.tracks}
+        new_track_index = sorted(updated_indices - existing_indices)[0]
+        new_track = next(
+            track for track in updated_session.tracks if track.editable_track_index == new_track_index
+        )
+        save_session(updated_session, session)
+    except (MidiSplitSessionError, StopIteration, IndexError) as exc:
+        typer.echo(f"Split add-track failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        "Split track added: "
+        f"editable_track_index={new_track.editable_track_index}, "
+        f"name={new_track.name}, "
+        f"track_count={len(updated_session.tracks)}"
+    )
+
+
+@midi_app.command("split-move-notes")
+def split_move_notes_command(
+    session: Path = typer.Option(..., "--session", help="Path to split session JSON."),
+    note_ids: str = typer.Option(
+        ...,
+        "--note-ids",
+        help="Comma-separated note_id values to move.",
+    ),
+    target_track: int = typer.Option(..., "--target-track", help="Target editable track index."),
+) -> None:
+    normalized_note_ids = [token.strip() for token in note_ids.split(",") if token.strip()]
+    if not normalized_note_ids:
+        typer.echo("No note IDs provided. Use --note-ids id1,id2,...", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        split_session = load_session(session)
+        updated_session = move_notes_to_track(
+            split_session,
+            note_ids=normalized_note_ids,
+            target_track_index=target_track,
+        )
+        save_session(updated_session, session)
+    except MidiSplitSessionError as exc:
+        typer.echo(f"Split move-notes failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        "Split notes moved: "
+        f"moved_count={len(normalized_note_ids)}, "
+        f"target_track={target_track}"
+    )
+
+
+@midi_app.command("split-merge-tracks")
+def split_merge_tracks_command(
+    session: Path = typer.Option(..., "--session", help="Path to split session JSON."),
+    tracks: str = typer.Option(
+        ...,
+        "--tracks",
+        help="Comma-separated editable track indices to merge.",
+    ),
+) -> None:
+    raw_tokens = [token.strip() for token in tracks.split(",") if token.strip()]
+    if not raw_tokens:
+        typer.echo("No track indices provided. Use --tracks 1,2,...", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        selected_indices = [int(token) for token in raw_tokens]
+    except ValueError as exc:
+        typer.echo("Invalid --tracks value. Use comma-separated integers.", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if len(set(selected_indices)) < 2:
+        typer.echo("At least two editable tracks are required for merge.", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        split_session = load_session(session)
+        updated_session = merge_tracks(split_session, editable_track_indices=selected_indices)
+        save_session(updated_session, session)
+    except MidiSplitSessionError as exc:
+        typer.echo(f"Split merge-tracks failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        "Split tracks merged: "
+        f"selected={','.join(str(index) for index in sorted(set(selected_indices)))}, "
+        f"target={min(selected_indices)}, "
+        f"track_count={len(updated_session.tracks)}"
+    )
+
+
+@midi_app.command("split-export")
+def split_export_command(
+    session: Path = typer.Option(..., "--session", help="Path to split session JSON."),
+    multitrack: Path | None = typer.Option(
+        None,
+        "--multitrack",
+        help="Optional output path for combined multitrack MIDI.",
+    ),
+    separate_dir: Path | None = typer.Option(
+        None,
+        "--separate-dir",
+        help="Optional output directory for per-track split MIDI files.",
+    ),
+    skip_empty: bool = typer.Option(
+        True,
+        "--skip-empty/--no-skip-empty",
+        help="Skip empty tracks when writing separate per-track MIDI files.",
+    ),
+) -> None:
+    if multitrack is None and separate_dir is None:
+        typer.echo("Provide at least one output target: --multitrack and/or --separate-dir.", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        split_session = load_session(session)
+        if multitrack is not None:
+            export_split_multitrack_midi(split_session, output_midi=multitrack)
+        separate_paths: list[Path] = []
+        if separate_dir is not None:
+            separate_paths = export_split_separate_midi_files(
+                split_session,
+                output_dir=separate_dir,
+                skip_empty=skip_empty,
+            )
+    except (MidiSplitSessionError, MidiSplitExportError) as exc:
+        typer.echo(f"Split export failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        "Split export complete: "
+        f"multitrack={multitrack if multitrack is not None else 'none'}, "
+        f"separate_count={len(separate_paths)}, "
+        f"separate_dir={separate_dir if separate_dir is not None else 'none'}"
     )
 
 
