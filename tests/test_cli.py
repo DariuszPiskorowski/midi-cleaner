@@ -255,6 +255,18 @@ def test_midi_split_export_help_lists_output_options() -> None:
     assert "--skip-empty" in result.stdout
 
 
+def test_midi_split_preview_help_lists_required_options() -> None:
+    result = runner.invoke(
+        app,
+        ["midi", "split-preview", "--help"],
+        env={"COLUMNS": "240", "LINES": "120"},
+    )
+
+    assert result.exit_code == 0
+    assert "--session" in result.stdout
+    assert "--preview" in result.stdout
+
+
 def test_midi_sync_with_wav_help_lists_required_options() -> None:
     result = runner.invoke(
         app,

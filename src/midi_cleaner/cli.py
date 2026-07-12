@@ -306,6 +306,26 @@ def split_init_command(
     )
 
 
+@midi_app.command("split-preview")
+def split_preview_command(
+    session: Path = typer.Option(..., "--session", help="Path to split session JSON."),
+    preview: Path = typer.Option(..., "--preview", help="Output path for split editor HTML."),
+) -> None:
+    try:
+        split_session = load_session(session)
+        generate_piano_roll_preview(split_session, preview)
+    except MidiSplitSessionError as exc:
+        typer.echo(f"Split preview generation failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        "Split preview generated: "
+        f"tracks={len(split_session.tracks)}, "
+        f"notes={len(split_session.notes)}, "
+        f"preview={preview}"
+    )
+
+
 @midi_app.command("split-add-track")
 def split_add_track_command(
     session: Path = typer.Option(..., "--session", help="Path to split session JSON."),

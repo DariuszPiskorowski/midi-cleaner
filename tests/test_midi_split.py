@@ -246,4 +246,33 @@ def test_generate_piano_roll_preview_creates_html_with_embedded_note_data(tmp_pa
     assert "<canvas" in html
     assert "session-json" in html
     assert '"notes"' in html
+    assert '"tracks"' in html
     assert session.notes[0].note_id in html
+
+
+def test_generate_piano_roll_preview_contains_editor_toolbar_actions(tmp_path: Path) -> None:
+    session = _create_session(tmp_path)
+    output_html = tmp_path / "split_editor.html"
+
+    generate_piano_roll_preview(session, output_html)
+
+    html = output_html.read_text(encoding="utf-8")
+    assert "Move selected to track" in html
+    assert "Add track" in html
+    assert "Merge selected tracks" in html
+    assert "Download updated session JSON" in html
+
+
+def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tmp_path: Path) -> None:
+    session = _create_session(tmp_path)
+    output_html = tmp_path / "split_editor.html"
+
+    generate_piano_roll_preview(session, output_html)
+
+    html = output_html.read_text(encoding="utf-8")
+    assert "function selectNoteById" in html
+    assert "function selectNotesInRect" in html
+    assert "function moveSelectedToTrack" in html
+    assert "function addTrack" in html
+    assert "function mergeSelectedTracks" in html
+    assert "function downloadSessionJson" in html
