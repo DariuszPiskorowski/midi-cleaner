@@ -109,6 +109,9 @@ class _MidiSplitEditorRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(body)
 
@@ -123,6 +126,9 @@ class _MidiSplitEditorRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         if download_name is not None:
             self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
         self.end_headers()
@@ -169,10 +175,6 @@ class _MidiSplitEditorRequestHandler(BaseHTTPRequestHandler):
             self._handle_import_midi(parsed)
             return
 
-        if parsed.path == "/api/save-session":
-            self._handle_save_session()
-            return
-
         if parsed.path == "/api/export-multitrack":
             self._handle_export_multitrack()
             return
@@ -205,16 +207,6 @@ class _MidiSplitEditorRequestHandler(BaseHTTPRequestHandler):
                 return
 
         session = session.model_copy(update={"source_midi": safe_name})
-        self.editor_state.set_session(session)
-        self._send_json(session.model_dump(mode="json"), status=HTTPStatus.OK)
-
-    def _handle_save_session(self) -> None:
-        try:
-            session = self._parse_session_json()
-        except MidiSplitEditorServerError as exc:
-            self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
-            return
-
         self.editor_state.set_session(session)
         self._send_json(session.model_dump(mode="json"), status=HTTPStatus.OK)
 

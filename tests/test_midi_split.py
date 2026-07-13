@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import mido
@@ -88,6 +89,13 @@ def _create_session(tmp_path: Path):
     midi_path = tmp_path / "source.mid"
     _write_split_source_midi(midi_path)
     return create_split_session(midi_path, source="manual", layer="midi")
+
+
+def _extract_editor_script(html: str) -> str:
+    match = re.search(r"<script>\s*\(function \(\) \{(?P<script>.*)\}\)\(\);\s*</script>", html, re.DOTALL)
+    if match is None:
+        raise AssertionError("Could not extract inline editor script")
+    return match.group("script")
 
 
 def test_split_init_imports_notes_and_creates_tracks_from_note_tracks(tmp_path: Path) -> None:
@@ -260,10 +268,14 @@ def test_generate_piano_roll_preview_contains_editor_toolbar_actions(tmp_path: P
     assert "Move selected to track" in html
     assert "Add track" in html
     assert "Merge selected tracks" in html
-    assert "Import MIDI" in html
-    assert "Export Multitrack MIDI" in html
-    assert "Export Separate Tracks ZIP" in html
-    assert "Download updated session JSON" in html
+    assert 'id="import-midi-label"' in html
+    assert 'for="import-midi-input"' in html
+    assert 'id="export-multitrack-btn"' in html
+    assert 'id="export-separate-btn"' in html
+    assert 'id="save-session-btn"' not in html
+    assert 'id="download-session-btn"' not in html
+    assert "Server: checking" in html
+    assert "midi-split-editor-build" in html
     assert "Select" in html
     assert "Zoom" in html
     assert "Hand" in html
@@ -276,6 +288,7 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     generate_piano_roll_preview(session, output_html)
 
     html = output_html.read_text(encoding="utf-8")
+    script = _extract_editor_script(html)
     assert "function selectNoteById" in html
     assert "function selectNotesInRect" in html
     assert "function moveSelectedToTrack" in html
@@ -284,8 +297,67 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function importMidi" in html
     assert "function exportMultitrackMidi" in html
     assert "function exportSeparateTracks" in html
-    assert "function downloadSessionJson" in html
     assert "let currentTool" in html
     assert "function handleCanvasWheel" in html
     assert "currentTool === \"zoom\"" in html
     assert "currentTool === \"pan\"" in html
+    assert "function checkServerConnection" in html
+    assert "function applyImportedSession" in html
+    assert "function fitImportedNotesToView" in html
+    assert "function renderAll" in html
+    assert "function setErrorStatus" in html
+    assert "console.error(\"MIDI split editor error:\", details);" in script
+
+
+def test_generate_piano_roll_preview_import_flow_wires_file_input_and_resets_value(tmp_path: Path) -> None:
+    session = _create_session(tmp_path)
+    output_html = tmp_path / "split_editor.html"
+
+    generate_piano_roll_preview(session, output_html)
+
+    script = _extract_editor_script(output_html.read_text(encoding="utf-8"))
+    assert 'const importLabel = document.getElementById("import-midi-label");' in script
+    assert 'const importInput = document.getElementById("import-midi-input");' in script
+    assert re.search(
+        r'importLabel\.addEventListener\("click",\s*function \(event\) \{.*?setStatus\("Import control activated"',
+        script,
+        re.DOTALL,
+    )
+    assert "importInput.click()" not in script
+    assert re.search(
+        r'importInput\.addEventListener\("change",\s*function \(event\) \{.*?const input = event\.target;.*?importMidi\(file\)\.finally\(function \(\) \{\s*if \(input\) \{\s*input\.value = "";',
+        script,
+        re.DOTALL,
+    )
+    assert "applyImportedSession(payload);" in script
+    assert "setStatus(\"Replacing editor session\", false);" in script
+    assert "Imported " in script and " notes from " in script
+
+
+def test_generate_piano_roll_preview_export_flow_has_blob_download_and_error_guards(tmp_path: Path) -> None:
+    session = _create_session(tmp_path)
+    output_html = tmp_path / "split_editor.html"
+
+    generate_piano_roll_preview(session, output_html)
+
+    script = _extract_editor_script(output_html.read_text(encoding="utf-8"))
+    assert "async function exportSessionToDownload(options)" in script
+    assert "if (!response.ok)" in script
+    assert "data = await response.arrayBuffer();" in script
+    assert "downloadBlob(data, contentType, fileName);" in script
+    assert "URL.revokeObjectURL(href);" in script
+    assert "setErrorStatus(operationLabel + \" failed: server unavailable.\", error);" in script
+    assert "const requestBody = JSON.stringify(session);" in script
+
+
+def test_generate_piano_roll_preview_disables_server_actions_in_static_mode(tmp_path: Path) -> None:
+    session = _create_session(tmp_path)
+    output_html = tmp_path / "split_editor.html"
+
+    generate_piano_roll_preview(session, output_html)
+
+    script = _extract_editor_script(output_html.read_text(encoding="utf-8"))
+    assert "function setServerActionControlsEnabled(enabled, disabledReason)" in script
+    assert "fetch(\"/api/session\", {" in script
+    assert "cache: \"no-store\"" in script
+    assert "Server connection unavailable. Start the editor with: midi-cleaner midi split-editor" in script

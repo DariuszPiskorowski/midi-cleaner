@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 
@@ -9,12 +10,14 @@ from midi_cleaner.midi_split.models import MidiSplitSession
 def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
     payload = session.model_dump(mode="json")
     payload_json = json.dumps(payload, ensure_ascii=True).replace("</", "<\\/")
+    build_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
     template = """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="midi-split-editor-build" content="__BUILD_ID__" />
   <title>MIDI Split Editor Preview</title>
   <style>
     * { box-sizing: border-box; }
@@ -35,6 +38,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       font-size: 13px;
     }
     #toolbar button,
+    #toolbar .toolbar-button,
     #toolbar select {
       padding: 4px 8px;
       font-size: 12px;
@@ -42,10 +46,30 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       background: #2e2e2e;
       color: #f5f5f5;
       cursor: pointer;
+      text-decoration: none;
+    }
+    #toolbar .toolbar-button {
+      display: inline-block;
+      line-height: 1.2;
     }
     #toolbar button.active-tool {
       border-color: #9ab8ff;
       background: #3b4d7d;
+    }
+    #toolbar button:disabled,
+    #toolbar .toolbar-button.disabled-control {
+      opacity: 0.45;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+    #server-status {
+      font-size: 12px;
+      color: #b9d0ff;
+    }
+    #build-id {
+      margin-left: auto;
+      font-size: 11px;
+      color: #aaaaaa;
     }
     #status-line {
       padding: 4px 8px;
@@ -54,6 +78,9 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       font-size: 12px;
       color: #d9d9d9;
       background: #1d1d1d;
+    }
+    #status-line.error {
+      color: #ffb3b3;
     }
     #layout {
       display: flex;
@@ -112,12 +139,12 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
     <span id="source-name">-</span>
     <span>|</span>
     <span>Selected notes: <strong id="selected-count">0</strong></span>
+    <span>|</span>
+    <span id="server-status">Server: checking</span>
 
-    <button id="import-midi-btn" type="button">Import MIDI</button>
+    <label id="import-midi-label" class="toolbar-button" for="import-midi-input">Import MIDI</label>
     <button id="export-multitrack-btn" type="button">Export Multitrack MIDI</button>
     <button id="export-separate-btn" type="button">Export Separate Tracks ZIP</button>
-    <button id="save-session-btn" type="button">Save Session JSON</button>
-    <button id="download-session-btn" type="button">Download updated session JSON</button>
 
     <span>|</span>
     <button id="tool-select-btn" type="button">Select</button>
@@ -131,7 +158,8 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
     <button id="add-track-btn" type="button">Add track</button>
     <button id="merge-tracks-btn" type="button">Merge selected tracks</button>
     <button id="clear-selection-btn" type="button">Clear selection</button>
-    <input id="import-midi-input" type="file" accept=".mid,.midi" style="display:none" />
+    <span id="build-id">Build: __BUILD_ID__</span>
+    <input id="import-midi-input" type="file" accept=".mid,.midi,audio/midi,audio/x-midi" hidden />
   </div>
   <div id="status-line">Ready.</div>
   <div id="layout">
@@ -202,16 +230,27 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       const selectedCountEl = document.getElementById("selected-count");
       const targetTrackEl = document.getElementById("target-track");
       const statusEl = document.getElementById("status-line");
+      const serverStatusEl = document.getElementById("server-status");
       const trackPanelEl = document.getElementById("track-panel");
       const rollWrapEl = document.getElementById("roll-wrap");
       const canvas = document.getElementById("roll-canvas");
       const ctx = canvas.getContext("2d");
+      const importInput = document.getElementById("import-midi-input");
+      const importLabel = document.getElementById("import-midi-label");
+      const exportMultitrackButton = document.getElementById("export-multitrack-btn");
+      const exportSeparateButton = document.getElementById("export-separate-btn");
 
       const toolButtons = {
         select: document.getElementById("tool-select-btn"),
         zoom: document.getElementById("tool-zoom-btn"),
         pan: document.getElementById("tool-pan-btn"),
       };
+
+      const serverActionControls = [
+        importLabel,
+        exportMultitrackButton,
+        exportSeparateButton,
+      ];
 
       const state = {
         selectedNoteIds: new Set(),
@@ -223,14 +262,112 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         pitchMax: 108,
         pixelsPerTick: DEFAULT_PIXELS_PER_TICK,
         xOffsetTicks: 0,
+        serverConnected: false,
       };
 
-      function supportsServerApi() {
-        return window.location.protocol === "http:" || window.location.protocol === "https:";
+      function setStatus(text, isError) {
+        const hasError = Boolean(isError);
+        statusEl.classList.toggle("error", hasError);
+        statusEl.textContent = text;
       }
 
-      function setStatus(text) {
-        statusEl.textContent = text;
+      function setErrorStatus(text, details) {
+        if (details !== undefined) {
+          console.error("MIDI split editor error:", details);
+        }
+        setStatus(text, true);
+      }
+
+      function setServerStatus(connected, label) {
+        state.serverConnected = Boolean(connected);
+        if (state.serverConnected) {
+          serverStatusEl.textContent = "Server: connected";
+          serverStatusEl.style.color = "#8be0a5";
+          return;
+        }
+        const text = String(label || "Server: unavailable");
+        serverStatusEl.textContent = text;
+        serverStatusEl.style.color = "#ffb3b3";
+      }
+
+      function setServerActionControlsEnabled(enabled, disabledReason) {
+        const isEnabled = Boolean(enabled);
+        const reason = String(disabledReason || "");
+
+        for (const control of serverActionControls) {
+          if (control instanceof HTMLButtonElement) {
+            control.disabled = !isEnabled;
+          } else {
+            control.classList.toggle("disabled-control", !isEnabled);
+            control.setAttribute("aria-disabled", String(!isEnabled));
+          }
+
+          if (reason) {
+            control.title = reason;
+          } else {
+            control.removeAttribute("title");
+          }
+        }
+
+        importInput.disabled = !isEnabled;
+      }
+
+      function ensureUsableSessionPayload(payload, operationLabel) {
+        if (!payload || typeof payload !== "object") {
+          throw new Error(operationLabel + " failed: empty JSON response.");
+        }
+        if (!Array.isArray(payload.tracks) || !Array.isArray(payload.notes)) {
+          throw new Error(operationLabel + " failed: response does not contain tracks/notes.");
+        }
+      }
+
+      async function checkServerConnection() {
+        setServerStatus(false, "Server: checking");
+        setStatus("Checking server connection...", false);
+
+        try {
+          const response = await fetch("/api/session", {
+            method: "GET",
+            cache: "no-store",
+          });
+          const payload = await parseJsonResponse(response, "Server session check");
+          ensureUsableSessionPayload(payload, "Server session check");
+          setServerActionControlsEnabled(true, "");
+          setServerStatus(true);
+          setStatus("Server connected.", false);
+          return payload;
+        } catch (error) {
+          const message = "Server connection unavailable. Start the editor with: midi-cleaner midi split-editor";
+          setServerActionControlsEnabled(false, message);
+          setServerStatus(false);
+          setErrorStatus(message, error);
+          return null;
+        }
+      }
+
+      async function parseJsonResponse(response, operationLabel) {
+        const raw = await response.text();
+        let payload = null;
+        if (raw.trim()) {
+          try {
+            payload = JSON.parse(raw);
+          } catch (error) {
+            if (response.ok) {
+              throw new Error(operationLabel + " failed: response is not valid JSON.");
+            }
+          }
+        }
+
+        if (!response.ok) {
+          const detail = payload && typeof payload.message === "string" && payload.message.trim()
+            ? payload.message.trim()
+            : (raw.trim() || "unknown server error");
+          throw new Error(operationLabel + " failed (HTTP " + String(response.status) + "): " + detail);
+        }
+
+        ensureUsableSessionPayload(payload, operationLabel);
+
+        return payload;
       }
 
       function colorForTrack(trackIndex) {
@@ -444,17 +581,63 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         }
       }
 
-      function setSessionData(newSession) {
-        session = normalizeSession(newSession);
-        sortTracks();
-        sortNotes();
+      function resetDerivedSessionState() {
         state.mergeTrackIndices.clear();
-        clearSelection();
+        state.dragSelect = null;
+        state.panDrag = null;
+        state.noteBoxes = [];
+        state.pixelsPerTick = DEFAULT_PIXELS_PER_TICK;
         state.xOffsetTicks = 0;
+        clearSelection();
+      }
+
+      function renderAll() {
         sourceNameEl.textContent = String(session.source_midi || "-");
         updateTargetTrackDropdown();
         renderTrackPanel();
         redraw();
+      }
+
+      function setSessionData(newSession) {
+        session = normalizeSession(newSession);
+        sortTracks();
+        sortNotes();
+        rebuildTrackSources();
+        resetDerivedSessionState();
+      }
+
+      function fitImportedNotesToView() {
+        if (!session.notes.length) {
+          state.pixelsPerTick = DEFAULT_PIXELS_PER_TICK;
+          state.xOffsetTicks = 0;
+          return;
+        }
+
+        let minStartTick = Number.POSITIVE_INFINITY;
+        let maxEndTick = 0;
+        for (const note of session.notes) {
+          minStartTick = Math.min(minStartTick, Number(note.start_tick || 0));
+          maxEndTick = Math.max(maxEndTick, Number(note.end_tick || 0));
+        }
+
+        const ticksPerBeat = Math.max(1, Number(session.ticks_per_beat || 480));
+        const widthPx = Math.max(120, Number(rollWrapEl.clientWidth || MIN_CANVAS_WIDTH) - LEFT_PAD - RIGHT_PAD);
+        const visibleSpanTicks = Math.max(ticksPerBeat, maxEndTick - minStartTick + ticksPerBeat);
+        const suggestedPixelsPerTick = widthPx / visibleSpanTicks;
+
+        state.pixelsPerTick = Math.max(
+          MIN_PIXELS_PER_TICK,
+          Math.min(MAX_PIXELS_PER_TICK, suggestedPixelsPerTick)
+        );
+        state.xOffsetTicks = Math.max(0, minStartTick - ticksPerBeat * 0.5);
+        clampXOffsetTicks();
+      }
+
+      function applyImportedSession(payload) {
+        setStatus("Replacing editor session", false);
+        setSessionData(payload);
+        fitImportedNotesToView();
+        renderAll();
       }
 
       function rebuildNoteBoxes() {
@@ -852,44 +1035,20 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         const blob = new Blob([data], { type: mimeType });
         const href = URL.createObjectURL(blob);
         const link = document.createElement("a");
-        link.href = href;
-        link.download = fileName;
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        URL.revokeObjectURL(href);
+        try {
+          link.href = href;
+          link.download = fileName;
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+        } finally {
+          URL.revokeObjectURL(href);
+        }
       }
 
       function sessionBaseName() {
         const sourceName = String(session.source_midi || "split_session").split(/[/\\\\]/).pop() || "split_session";
         return sourceName.replace(/[.][^.]+$/, "") || "split_session";
-      }
-
-      function downloadSessionJson() {
-        const pretty = JSON.stringify(session, null, 2) + "\\n";
-        const fileName = sessionBaseName() + "_split_session_updated.json";
-        downloadBlob(pretty, "application/json", fileName);
-        setStatus("Downloaded " + fileName + ".");
-      }
-
-      async function saveSessionToServer() {
-        if (!supportsServerApi()) {
-          setStatus("Saving to server requires running 'midi split-editor'.");
-          return;
-        }
-
-        const response = await fetch("/api/save-session", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(session),
-        });
-        if (!response.ok) {
-          setStatus("Save to server failed: HTTP " + String(response.status));
-          return;
-        }
-        const payload = await response.json();
-        setSessionData(payload);
-        setStatus("Session saved to server memory.");
       }
 
       function filenameFromDisposition(contentDisposition, fallback) {
@@ -900,110 +1059,207 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         if (!match) {
           return fallback;
         }
-        return match[1];
+        const candidate = match[1].trim();
+        if (!candidate) {
+          return fallback;
+        }
+        return candidate.replace(/[\\/]/g, "_");
       }
 
       async function importMidi(file) {
-        if (!supportsServerApi()) {
-          setStatus("MIDI import requires running 'midi split-editor'.");
+        if (!state.serverConnected) {
+          setErrorStatus("Server connection unavailable. Start the editor with: midi-cleaner midi split-editor");
           return;
         }
-        const url = "/api/import-midi?filename=" + encodeURIComponent(file.name || "uploaded.mid");
-        const response = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/octet-stream" },
-          body: await file.arrayBuffer(),
-        });
+        if (!file) {
+          setErrorStatus("No MIDI file selected for import.");
+          return;
+        }
+
+        const fileName = String(file.name || "uploaded.mid");
+        console.info("Import control activated");
+        setStatus("File selected: " + fileName, false);
+
+        let fileBytes;
+        try {
+          console.info("Reading file");
+          setStatus("Reading file", false);
+          fileBytes = await file.arrayBuffer();
+        } catch (error) {
+          setErrorStatus("Could not read selected MIDI file.", error);
+          return;
+        }
+
+        const url = "/api/import-midi?filename=" + encodeURIComponent(fileName);
+        let response;
+        try {
+          console.info("Uploading MIDI");
+          setStatus("Uploading MIDI", false);
+          response = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/octet-stream" },
+            body: fileBytes,
+          });
+        } catch (error) {
+          setErrorStatus("MIDI import failed: server unavailable.", error);
+          return;
+        }
+
+        let payload;
+        try {
+          console.info("Import response received");
+          setStatus("Import response received", false);
+          payload = await parseJsonResponse(response, "MIDI import");
+          ensureUsableSessionPayload(payload, "MIDI import");
+        } catch (error) {
+          setErrorStatus(String(error.message || error), error);
+          return;
+        }
+
+        try {
+          console.info("Replacing editor session");
+          applyImportedSession(payload);
+        } catch (error) {
+          setErrorStatus("MIDI import succeeded but UI refresh failed.", error);
+          return;
+        }
+
+        const noteCount = Array.isArray(payload.notes) ? payload.notes.length : 0;
+        const trackCount = Array.isArray(payload.tracks) ? payload.tracks.length : 0;
+        console.info("Imported " + String(noteCount) + " notes from " + String(trackCount) + " tracks");
+        setStatus(
+          "Imported " + String(noteCount) + " notes from " + String(trackCount) + " tracks: " + fileName,
+          false
+        );
+      }
+
+      async function exportSessionToDownload(options) {
+        if (!state.serverConnected) {
+          setErrorStatus("Server connection unavailable. Start the editor with: midi-cleaner midi split-editor");
+          return;
+        }
+
+        const endpoint = String(options.endpoint);
+        const operationLabel = String(options.operationLabel);
+        const fallbackFileName = String(options.fallbackFileName);
+        const expectedMimePrefix = String(options.expectedMimePrefix);
+        const successLabel = String(options.successLabel);
+        const requestBody = JSON.stringify(session);
+
+        setStatus(operationLabel + " in progress...", false);
+
+        let response;
+        try {
+          response = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: requestBody,
+          });
+        } catch (error) {
+          setErrorStatus(operationLabel + " failed: server unavailable.", error);
+          return;
+        }
+
         if (!response.ok) {
-          setStatus("MIDI import failed: HTTP " + String(response.status));
+          try {
+            await parseJsonResponse(response, operationLabel);
+          } catch (error) {
+            setErrorStatus(String(error.message || error), error);
+          }
           return;
         }
-        const payload = await response.json();
-        setSessionData(payload);
-        setStatus("Imported MIDI: " + String(file.name || "uploaded.mid") + ".");
+
+        const contentType = String(response.headers.get("Content-Type") || "").toLowerCase();
+        if (!contentType.startsWith(expectedMimePrefix)) {
+          setErrorStatus(
+            operationLabel + " failed: unexpected response type '" + contentType + "'."
+          );
+          return;
+        }
+
+        let data;
+        try {
+          data = await response.arrayBuffer();
+        } catch (error) {
+          setErrorStatus(operationLabel + " failed: could not read response body.", error);
+          return;
+        }
+
+        if (!data || data.byteLength <= 0) {
+          setErrorStatus(operationLabel + " failed: exported file is empty.");
+          return;
+        }
+
+        const fileName = filenameFromDisposition(
+          response.headers.get("Content-Disposition"),
+          fallbackFileName
+        );
+
+        try {
+          downloadBlob(data, contentType, fileName);
+        } catch (error) {
+          setErrorStatus(operationLabel + " failed while preparing browser download.", error);
+          return;
+        }
+
+        console.info(successLabel + ": " + fileName);
+        setStatus(successLabel + ": " + fileName + ".", false);
       }
 
       async function exportMultitrackMidi() {
-        if (!supportsServerApi()) {
-          setStatus("Direct MIDI export requires running 'midi split-editor'.");
-          return;
-        }
-        const response = await fetch("/api/export-multitrack", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(session),
+        await exportSessionToDownload({
+          endpoint: "/api/export-multitrack",
+          operationLabel: "Export multitrack MIDI",
+          fallbackFileName: sessionBaseName() + "_split.mid",
+          expectedMimePrefix: "audio/midi",
+          successLabel: "Exported multitrack MIDI",
         });
-        if (!response.ok) {
-          setStatus("Export multitrack failed: HTTP " + String(response.status));
-          return;
-        }
-        const fileName = filenameFromDisposition(
-          response.headers.get("Content-Disposition"),
-          sessionBaseName() + "_split.mid"
-        );
-        const data = await response.arrayBuffer();
-        downloadBlob(data, "audio/midi", fileName);
-        setStatus("Exported multitrack MIDI: " + fileName + ".");
       }
 
       async function exportSeparateTracks() {
-        if (!supportsServerApi()) {
-          setStatus("Direct MIDI export requires running 'midi split-editor'.");
-          return;
-        }
-        const response = await fetch("/api/export-separate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(session),
+        await exportSessionToDownload({
+          endpoint: "/api/export-separate",
+          operationLabel: "Export separate tracks ZIP",
+          fallbackFileName: sessionBaseName() + "_split_tracks.zip",
+          expectedMimePrefix: "application/zip",
+          successLabel: "Exported separate track ZIP",
         });
-        if (!response.ok) {
-          setStatus("Export separate tracks failed: HTTP " + String(response.status));
-          return;
-        }
-        const fileName = filenameFromDisposition(
-          response.headers.get("Content-Disposition"),
-          sessionBaseName() + "_split_tracks.zip"
-        );
-        const data = await response.arrayBuffer();
-        downloadBlob(data, "application/zip", fileName);
-        setStatus("Exported separate track ZIP: " + fileName + ".");
       }
 
       function bindToolbarActions() {
         document.getElementById("move-selected-btn").addEventListener("click", moveSelectedToTrack);
         document.getElementById("add-track-btn").addEventListener("click", addTrack);
         document.getElementById("merge-tracks-btn").addEventListener("click", mergeSelectedTracks);
-        document.getElementById("download-session-btn").addEventListener("click", downloadSessionJson);
-        document.getElementById("save-session-btn").addEventListener("click", function () {
-          saveSessionToServer().catch(function (error) {
-            setStatus("Save session failed: " + String(error));
-          });
-        });
 
-        const importInput = document.getElementById("import-midi-input");
-        document.getElementById("import-midi-btn").addEventListener("click", function () {
-          importInput.value = "";
-          importInput.click();
-        });
-        importInput.addEventListener("change", function () {
-          const file = importInput.files && importInput.files[0] ? importInput.files[0] : null;
-          if (!file) {
+        importLabel.addEventListener("click", function (event) {
+          setStatus("Import control activated", false);
+          console.info("Import control activated");
+          if (importInput.disabled || !state.serverConnected) {
+            event.preventDefault();
+            setErrorStatus("Server connection unavailable. Start the editor with: midi-cleaner midi split-editor");
             return;
           }
-          importMidi(file).catch(function (error) {
-            setStatus("MIDI import failed: " + String(error));
+        });
+
+        importInput.addEventListener("change", function (event) {
+          const input = event.target;
+          const file = input && input.files && input.files[0] ? input.files[0] : null;
+          if (!file) {
+            setStatus("No file selected.", false);
+            return;
+          }
+          importMidi(file).finally(function () {
+            if (input) {
+              input.value = "";
+            }
           });
         });
 
-        document.getElementById("export-multitrack-btn").addEventListener("click", function () {
-          exportMultitrackMidi().catch(function (error) {
-            setStatus("Export multitrack failed: " + String(error));
-          });
+        exportMultitrackButton.addEventListener("click", function () {
+          exportMultitrackMidi();
         });
-        document.getElementById("export-separate-btn").addEventListener("click", function () {
-          exportSeparateTracks().catch(function (error) {
-            setStatus("Export separate failed: " + String(error));
-          });
+        exportSeparateButton.addEventListener("click", function () {
+          exportSeparateTracks();
         });
 
         document.getElementById("clear-selection-btn").addEventListener("click", function () {
@@ -1025,8 +1281,14 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         window.addEventListener("resize", redraw);
       }
 
-      function initialize() {
+      async function initialize() {
+        setServerActionControlsEnabled(
+          false,
+          "Server connection unavailable. Start the editor with: midi-cleaner midi split-editor"
+        );
+        setServerStatus(false, "Server: checking");
         setSessionData(session);
+        renderAll();
         setTool("select");
         bindToolbarActions();
         bindCanvasActions();
@@ -1058,7 +1320,6 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           importMidi: importMidi,
           exportMultitrackMidi: exportMultitrackMidi,
           exportSeparateTracks: exportSeparateTracks,
-          downloadSessionJson: downloadSessionJson,
           clearSelection: function () {
             clearSelection();
             redraw();
@@ -1068,6 +1329,9 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
               pixelsPerTick: state.pixelsPerTick,
               xOffsetTicks: state.xOffsetTicks,
             };
+          },
+          isServerConnected: function () {
+            return state.serverConnected;
           },
           getNoteBoxes: function () {
             return state.noteBoxes.map(function (box) {
@@ -1081,16 +1345,23 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
             });
           },
         };
+
+        const serverSession = await checkServerConnection();
+        if (serverSession) {
+          applyImportedSession(serverSession);
+        }
       }
 
-      initialize();
+      initialize().catch(function (error) {
+        setErrorStatus("Editor initialization failed.", error);
+      });
     })();
   </script>
 </body>
 </html>
 """
 
-    return template.replace("__SESSION_JSON__", payload_json)
+    return template.replace("__SESSION_JSON__", payload_json).replace("__BUILD_ID__", build_id)
 
 
 def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) -> None:
