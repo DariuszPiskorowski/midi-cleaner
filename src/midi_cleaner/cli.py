@@ -56,6 +56,7 @@ from midi_cleaner.midi.remap_drums import (
 )
 from midi_cleaner.midi_split import (
     DEFAULT_MAX_TRACKS,
+    MidiSplitEditorServerError,
     MidiSplitExportError,
     MidiSplitSessionError,
     add_empty_track,
@@ -66,6 +67,7 @@ from midi_cleaner.midi_split import (
     load_session,
     merge_tracks,
     move_notes_to_track,
+    run_split_editor_server,
     save_session,
 )
 from midi_cleaner.midi.set_bpm import MidiSetBpmError, set_midi_bpm
@@ -324,6 +326,43 @@ def split_preview_command(
         f"notes={len(split_session.notes)}, "
         f"preview={preview}"
     )
+
+
+@midi_app.command("split-editor")
+def split_editor_command(
+    input_midi: Path | None = typer.Option(
+        None,
+        "--input",
+        help="Optional input MIDI path for initial session.",
+    ),
+    session: Path | None = typer.Option(
+        None,
+        "--session",
+        help="Optional split session JSON path for initial session.",
+    ),
+    host: str = typer.Option("127.0.0.1", "--host", help="Server bind host."),
+    port: int = typer.Option(0, "--port", help="Server bind port. Use 0 for auto free port."),
+    no_open: bool = typer.Option(False, "--no-open", help="Do not open browser automatically."),
+) -> None:
+    if input_midi is not None and session is not None:
+        typer.echo("Use either --input or --session as initial source, not both.", err=True)
+        raise typer.Exit(code=1)
+
+    if port < 0 or port > 65535:
+        typer.echo("Invalid --port. Use 0..65535.", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        run_split_editor_server(
+            input_midi=input_midi,
+            session_path=session,
+            host=host,
+            port=port,
+            open_browser=not no_open,
+        )
+    except MidiSplitEditorServerError as exc:
+        typer.echo(f"Split editor server failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
 
 @midi_app.command("split-add-track")

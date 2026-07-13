@@ -260,7 +260,13 @@ def test_generate_piano_roll_preview_contains_editor_toolbar_actions(tmp_path: P
     assert "Move selected to track" in html
     assert "Add track" in html
     assert "Merge selected tracks" in html
+    assert "Import MIDI" in html
+    assert "Export Multitrack MIDI" in html
+    assert "Export Separate Tracks ZIP" in html
     assert "Download updated session JSON" in html
+    assert "Select" in html
+    assert "Zoom" in html
+    assert "Hand" in html
 
 
 def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tmp_path: Path) -> None:
@@ -275,4 +281,11 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function moveSelectedToTrack" in html
     assert "function addTrack" in html
     assert "function mergeSelectedTracks" in html
+    assert "function importMidi" in html
+    assert "function exportMultitrackMidi" in html
+    assert "function exportSeparateTracks" in html
     assert "function downloadSessionJson" in html
+    assert "let currentTool" in html
+    assert "function handleCanvasWheel" in html
+    assert "currentTool === \"zoom\"" in html
+    assert "currentTool === \"pan\"" in html

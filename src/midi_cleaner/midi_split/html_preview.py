@@ -6,14 +6,8 @@ from pathlib import Path
 from midi_cleaner.midi_split.models import MidiSplitSession
 
 
-def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) -> None:
-    payload = {
-        "schema_version": session.schema_version,
-        "source_midi": session.source_midi,
-        "ticks_per_beat": int(session.ticks_per_beat),
-        "tracks": [track.model_dump(mode="json") for track in session.tracks],
-        "notes": [note.model_dump(mode="json") for note in session.notes],
-    }
+def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
+    payload = session.model_dump(mode="json")
     payload_json = json.dumps(payload, ensure_ascii=True).replace("</", "<\\/")
 
     template = """<!doctype html>
@@ -44,6 +38,14 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
     #toolbar select {
       padding: 4px 8px;
       font-size: 12px;
+      border: 1px solid #666;
+      background: #2e2e2e;
+      color: #f5f5f5;
+      cursor: pointer;
+    }
+    #toolbar button.active-tool {
+      border-color: #9ab8ff;
+      background: #3b4d7d;
     }
     #status-line {
       padding: 4px 8px;
@@ -55,13 +57,13 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
     }
     #layout {
       display: flex;
-      height: calc(100vh - 78px);
+      height: calc(100vh - 88px);
       min-height: 420px;
     }
     #track-panel {
-      width: 260px;
+      width: 280px;
       min-width: 220px;
-      max-width: 320px;
+      max-width: 340px;
       overflow: auto;
       border-right: 1px solid #333;
       background: #1e1e1e;
@@ -95,10 +97,12 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
       flex: 1;
       overflow: auto;
       background: #111;
+      position: relative;
     }
     #roll-canvas {
       display: block;
       background: #111;
+      cursor: crosshair;
     }
   </style>
 </head>
@@ -108,13 +112,26 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
     <span id="source-name">-</span>
     <span>|</span>
     <span>Selected notes: <strong id="selected-count">0</strong></span>
+
+    <button id="import-midi-btn" type="button">Import MIDI</button>
+    <button id="export-multitrack-btn" type="button">Export Multitrack MIDI</button>
+    <button id="export-separate-btn" type="button">Export Separate Tracks ZIP</button>
+    <button id="save-session-btn" type="button">Save Session JSON</button>
+    <button id="download-session-btn" type="button">Download updated session JSON</button>
+
+    <span>|</span>
+    <button id="tool-select-btn" type="button">Select</button>
+    <button id="tool-zoom-btn" type="button">Zoom</button>
+    <button id="tool-pan-btn" type="button">Hand</button>
+
+    <span>|</span>
     <label for="target-track">Target track:</label>
     <select id="target-track"></select>
     <button id="move-selected-btn" type="button">Move selected to track</button>
     <button id="add-track-btn" type="button">Add track</button>
     <button id="merge-tracks-btn" type="button">Merge selected tracks</button>
-    <button id="download-session-btn" type="button">Download updated session JSON</button>
     <button id="clear-selection-btn" type="button">Clear selection</button>
+    <input id="import-midi-input" type="file" accept=".mid,.midi" style="display:none" />
   </div>
   <div id="status-line">Ready.</div>
   <div id="layout">
@@ -136,45 +153,109 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
       const BOTTOM_PAD = 24;
       const MIN_CANVAS_WIDTH = 1000;
       const NOTE_ROW_HEIGHT = 10;
-      const TICK_SCALE = 0.18;
+      const DEFAULT_PIXELS_PER_TICK = 0.18;
+      const MIN_PIXELS_PER_TICK = 0.03;
+      const MAX_PIXELS_PER_TICK = 2.50;
+      const ZOOM_IN_FACTOR = 1.20;
+      const ZOOM_OUT_FACTOR = 1 / 1.20;
       const DRAG_THRESHOLD_PX = 4;
       const palette = [
         "#ff6f61", "#6fcf97", "#56ccf2", "#f2c94c", "#bb6bd9", "#f2994a",
         "#2d9cdb", "#9b51e0", "#27ae60", "#eb5757", "#219ebc", "#f77f00"
       ];
 
-      const session = JSON.parse(document.getElementById("session-json").textContent);
-      if (!Array.isArray(session.tracks)) {
-        session.tracks = [];
+      function normalizeSession(value) {
+        const session = value && typeof value === "object" ? value : {};
+        if (!Array.isArray(session.tracks)) {
+          session.tracks = [];
+        }
+        if (!Array.isArray(session.notes)) {
+          session.notes = [];
+        }
+        if (!Array.isArray(session.tempo_map)) {
+          session.tempo_map = [];
+        }
+        if (typeof session.schema_version !== "string") {
+          session.schema_version = "0.1.0";
+        }
+        if (typeof session.source_midi !== "string") {
+          session.source_midi = "";
+        }
+        if (typeof session.source !== "string") {
+          session.source = "manual";
+        }
+        if (typeof session.layer !== "string") {
+          session.layer = "midi";
+        }
+        if (!Number.isFinite(Number(session.ticks_per_beat)) || Number(session.ticks_per_beat) <= 0) {
+          session.ticks_per_beat = 480;
+        } else {
+          session.ticks_per_beat = Number(session.ticks_per_beat);
+        }
+        return session;
       }
-      if (!Array.isArray(session.notes)) {
-        session.notes = [];
-      }
+
+      let session = normalizeSession(JSON.parse(document.getElementById("session-json").textContent));
+      let currentTool = "select";
 
       const sourceNameEl = document.getElementById("source-name");
       const selectedCountEl = document.getElementById("selected-count");
       const targetTrackEl = document.getElementById("target-track");
       const statusEl = document.getElementById("status-line");
       const trackPanelEl = document.getElementById("track-panel");
+      const rollWrapEl = document.getElementById("roll-wrap");
       const canvas = document.getElementById("roll-canvas");
       const ctx = canvas.getContext("2d");
+
+      const toolButtons = {
+        select: document.getElementById("tool-select-btn"),
+        zoom: document.getElementById("tool-zoom-btn"),
+        pan: document.getElementById("tool-pan-btn"),
+      };
 
       const state = {
         selectedNoteIds: new Set(),
         mergeTrackIndices: new Set(),
         noteBoxes: [],
-        drag: null,
+        dragSelect: null,
+        panDrag: null,
         pitchMin: 24,
         pitchMax: 108,
+        pixelsPerTick: DEFAULT_PIXELS_PER_TICK,
+        xOffsetTicks: 0,
       };
+
+      function supportsServerApi() {
+        return window.location.protocol === "http:" || window.location.protocol === "https:";
+      }
 
       function setStatus(text) {
         statusEl.textContent = text;
       }
 
+      function colorForTrack(trackIndex) {
+        const normalized = Math.max(1, Number(trackIndex));
+        return palette[(normalized - 1) % palette.length];
+      }
+
       function sortTracks() {
         session.tracks.sort(function (a, b) {
           return Number(a.editable_track_index) - Number(b.editable_track_index);
+        });
+      }
+
+      function sortNotes() {
+        session.notes.sort(function (a, b) {
+          if (Number(a.start_tick) !== Number(b.start_tick)) {
+            return Number(a.start_tick) - Number(b.start_tick);
+          }
+          if (Number(a.end_tick) !== Number(b.end_tick)) {
+            return Number(a.end_tick) - Number(b.end_tick);
+          }
+          if (Number(a.editable_track_index) !== Number(b.editable_track_index)) {
+            return Number(a.editable_track_index) - Number(b.editable_track_index);
+          }
+          return String(a.note_id).localeCompare(String(b.note_id));
         });
       }
 
@@ -187,19 +268,67 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
         return null;
       }
 
-      function colorForTrack(trackIndex) {
-        const normalized = Math.max(1, Number(trackIndex));
-        return palette[(normalized - 1) % palette.length];
+      function getMaxTick() {
+        let maxTick = Math.max(0, Number(session.ticks_per_beat) * 8);
+        for (const note of session.notes) {
+          maxTick = Math.max(maxTick, Number(note.end_tick || 0));
+        }
+        return maxTick;
+      }
+
+      function getVisibleTickSpan() {
+        const widthPx = Math.max(1, canvas.width - LEFT_PAD - RIGHT_PAD);
+        return widthPx / state.pixelsPerTick;
+      }
+
+      function clampXOffsetTicks() {
+        const maxTick = getMaxTick();
+        const maxOffset = Math.max(0, maxTick - getVisibleTickSpan() + Number(session.ticks_per_beat || 480) * 2);
+        state.xOffsetTicks = Math.max(0, Math.min(state.xOffsetTicks, maxOffset));
+      }
+
+      function updatePitchRange() {
+        if (session.notes.length === 0) {
+          state.pitchMin = 24;
+          state.pitchMax = 108;
+          return;
+        }
+
+        let minPitch = 127;
+        let maxPitch = 0;
+        for (const note of session.notes) {
+          const pitch = Number(note.pitch_midi || 0);
+          minPitch = Math.min(minPitch, pitch);
+          maxPitch = Math.max(maxPitch, pitch);
+        }
+
+        state.pitchMin = Math.max(0, minPitch - 2);
+        state.pitchMax = Math.min(127, maxPitch + 2);
+      }
+
+      function updateCanvasSize() {
+        const width = Math.max(MIN_CANVAS_WIDTH, Number(rollWrapEl.clientWidth || MIN_CANVAS_WIDTH));
+        const rows = state.pitchMax - state.pitchMin + 1;
+        const height = Math.max(420, Math.ceil(TOP_PAD + rows * NOTE_ROW_HEIGHT + BOTTOM_PAD));
+        canvas.width = Math.ceil(width);
+        canvas.height = height;
+      }
+
+      function yForPitch(pitch) {
+        return TOP_PAD + (state.pitchMax - pitch) * NOTE_ROW_HEIGHT;
+      }
+
+      function xForTick(tick) {
+        return LEFT_PAD + (Number(tick) - state.xOffsetTicks) * state.pixelsPerTick;
+      }
+
+      function updateSelectionUi() {
+        selectedCountEl.textContent = String(state.selectedNoteIds.size);
       }
 
       function clearSelection() {
         state.selectedNoteIds.clear();
         updateSelectionUi();
-        redraw();
-      }
-
-      function updateSelectionUi() {
-        selectedCountEl.textContent = String(state.selectedNoteIds.size);
       }
 
       function buildTrackNoteCounts() {
@@ -214,40 +343,22 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
         return counts;
       }
 
-      function updateTargetTrackDropdown() {
-        const previousValue = Number(targetTrackEl.value || 0);
-        targetTrackEl.innerHTML = "";
-
-        for (const track of session.tracks) {
-          const option = document.createElement("option");
-          option.value = String(track.editable_track_index);
-          option.textContent = String(track.editable_track_index).padStart(2, "0") + " - " + track.name;
-          targetTrackEl.appendChild(option);
-        }
-
-        if (getTrackByIndex(previousValue) !== null) {
-          targetTrackEl.value = String(previousValue);
-        } else if (session.tracks.length > 0) {
-          targetTrackEl.value = String(session.tracks[0].editable_track_index);
-        }
-      }
-
       function rebuildTrackSources() {
-        const sourcesByTrack = new Map();
+        const sourceByTrack = new Map();
         for (const track of session.tracks) {
-          sourcesByTrack.set(Number(track.editable_track_index), new Set());
+          sourceByTrack.set(Number(track.editable_track_index), new Set());
         }
 
         for (const note of session.notes) {
           const trackIndex = Number(note.editable_track_index);
-          if (!sourcesByTrack.has(trackIndex)) {
-            sourcesByTrack.set(trackIndex, new Set());
+          if (!sourceByTrack.has(trackIndex)) {
+            sourceByTrack.set(trackIndex, new Set());
           }
-          sourcesByTrack.get(trackIndex).add(Number(note.source_track_index));
+          sourceByTrack.get(trackIndex).add(Number(note.source_track_index));
         }
 
         for (const track of session.tracks) {
-          const values = Array.from(sourcesByTrack.get(Number(track.editable_track_index)) || []);
+          const values = Array.from(sourceByTrack.get(Number(track.editable_track_index)) || []);
           values.sort(function (a, b) { return a - b; });
           track.source_track_indices = values;
         }
@@ -266,11 +377,11 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
           checkbox.title = "Select track for merge";
           checkbox.checked = state.mergeTrackIndices.has(Number(track.editable_track_index));
           checkbox.addEventListener("change", function () {
-            const idx = Number(track.editable_track_index);
+            const index = Number(track.editable_track_index);
             if (checkbox.checked) {
-              state.mergeTrackIndices.add(idx);
+              state.mergeTrackIndices.add(index);
             } else {
-              state.mergeTrackIndices.delete(idx);
+              state.mergeTrackIndices.delete(index);
             }
           });
 
@@ -296,61 +407,59 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
         }
       }
 
-      function updatePitchRange() {
-        if (session.notes.length === 0) {
-          state.pitchMin = 24;
-          state.pitchMax = 108;
-          return;
+      function updateTargetTrackDropdown() {
+        const previousValue = Number(targetTrackEl.value || 0);
+        targetTrackEl.innerHTML = "";
+
+        for (const track of session.tracks) {
+          const option = document.createElement("option");
+          option.value = String(track.editable_track_index);
+          option.textContent = String(track.editable_track_index).padStart(2, "0") + " - " + String(track.name);
+          targetTrackEl.appendChild(option);
         }
 
-        let minPitch = 127;
-        let maxPitch = 0;
-        for (const note of session.notes) {
-          const pitch = Number(note.pitch_midi || 0);
-          minPitch = Math.min(minPitch, pitch);
-          maxPitch = Math.max(maxPitch, pitch);
+        if (getTrackByIndex(previousValue) !== null) {
+          targetTrackEl.value = String(previousValue);
+        } else if (session.tracks.length > 0) {
+          targetTrackEl.value = String(session.tracks[0].editable_track_index);
+        }
+      }
+
+      function setTool(toolName) {
+        currentTool = toolName;
+        for (const name of Object.keys(toolButtons)) {
+          if (name === toolName) {
+            toolButtons[name].classList.add("active-tool");
+          } else {
+            toolButtons[name].classList.remove("active-tool");
+          }
         }
 
-        state.pitchMin = Math.max(0, minPitch - 2);
-        state.pitchMax = Math.min(127, maxPitch + 2);
-      }
-
-      function yForPitch(pitch) {
-        return TOP_PAD + (state.pitchMax - pitch) * NOTE_ROW_HEIGHT;
-      }
-
-      function xForTick(tick) {
-        return LEFT_PAD + Number(tick) * TICK_SCALE;
-      }
-
-      function updateCanvasSize() {
-        const ticksPerBeat = Math.max(1, Number(session.ticks_per_beat || 480));
-        let maxTick = ticksPerBeat * 8;
-        for (const note of session.notes) {
-          maxTick = Math.max(maxTick, Number(note.end_tick || 0));
+        if (toolName === "select") {
+          canvas.style.cursor = "crosshair";
+        } else if (toolName === "zoom") {
+          canvas.style.cursor = "zoom-in";
+        } else {
+          canvas.style.cursor = "grab";
         }
+      }
 
-        const width = Math.max(MIN_CANVAS_WIDTH, Math.ceil(LEFT_PAD + maxTick * TICK_SCALE + RIGHT_PAD));
-        const rows = state.pitchMax - state.pitchMin + 1;
-        const height = Math.max(420, Math.ceil(TOP_PAD + rows * NOTE_ROW_HEIGHT + BOTTOM_PAD));
-        canvas.width = width;
-        canvas.height = height;
+      function setSessionData(newSession) {
+        session = normalizeSession(newSession);
+        sortTracks();
+        sortNotes();
+        state.mergeTrackIndices.clear();
+        clearSelection();
+        state.xOffsetTicks = 0;
+        sourceNameEl.textContent = String(session.source_midi || "-");
+        updateTargetTrackDropdown();
+        renderTrackPanel();
+        redraw();
       }
 
       function rebuildNoteBoxes() {
         state.noteBoxes = [];
-        const notes = session.notes.slice();
-        notes.sort(function (a, b) {
-          if (Number(a.start_tick) !== Number(b.start_tick)) {
-            return Number(a.start_tick) - Number(b.start_tick);
-          }
-          if (Number(a.pitch_midi) !== Number(b.pitch_midi)) {
-            return Number(a.pitch_midi) - Number(b.pitch_midi);
-          }
-          return String(a.note_id).localeCompare(String(b.note_id));
-        });
-
-        for (const note of notes) {
+        for (const note of session.notes) {
           const pitch = Number(note.pitch_midi || 0);
           if (pitch < state.pitchMin || pitch > state.pitchMax) {
             continue;
@@ -359,10 +468,22 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
           const startTick = Number(note.start_tick || 0);
           const endTick = Math.max(startTick, Number(note.end_tick || startTick));
           const x = xForTick(startTick);
-          const y = yForPitch(pitch) + 1;
-          const w = Math.max(1, (endTick - startTick) * TICK_SCALE);
+          const endX = xForTick(endTick);
+          const w = Math.max(1, endX - x);
           const h = Math.max(3, NOTE_ROW_HEIGHT - 2);
-          state.noteBoxes.push({ x: x, y: y, w: w, h: h, note: note });
+          const y = yForPitch(pitch) + 1;
+
+          if (x + w < LEFT_PAD - 2 || x > canvas.width - RIGHT_PAD + 2) {
+            continue;
+          }
+
+          state.noteBoxes.push({
+            x: x,
+            y: y,
+            w: w,
+            h: h,
+            note: note,
+          });
         }
       }
 
@@ -378,9 +499,13 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
 
         const ticksPerBeat = Math.max(1, Number(session.ticks_per_beat || 480));
         const barTicks = ticksPerBeat * 4;
-        const maxTicks = Math.max(0, Math.floor((canvas.width - LEFT_PAD - RIGHT_PAD) / TICK_SCALE));
-        for (let tick = 0; tick <= maxTicks; tick += ticksPerBeat) {
+        const startTick = Math.floor(state.xOffsetTicks / ticksPerBeat) * ticksPerBeat;
+        const endTick = state.xOffsetTicks + getVisibleTickSpan();
+        for (let tick = startTick; tick <= endTick; tick += ticksPerBeat) {
           const x = Math.round(xForTick(tick)) + 0.5;
+          if (x < LEFT_PAD || x > canvas.width - RIGHT_PAD) {
+            continue;
+          }
           const isBar = tick % barTicks === 0;
           ctx.strokeStyle = isBar ? "#4b4b4b" : "#2f2f2f";
           ctx.beginPath();
@@ -415,14 +540,14 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
       }
 
       function drawSelectionRectangle() {
-        if (!state.drag || !state.drag.active) {
+        if (!state.dragSelect || !state.dragSelect.active) {
           return;
         }
 
-        const x = Math.min(state.drag.startX, state.drag.currentX);
-        const y = Math.min(state.drag.startY, state.drag.currentY);
-        const w = Math.abs(state.drag.currentX - state.drag.startX);
-        const h = Math.abs(state.drag.currentY - state.drag.startY);
+        const x = Math.min(state.dragSelect.startX, state.dragSelect.currentX);
+        const y = Math.min(state.dragSelect.startY, state.dragSelect.currentY);
+        const w = Math.abs(state.dragSelect.currentX - state.dragSelect.startX);
+        const h = Math.abs(state.dragSelect.currentY - state.dragSelect.startY);
 
         ctx.fillStyle = "rgba(120, 180, 255, 0.18)";
         ctx.fillRect(x, y, w, h);
@@ -435,6 +560,7 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
       function redraw() {
         updatePitchRange();
         updateCanvasSize();
+        clampXOffsetTicks();
         rebuildNoteBoxes();
         drawGrid();
         drawNotes();
@@ -475,22 +601,18 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
             box.x + box.w > rect.x &&
             box.y < rect.y + rect.h &&
             box.y + box.h > rect.y;
-
           if (intersects) {
             state.selectedNoteIds.add(String(box.note.note_id));
           }
         }
-
         updateSelectionUi();
       }
 
       function canvasPointFromEvent(event) {
         const rect = canvas.getBoundingClientRect();
-        const x = event.clientX - rect.left;
-        const y = event.clientY - rect.top;
         return {
-          x: Math.max(0, Math.min(canvas.width, x)),
-          y: Math.max(0, Math.min(canvas.height, y)),
+          x: Math.max(0, Math.min(canvas.width, event.clientX - rect.left)),
+          y: Math.max(0, Math.min(canvas.height, event.clientY - rect.top)),
         };
       }
 
@@ -500,8 +622,21 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
         }
 
         const point = canvasPointFromEvent(event);
+        if (currentTool === "pan") {
+          state.panDrag = {
+            startX: point.x,
+            startOffsetTicks: state.xOffsetTicks,
+          };
+          canvas.style.cursor = "grabbing";
+          return;
+        }
+
+        if (currentTool !== "select") {
+          return;
+        }
+
         const hit = getNoteBoxAt(point.x, point.y);
-        state.drag = {
+        state.dragSelect = {
           startX: point.x,
           startY: point.y,
           currentX: point.x,
@@ -513,43 +648,89 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
       }
 
       function handleCanvasMouseMove(event) {
-        if (!state.drag) {
+        const point = canvasPointFromEvent(event);
+
+        if (state.panDrag) {
+          const dx = point.x - state.panDrag.startX;
+          state.xOffsetTicks = state.panDrag.startOffsetTicks - dx / state.pixelsPerTick;
+          clampXOffsetTicks();
+          redraw();
           return;
         }
 
-        const point = canvasPointFromEvent(event);
-        state.drag.currentX = point.x;
-        state.drag.currentY = point.y;
+        if (!state.dragSelect) {
+          return;
+        }
 
-        const dx = Math.abs(state.drag.currentX - state.drag.startX);
-        const dy = Math.abs(state.drag.currentY - state.drag.startY);
+        state.dragSelect.currentX = point.x;
+        state.dragSelect.currentY = point.y;
+
+        const dx = Math.abs(state.dragSelect.currentX - state.dragSelect.startX);
+        const dy = Math.abs(state.dragSelect.currentY - state.dragSelect.startY);
         if (dx >= DRAG_THRESHOLD_PX || dy >= DRAG_THRESHOLD_PX) {
-          state.drag.active = true;
+          state.dragSelect.active = true;
         }
 
         redraw();
       }
 
       function handleCanvasMouseUp() {
-        if (!state.drag) {
+        if (state.panDrag) {
+          state.panDrag = null;
+          if (currentTool === "pan") {
+            canvas.style.cursor = "grab";
+          }
           return;
         }
 
-        if (state.drag.active) {
-          const rect = {
-            x: Math.min(state.drag.startX, state.drag.currentX),
-            y: Math.min(state.drag.startY, state.drag.currentY),
-            w: Math.abs(state.drag.currentX - state.drag.startX),
-            h: Math.abs(state.drag.currentY - state.drag.startY),
-          };
-          selectNotesInRect(rect, state.drag.additive);
-        } else if (state.drag.hitNoteId) {
-          selectNoteById(state.drag.hitNoteId, state.drag.additive);
-        } else if (!state.drag.additive) {
-          clearSelection();
+        if (!state.dragSelect) {
+          return;
         }
 
-        state.drag = null;
+        if (state.dragSelect.active) {
+          const rect = {
+            x: Math.min(state.dragSelect.startX, state.dragSelect.currentX),
+            y: Math.min(state.dragSelect.startY, state.dragSelect.currentY),
+            w: Math.abs(state.dragSelect.currentX - state.dragSelect.startX),
+            h: Math.abs(state.dragSelect.currentY - state.dragSelect.startY),
+          };
+          selectNotesInRect(rect, state.dragSelect.additive);
+        } else if (state.dragSelect.hitNoteId) {
+          selectNoteById(state.dragSelect.hitNoteId, state.dragSelect.additive);
+        } else if (!state.dragSelect.additive) {
+          clearSelection();
+          setStatus("Selection cleared.");
+        }
+
+        state.dragSelect = null;
+        redraw();
+      }
+
+      function handleCanvasWheel(event) {
+        if (currentTool !== "zoom" && currentTool !== "pan") {
+          return;
+        }
+
+        event.preventDefault();
+        const point = canvasPointFromEvent(event);
+
+        if (currentTool === "zoom") {
+          const cursorTick = state.xOffsetTicks + (point.x - LEFT_PAD) / state.pixelsPerTick;
+          const factor = event.deltaY < 0 ? ZOOM_IN_FACTOR : ZOOM_OUT_FACTOR;
+          state.pixelsPerTick = Math.max(
+            MIN_PIXELS_PER_TICK,
+            Math.min(MAX_PIXELS_PER_TICK, state.pixelsPerTick * factor)
+          );
+          state.xOffsetTicks = cursorTick - (point.x - LEFT_PAD) / state.pixelsPerTick;
+          clampXOffsetTicks();
+          setStatus("Zoom: " + state.pixelsPerTick.toFixed(3) + " px/tick");
+          redraw();
+          return;
+        }
+
+        const deltaTicks = event.deltaY / state.pixelsPerTick;
+        state.xOffsetTicks += deltaTicks;
+        clampXOffsetTicks();
         redraw();
       }
 
@@ -575,10 +756,13 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
           }
         }
 
+        sortNotes();
         rebuildTrackSources();
         renderTrackPanel();
         redraw();
-        setStatus("Moved " + String(movedCount) + " notes to track " + String(targetTrack.editable_track_index) + ".");
+        setStatus(
+          "Moved " + String(movedCount) + " notes to track " + String(targetTrack.editable_track_index) + "."
+        );
       }
 
       function nextAvailableTrackIndex() {
@@ -597,8 +781,7 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
       function addTrack() {
         const nextIndex = nextAvailableTrackIndex();
         if (nextIndex === null) {
-          setStatus("Cannot add track: maximum track count reached (12).");
-          alert("Maximum editable track count reached (12).");
+          setStatus("Cannot add track: maximum editable track count reached (12).");
           return;
         }
 
@@ -651,11 +834,12 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
         }
 
         session.tracks = session.tracks.filter(function (track) {
-          const idx = Number(track.editable_track_index);
-          return idx === targetIndex || !selectedSet.has(idx);
+          const index = Number(track.editable_track_index);
+          return index === targetIndex || !selectedSet.has(index);
         });
 
         sortTracks();
+        sortNotes();
         rebuildTrackSources();
         state.mergeTrackIndices.clear();
         updateTargetTrackDropdown();
@@ -664,50 +848,193 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
         setStatus("Merged tracks into track " + String(targetIndex) + ". Moved " + String(moved) + " notes.");
       }
 
-      function downloadSessionJson() {
-        const pretty = JSON.stringify(session, null, 2) + "\\n";
-        const blob = new Blob([pretty], { type: "application/json" });
+      function downloadBlob(data, mimeType, fileName) {
+        const blob = new Blob([data], { type: mimeType });
         const href = URL.createObjectURL(blob);
-
-        const sourceName = String(session.source_midi || "split_session").split(/[/\\\\]/).pop() || "split_session";
-        const baseName = sourceName.replace(/\\.[^.]+$/, "") || "split_session";
-        const filename = baseName + "_split_session_updated.json";
-
         const link = document.createElement("a");
         link.href = href;
-        link.download = filename;
+        link.download = fileName;
         document.body.appendChild(link);
         link.click();
         link.remove();
         URL.revokeObjectURL(href);
-
-        setStatus("Downloaded " + filename + ".");
       }
 
-      function initialize() {
-        sortTracks();
-        sourceNameEl.textContent = String(session.source_midi || "-");
-        updateTargetTrackDropdown();
-        renderTrackPanel();
-        updateSelectionUi();
-        redraw();
+      function sessionBaseName() {
+        const sourceName = String(session.source_midi || "split_session").split(/[/\\\\]/).pop() || "split_session";
+        return sourceName.replace(/[.][^.]+$/, "") || "split_session";
+      }
 
+      function downloadSessionJson() {
+        const pretty = JSON.stringify(session, null, 2) + "\\n";
+        const fileName = sessionBaseName() + "_split_session_updated.json";
+        downloadBlob(pretty, "application/json", fileName);
+        setStatus("Downloaded " + fileName + ".");
+      }
+
+      async function saveSessionToServer() {
+        if (!supportsServerApi()) {
+          setStatus("Saving to server requires running 'midi split-editor'.");
+          return;
+        }
+
+        const response = await fetch("/api/save-session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(session),
+        });
+        if (!response.ok) {
+          setStatus("Save to server failed: HTTP " + String(response.status));
+          return;
+        }
+        const payload = await response.json();
+        setSessionData(payload);
+        setStatus("Session saved to server memory.");
+      }
+
+      function filenameFromDisposition(contentDisposition, fallback) {
+        if (!contentDisposition) {
+          return fallback;
+        }
+        const match = /filename=\"?([^\";]+)\"?/i.exec(contentDisposition);
+        if (!match) {
+          return fallback;
+        }
+        return match[1];
+      }
+
+      async function importMidi(file) {
+        if (!supportsServerApi()) {
+          setStatus("MIDI import requires running 'midi split-editor'.");
+          return;
+        }
+        const url = "/api/import-midi?filename=" + encodeURIComponent(file.name || "uploaded.mid");
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: await file.arrayBuffer(),
+        });
+        if (!response.ok) {
+          setStatus("MIDI import failed: HTTP " + String(response.status));
+          return;
+        }
+        const payload = await response.json();
+        setSessionData(payload);
+        setStatus("Imported MIDI: " + String(file.name || "uploaded.mid") + ".");
+      }
+
+      async function exportMultitrackMidi() {
+        if (!supportsServerApi()) {
+          setStatus("Direct MIDI export requires running 'midi split-editor'.");
+          return;
+        }
+        const response = await fetch("/api/export-multitrack", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(session),
+        });
+        if (!response.ok) {
+          setStatus("Export multitrack failed: HTTP " + String(response.status));
+          return;
+        }
+        const fileName = filenameFromDisposition(
+          response.headers.get("Content-Disposition"),
+          sessionBaseName() + "_split.mid"
+        );
+        const data = await response.arrayBuffer();
+        downloadBlob(data, "audio/midi", fileName);
+        setStatus("Exported multitrack MIDI: " + fileName + ".");
+      }
+
+      async function exportSeparateTracks() {
+        if (!supportsServerApi()) {
+          setStatus("Direct MIDI export requires running 'midi split-editor'.");
+          return;
+        }
+        const response = await fetch("/api/export-separate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(session),
+        });
+        if (!response.ok) {
+          setStatus("Export separate tracks failed: HTTP " + String(response.status));
+          return;
+        }
+        const fileName = filenameFromDisposition(
+          response.headers.get("Content-Disposition"),
+          sessionBaseName() + "_split_tracks.zip"
+        );
+        const data = await response.arrayBuffer();
+        downloadBlob(data, "application/zip", fileName);
+        setStatus("Exported separate track ZIP: " + fileName + ".");
+      }
+
+      function bindToolbarActions() {
         document.getElementById("move-selected-btn").addEventListener("click", moveSelectedToTrack);
         document.getElementById("add-track-btn").addEventListener("click", addTrack);
         document.getElementById("merge-tracks-btn").addEventListener("click", mergeSelectedTracks);
         document.getElementById("download-session-btn").addEventListener("click", downloadSessionJson);
+        document.getElementById("save-session-btn").addEventListener("click", function () {
+          saveSessionToServer().catch(function (error) {
+            setStatus("Save session failed: " + String(error));
+          });
+        });
+
+        const importInput = document.getElementById("import-midi-input");
+        document.getElementById("import-midi-btn").addEventListener("click", function () {
+          importInput.value = "";
+          importInput.click();
+        });
+        importInput.addEventListener("change", function () {
+          const file = importInput.files && importInput.files[0] ? importInput.files[0] : null;
+          if (!file) {
+            return;
+          }
+          importMidi(file).catch(function (error) {
+            setStatus("MIDI import failed: " + String(error));
+          });
+        });
+
+        document.getElementById("export-multitrack-btn").addEventListener("click", function () {
+          exportMultitrackMidi().catch(function (error) {
+            setStatus("Export multitrack failed: " + String(error));
+          });
+        });
+        document.getElementById("export-separate-btn").addEventListener("click", function () {
+          exportSeparateTracks().catch(function (error) {
+            setStatus("Export separate failed: " + String(error));
+          });
+        });
+
         document.getElementById("clear-selection-btn").addEventListener("click", function () {
           clearSelection();
+          redraw();
           setStatus("Selection cleared.");
         });
 
+        toolButtons.select.addEventListener("click", function () { setTool("select"); });
+        toolButtons.zoom.addEventListener("click", function () { setTool("zoom"); });
+        toolButtons.pan.addEventListener("click", function () { setTool("pan"); });
+      }
+
+      function bindCanvasActions() {
         canvas.addEventListener("mousedown", handleCanvasMouseDown);
         window.addEventListener("mousemove", handleCanvasMouseMove);
         window.addEventListener("mouseup", handleCanvasMouseUp);
+        canvas.addEventListener("wheel", handleCanvasWheel, { passive: false });
+        window.addEventListener("resize", redraw);
+      }
+
+      function initialize() {
+        setSessionData(session);
+        setTool("select");
+        bindToolbarActions();
+        bindCanvasActions();
 
         window.addEventListener("keydown", function (event) {
           if (event.key === "Escape") {
             clearSelection();
+            redraw();
             setStatus("Selection cleared.");
           }
         });
@@ -723,11 +1050,25 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
             updateSelectionUi();
             redraw();
           },
+          setTool: setTool,
+          getTool: function () { return currentTool; },
           moveSelectedToTrack: moveSelectedToTrack,
           addTrack: addTrack,
           mergeSelectedTracks: mergeSelectedTracks,
-          clearSelection: clearSelection,
+          importMidi: importMidi,
+          exportMultitrackMidi: exportMultitrackMidi,
+          exportSeparateTracks: exportSeparateTracks,
           downloadSessionJson: downloadSessionJson,
+          clearSelection: function () {
+            clearSelection();
+            redraw();
+          },
+          getViewState: function () {
+            return {
+              pixelsPerTick: state.pixelsPerTick,
+              xOffsetTicks: state.xOffsetTicks,
+            };
+          },
           getNoteBoxes: function () {
             return state.noteBoxes.map(function (box) {
               return {
@@ -748,7 +1089,11 @@ def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) ->
 </body>
 </html>
 """
-    html = template.replace("__SESSION_JSON__", payload_json)
 
+    return template.replace("__SESSION_JSON__", payload_json)
+
+
+def generate_piano_roll_preview(session: MidiSplitSession, output_html: Path) -> None:
+    html = render_piano_roll_preview_html(session)
     output_html.parent.mkdir(parents=True, exist_ok=True)
     output_html.write_text(html, encoding="utf-8")

@@ -267,6 +267,21 @@ def test_midi_split_preview_help_lists_required_options() -> None:
     assert "--preview" in result.stdout
 
 
+def test_midi_split_editor_help_lists_required_options() -> None:
+    result = runner.invoke(
+        app,
+        ["midi", "split-editor", "--help"],
+        env={"COLUMNS": "240", "LINES": "120"},
+    )
+
+    assert result.exit_code == 0
+    assert "--input" in result.stdout
+    assert "--session" in result.stdout
+    assert "--host" in result.stdout
+    assert "--port" in result.stdout
+    assert "--no-open" in result.stdout
+
+
 def test_midi_sync_with_wav_help_lists_required_options() -> None:
     result = runner.invoke(
         app,
