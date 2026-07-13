@@ -272,6 +272,9 @@ def test_generate_piano_roll_preview_contains_editor_toolbar_actions(tmp_path: P
     assert 'for="import-midi-input"' in html
     assert 'id="export-multitrack-btn"' in html
     assert 'id="export-separate-btn"' in html
+    assert 'id="undo-btn"' in html
+    assert 'id="redo-btn"' in html
+    assert 'id="merge-notes-btn"' in html
     assert 'id="save-session-btn"' not in html
     assert 'id="download-session-btn"' not in html
     assert "Server: checking" in html
@@ -294,6 +297,9 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function moveSelectedToTrack" in html
     assert "function addTrack" in html
     assert "function mergeSelectedTracks" in html
+    assert "function mergeSelectedNotes" in html
+    assert "function undoHistory" in html
+    assert "function redoHistory" in html
     assert "function importMidi" in html
     assert "function exportMultitrackMidi" in html
     assert "function exportSeparateTracks" in html
@@ -305,8 +311,25 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function applyImportedSession" in html
     assert "function fitImportedNotesToView" in html
     assert "function renderAll" in html
+    assert "function buildTimelineMarkers" in html
+    assert "function drawTimelineRuler" in html
     assert "function setErrorStatus" in html
     assert "console.error(\"MIDI split editor error:\", details);" in script
+
+
+def test_generate_piano_roll_preview_wires_history_shortcuts_without_editable_interception(tmp_path: Path) -> None:
+    session = _create_session(tmp_path)
+    output_html = tmp_path / "split_editor.html"
+
+    generate_piano_roll_preview(session, output_html)
+
+    script = _extract_editor_script(output_html.read_text(encoding="utf-8"))
+    assert "function isEditableTypingTarget" in script
+    assert "if (isEditableTypingTarget(event.target))" in script
+    assert "if (isModifierDown && key === \"z\" && !event.shiftKey)" in script
+    assert "undoHistory();" in script
+    assert "if (isModifierDown && (key === \"y\" || (key === \"z\" && event.shiftKey)))" in script
+    assert "redoHistory();" in script
 
 
 def test_generate_piano_roll_preview_import_flow_wires_file_input_and_resets_value(tmp_path: Path) -> None:
