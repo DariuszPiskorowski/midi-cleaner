@@ -6,6 +6,8 @@ from bisect import bisect_right
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from midi_cleaner.midi.importer import pitch_name_from_midi
+
 DEFAULT_TEMPO_US_PER_BEAT = 500_000
 DEFAULT_TIME_SIGNATURE_NUMERATOR = 4
 DEFAULT_TIME_SIGNATURE_DENOMINATOR = 4
@@ -59,6 +61,271 @@ def sort_note_payloads(notes: Sequence[Mapping[str, Any]]) -> list[dict[str, Any
 
 def _note_id(note: Mapping[str, Any]) -> str:
     return str(note.get("note_id", "")).strip()
+
+
+def _clamp_pitch_midi(value: int) -> int:
+    return max(0, min(127, int(value)))
+
+
+def _normalize_note_timing_and_pitch(
+    note: dict[str, Any],
+    *,
+    ticks_per_beat: int,
+    tempo_events: Sequence[Mapping[str, Any]] | None,
+    min_duration_ticks: int = 0,
+) -> None:
+    min_duration = max(0, int(min_duration_ticks))
+    start_tick = max(0, _as_int(note.get("start_tick"), 0))
+    end_tick = _as_int(note.get("end_tick"), start_tick)
+    end_tick = max(start_tick + min_duration, end_tick)
+
+    pitch_midi = _clamp_pitch_midi(_as_int(note.get("pitch_midi"), 0))
+
+    note["start_tick"] = int(start_tick)
+    note["end_tick"] = int(end_tick)
+    note["duration_ticks"] = int(max(0, end_tick - start_tick))
+    note["pitch_midi"] = int(pitch_midi)
+    note["pitch_name"] = pitch_name_from_midi(pitch_midi)
+    note["start_sec"] = float(
+        tick_to_seconds(start_tick, tempo_events, ticks_per_beat=ticks_per_beat)
+    )
+    note["end_sec"] = float(
+        tick_to_seconds(end_tick, tempo_events, ticks_per_beat=ticks_per_beat)
+    )
+    note["duration_sec"] = float(max(0.0, note["end_sec"] - note["start_sec"]))
+
+
+def _replacement_notes(
+    *,
+    payloads: Sequence[Mapping[str, Any]],
+    after_notes: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    after_by_id = {_note_id(note): note_to_payload(note) for note in after_notes}
+
+    merged: list[dict[str, Any]] = []
+    for note in payloads:
+        note_id = _note_id(note)
+        if note_id in after_by_id:
+            merged.append(clone_note_payload(after_by_id[note_id]))
+        else:
+            merged.append(clone_note_payload(note))
+
+    replaced_ids = {_note_id(note) for note in payloads}
+    for note in after_notes:
+        note_id = _note_id(note)
+        if note_id not in replaced_ids:
+            merged.append(clone_note_payload(note))
+
+    return sort_note_payloads(merged)
+
+
+def move_selected_notes(
+    *,
+    all_notes: Sequence[object],
+    selected_note_ids: Sequence[str],
+    delta_ticks: int,
+    delta_pitch: int,
+    ticks_per_beat: int,
+    tempo_events: Sequence[Mapping[str, Any]] | None,
+) -> dict[str, Any]:
+    payloads = [note_to_payload(note) for note in all_notes]
+    selected_set = {str(note_id) for note_id in selected_note_ids}
+    selected_notes = [note for note in payloads if _note_id(note) in selected_set]
+    before_notes = sort_note_payloads(selected_notes)
+
+    if not before_notes:
+        return {
+            "before_notes": [],
+            "after_notes": [],
+            "notes_after": sort_note_payloads(payloads),
+            "selection_after": [],
+            "moved_count": 0,
+            "applied_delta_ticks": 0,
+            "applied_delta_pitch": 0,
+        }
+
+    requested_delta_ticks = _as_int(delta_ticks, 0)
+    min_start_tick = min(_as_int(note.get("start_tick"), 0) for note in before_notes)
+    applied_delta_ticks = requested_delta_ticks
+    if min_start_tick + applied_delta_ticks < 0:
+        applied_delta_ticks = -min_start_tick
+
+    requested_delta_pitch = _as_int(delta_pitch, 0)
+    min_pitch = min(_as_int(note.get("pitch_midi"), 0) for note in before_notes)
+    max_pitch = max(_as_int(note.get("pitch_midi"), 0) for note in before_notes)
+    applied_delta_pitch = requested_delta_pitch
+    if min_pitch + applied_delta_pitch < 0:
+        applied_delta_pitch = -min_pitch
+    if max_pitch + applied_delta_pitch > 127:
+        applied_delta_pitch = 127 - max_pitch
+
+    after_notes: list[dict[str, Any]] = []
+    for note in before_notes:
+        updated = clone_note_payload(note)
+
+        start_tick = _as_int(note.get("start_tick"), 0) + applied_delta_ticks
+        end_tick = _as_int(note.get("end_tick"), start_tick) + applied_delta_ticks
+        duration_ticks = max(0, _as_int(note.get("end_tick"), start_tick) - _as_int(note.get("start_tick"), 0))
+        updated["start_tick"] = int(max(0, start_tick))
+        updated["end_tick"] = int(max(updated["start_tick"], updated["start_tick"] + duration_ticks))
+        updated["pitch_midi"] = int(_as_int(note.get("pitch_midi"), 0) + applied_delta_pitch)
+        _normalize_note_timing_and_pitch(
+            updated,
+            ticks_per_beat=ticks_per_beat,
+            tempo_events=tempo_events,
+        )
+        after_notes.append(updated)
+
+    notes_after = _replacement_notes(payloads=payloads, after_notes=after_notes)
+
+    selection_after = [str(note["note_id"]) for note in before_notes]
+    return {
+        "before_notes": before_notes,
+        "after_notes": sort_note_payloads(after_notes),
+        "notes_after": notes_after,
+        "selection_after": selection_after,
+        "moved_count": len(before_notes),
+        "applied_delta_ticks": int(applied_delta_ticks),
+        "applied_delta_pitch": int(applied_delta_pitch),
+    }
+
+
+def resize_note_edge(
+    *,
+    all_notes: Sequence[object],
+    note_id: str,
+    edge: str,
+    target_tick: int,
+    ticks_per_beat: int,
+    tempo_events: Sequence[Mapping[str, Any]] | None,
+    min_duration_ticks: int = 1,
+) -> dict[str, Any]:
+    if edge not in {"left", "right"}:
+        raise ValueError("edge must be 'left' or 'right'.")
+
+    payloads = [note_to_payload(note) for note in all_notes]
+    note_map = {_note_id(note): note for note in payloads}
+    normalized_note_id = str(note_id)
+    if normalized_note_id not in note_map:
+        raise ValueError(f"Unknown note_id: {normalized_note_id}")
+
+    before_note = clone_note_payload(note_map[normalized_note_id])
+    updated_note = clone_note_payload(before_note)
+
+    min_duration = max(1, _as_int(min_duration_ticks, 1))
+    requested_tick = max(0, _as_int(target_tick, 0))
+    start_tick = _as_int(before_note.get("start_tick"), 0)
+    end_tick = _as_int(before_note.get("end_tick"), start_tick)
+
+    if edge == "left":
+        max_start_tick = max(0, end_tick - min_duration)
+        updated_note["start_tick"] = int(min(requested_tick, max_start_tick))
+        updated_note["end_tick"] = int(end_tick)
+    else:
+        min_end_tick = start_tick + min_duration
+        updated_note["start_tick"] = int(start_tick)
+        updated_note["end_tick"] = int(max(requested_tick, min_end_tick))
+
+    _normalize_note_timing_and_pitch(
+        updated_note,
+        ticks_per_beat=ticks_per_beat,
+        tempo_events=tempo_events,
+        min_duration_ticks=min_duration,
+    )
+
+    notes_after = _replacement_notes(payloads=payloads, after_notes=[updated_note])
+
+    return {
+        "before_note": before_note,
+        "after_note": clone_note_payload(updated_note),
+        "before_notes": [before_note],
+        "after_notes": [clone_note_payload(updated_note)],
+        "notes_after": notes_after,
+        "selection_after": [normalized_note_id],
+    }
+
+
+def _generate_unique_draw_note_id(existing_note_ids: set[str], note_id_prefix: str) -> str:
+    prefix = note_id_prefix.strip() or "drawn"
+    ordinal = 1
+    while True:
+        candidate = f"{prefix}_{ordinal:06d}"
+        if candidate not in existing_note_ids:
+            return candidate
+        ordinal += 1
+
+
+def draw_note(
+    *,
+    all_notes: Sequence[object],
+    start_tick: int,
+    end_tick: int,
+    pitch_midi: int,
+    editable_track_index: int,
+    editable_track_name: str,
+    ticks_per_beat: int,
+    tempo_events: Sequence[Mapping[str, Any]] | None,
+    channel: int = 0,
+    velocity: int = 100,
+    source_track_index: int | None = None,
+    source_track_name: str | None = None,
+    muted: bool = False,
+    metadata: Mapping[str, Any] | None = None,
+    min_duration_ticks: int = 1,
+    note_id_prefix: str = "drawn",
+) -> dict[str, Any]:
+    payloads = [note_to_payload(note) for note in all_notes]
+    existing_note_ids = {_note_id(note) for note in payloads}
+    generated_note_id = _generate_unique_draw_note_id(existing_note_ids, note_id_prefix)
+
+    min_duration = max(1, _as_int(min_duration_ticks, 1))
+    normalized_start = max(0, _as_int(start_tick, 0))
+    normalized_end = max(0, _as_int(end_tick, normalized_start))
+    if normalized_end < normalized_start:
+        normalized_start, normalized_end = normalized_end, normalized_start
+    if normalized_end <= normalized_start:
+        normalized_end = normalized_start + min_duration
+
+    note_payload: dict[str, Any] = {
+        "note_id": generated_note_id,
+        "source_track_index": int(
+            _as_int(source_track_index, _as_int(editable_track_index, 0))
+            if source_track_index is not None
+            else _as_int(editable_track_index, 0)
+        ),
+        "source_track_name": source_track_name,
+        "editable_track_index": int(_as_int(editable_track_index, 0)),
+        "editable_track_name": str(editable_track_name),
+        "channel": int(_as_int(channel, 0)),
+        "pitch_midi": int(_clamp_pitch_midi(_as_int(pitch_midi, 0))),
+        "pitch_name": pitch_name_from_midi(_clamp_pitch_midi(_as_int(pitch_midi, 0))),
+        "velocity": int(max(1, min(127, _as_int(velocity, 100)))),
+        "start_tick": int(normalized_start),
+        "end_tick": int(normalized_end),
+        "duration_ticks": int(max(0, normalized_end - normalized_start)),
+        "start_sec": 0.0,
+        "end_sec": 0.0,
+        "duration_sec": 0.0,
+        "muted": bool(muted),
+        "metadata": dict(metadata or {}),
+    }
+
+    _normalize_note_timing_and_pitch(
+        note_payload,
+        ticks_per_beat=ticks_per_beat,
+        tempo_events=tempo_events,
+        min_duration_ticks=min_duration,
+    )
+
+    notes_after = sort_note_payloads([*payloads, note_payload])
+
+    return {
+        "drawn_note": clone_note_payload(note_payload),
+        "before_notes": [],
+        "after_notes": [clone_note_payload(note_payload)],
+        "notes_after": notes_after,
+        "selection_after": [generated_note_id],
+    }
 
 
 def validate_merge_note_candidates(selected_notes: Sequence[object]) -> str | None:

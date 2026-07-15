@@ -150,8 +150,18 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
 
     <span>|</span>
     <button id="tool-select-btn" type="button">Select</button>
+    <button id="tool-draw-btn" type="button">Draw</button>
     <button id="tool-zoom-btn" type="button">Zoom</button>
     <button id="tool-pan-btn" type="button">Hand</button>
+
+    <label for="snap-enabled">Snap</label>
+    <input id="snap-enabled" type="checkbox" checked />
+    <select id="snap-grid">
+      <option value="4">1/4</option>
+      <option value="8">1/8</option>
+      <option value="16" selected>1/16</option>
+      <option value="32">1/32</option>
+    </select>
 
     <span>|</span>
     <label for="target-track">Target track:</label>
@@ -185,6 +195,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       const TOP_PAD = 52;
       const RIGHT_PAD = 24;
       const BOTTOM_PAD = 24;
+      const NOTE_EDGE_RESIZE_HIT_PX = 6;
       const RULER_BAR_TEXT_Y = 12;
       const RULER_BEAT_TEXT_Y = 24;
       const RULER_TIME_TEXT_Y = 36;
@@ -192,11 +203,13 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       const MIN_CANVAS_WIDTH = 1000;
       const NOTE_ROW_HEIGHT = 10;
       const DEFAULT_PIXELS_PER_TICK = 0.18;
+      const DEFAULT_DRAW_VELOCITY = 100;
       const MIN_PIXELS_PER_TICK = 0.03;
       const MAX_PIXELS_PER_TICK = 2.50;
       const ZOOM_IN_FACTOR = 1.20;
       const ZOOM_OUT_FACTOR = 1 / 1.20;
       const DRAG_THRESHOLD_PX = 4;
+      const DRAW_NOTE_ID_PREFIX = "drawn";
       const DEFAULT_TEMPO_US_PER_BEAT = 500000;
       const DEFAULT_TIME_SIGNATURE_NUMERATOR = 4;
       const DEFAULT_TIME_SIGNATURE_DENOMINATOR = 4;
@@ -270,9 +283,12 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       const mergeNotesButton = document.getElementById("merge-notes-btn");
       const deleteNotesButton = document.getElementById("delete-notes-btn");
       const muteNotesButton = document.getElementById("mute-notes-btn");
+      const snapEnabledEl = document.getElementById("snap-enabled");
+      const snapGridEl = document.getElementById("snap-grid");
 
       const toolButtons = {
         select: document.getElementById("tool-select-btn"),
+        draw: document.getElementById("tool-draw-btn"),
         zoom: document.getElementById("tool-zoom-btn"),
         pan: document.getElementById("tool-pan-btn"),
       };
@@ -289,6 +305,8 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         noteById: new Map(),
         noteBoxes: [],
         dragSelect: null,
+        noteEditDrag: null,
+        drawDrag: null,
         panDrag: null,
         pitchMin: 24,
         pitchMax: 108,
@@ -297,6 +315,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         serverConnected: false,
         undoStack: [],
         redoStack: [],
+        drawNoteCounter: 1,
         normalizedTempoMap: [],
         normalizedTimeSignatureMap: [],
       };
@@ -492,6 +511,66 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         return 600;
       }
 
+      function pitchNameFromMidi(pitch) {
+        const names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+        const normalized = Math.max(0, Math.min(127, Math.round(Number(pitch || 0))));
+        const octave = Math.floor(normalized / 12) - 1;
+        return names[normalized % 12] + String(octave);
+      }
+
+      function clampPitchMidi(value) {
+        return Math.max(0, Math.min(127, Math.round(Number(value || 0))));
+      }
+
+      function currentSnapDivision() {
+        const parsed = Number(snapGridEl && snapGridEl.value);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          return 16;
+        }
+        return Math.max(1, Math.round(parsed));
+      }
+
+      function isSnapEnabled() {
+        return Boolean(snapEnabledEl && snapEnabledEl.checked);
+      }
+
+      function currentSnapTicks() {
+        const ticksPerBeat = Math.max(1, Number(session.ticks_per_beat || 480));
+        const denominator = currentSnapDivision();
+        return Math.max(1, Math.round((ticksPerBeat * 4) / denominator));
+      }
+
+      function minimumDurationTicks() {
+        if (!isSnapEnabled()) {
+          return 1;
+        }
+        return Math.max(1, currentSnapTicks());
+      }
+
+      function snapAbsoluteTick(tick) {
+        const rounded = Math.round(Number(tick || 0));
+        if (!isSnapEnabled()) {
+          return rounded;
+        }
+        const grid = currentSnapTicks();
+        return Math.round(rounded / grid) * grid;
+      }
+
+      function snapDeltaTicks(deltaTicks) {
+        const rounded = Math.round(Number(deltaTicks || 0));
+        if (!isSnapEnabled()) {
+          return rounded;
+        }
+        const grid = currentSnapTicks();
+        return Math.round(rounded / grid) * grid;
+      }
+
+      function noteDurationTicks(note) {
+        const start = Math.round(Number(note && note.start_tick || 0));
+        const end = Math.round(Number(note && note.end_tick || start));
+        return Math.max(0, end - start);
+      }
+
       function rebuildNoteLookup() {
         state.noteById.clear();
         for (const note of session.notes) {
@@ -660,6 +739,8 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         note.start_tick = Math.max(0, Math.round(Number(note.start_tick || 0)));
         note.end_tick = Math.max(note.start_tick, Math.round(Number(note.end_tick || note.start_tick)));
         note.duration_ticks = Math.max(0, note.end_tick - note.start_tick);
+        note.pitch_midi = clampPitchMidi(note.pitch_midi);
+        note.pitch_name = pitchNameFromMidi(note.pitch_midi);
         note.start_sec = tickToSeconds(note.start_tick);
         note.end_sec = tickToSeconds(note.end_tick);
         note.duration_sec = Math.max(0, note.end_sec - note.start_sec);
@@ -1019,8 +1100,18 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         return TOP_PAD + (state.pitchMax - pitch) * NOTE_ROW_HEIGHT;
       }
 
+      function pitchFromCanvasY(y) {
+        const relative = Math.floor((Number(y) - TOP_PAD) / NOTE_ROW_HEIGHT);
+        const pitch = state.pitchMax - relative;
+        return clampPitchMidi(pitch);
+      }
+
       function xForTick(tick) {
         return LEFT_PAD + (Number(tick) - state.xOffsetTicks) * state.pixelsPerTick;
+      }
+
+      function tickFromCanvasX(x) {
+        return state.xOffsetTicks + (Number(x) - LEFT_PAD) / state.pixelsPerTick;
       }
 
       function updateSelectionUi() {
@@ -1138,23 +1229,48 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           }
         }
 
-        if (toolName === "select") {
+        if (toolName === "draw") {
           canvas.style.cursor = "crosshair";
-        } else if (toolName === "zoom") {
-          canvas.style.cursor = "zoom-in";
-        } else {
-          canvas.style.cursor = "grab";
+          return;
         }
+        if (toolName === "zoom") {
+          canvas.style.cursor = "zoom-in";
+          return;
+        }
+        if (toolName === "pan") {
+          canvas.style.cursor = state.panDrag ? "grabbing" : "grab";
+          return;
+        }
+
+        canvas.style.cursor = "default";
       }
 
       function resetDerivedSessionState() {
         state.mergeTrackIndices.clear();
         state.dragSelect = null;
+        state.noteEditDrag = null;
+        state.drawDrag = null;
         state.panDrag = null;
         state.noteBoxes = [];
         state.pixelsPerTick = DEFAULT_PIXELS_PER_TICK;
         state.xOffsetTicks = 0;
         clearSelection();
+      }
+
+      function resetDrawNoteCounter() {
+        let nextOrdinal = 1;
+        for (const note of session.notes) {
+          const noteId = String(note.note_id || "");
+          const match = /^drawn_(\\d{6})$/i.exec(noteId);
+          if (!match) {
+            continue;
+          }
+          const parsed = Number(match[1]);
+          if (Number.isFinite(parsed)) {
+            nextOrdinal = Math.max(nextOrdinal, Math.floor(parsed) + 1);
+          }
+        }
+        state.drawNoteCounter = nextOrdinal;
       }
 
       function renderAll() {
@@ -1172,6 +1288,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         rebuildTrackSources();
         refreshTimingCaches();
         rebuildNoteLookup();
+        resetDrawNoteCounter();
         clearHistory();
         resetDerivedSessionState();
         updateEditorActionButtons();
@@ -1495,6 +1612,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         drawGrid();
         drawNotes();
         drawSelectionRectangle();
+        drawDrawPreview();
       }
 
       function getNoteBoxAt(x, y) {
@@ -1505,6 +1623,62 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           }
         }
         return null;
+      }
+
+      function getNoteHitRegion(box, x) {
+        const threshold = Math.max(3, Math.min(NOTE_EDGE_RESIZE_HIT_PX, box.w / 2));
+        const rightEdge = box.x + box.w;
+
+        if (Math.abs(Number(x) - box.x) <= threshold) {
+          return "left";
+        }
+        if (Math.abs(Number(x) - rightEdge) <= threshold) {
+          return "right";
+        }
+        return "body";
+      }
+
+      function updateCanvasCursorForPoint(point) {
+        if (currentTool === "draw") {
+          canvas.style.cursor = "crosshair";
+          return;
+        }
+        if (currentTool === "zoom") {
+          canvas.style.cursor = "zoom-in";
+          return;
+        }
+        if (currentTool === "pan") {
+          canvas.style.cursor = state.panDrag ? "grabbing" : "grab";
+          return;
+        }
+
+        if (state.noteEditDrag) {
+          if (state.noteEditDrag.mode === "move") {
+            canvas.style.cursor = "grabbing";
+          } else {
+            canvas.style.cursor = "ew-resize";
+          }
+          return;
+        }
+
+        if (!point || point.y < TOP_PAD || point.x < LEFT_PAD || point.x > canvas.width - RIGHT_PAD) {
+          canvas.style.cursor = "default";
+          return;
+        }
+
+        const hit = getNoteBoxAt(point.x, point.y);
+        if (!hit) {
+          canvas.style.cursor = "default";
+          return;
+        }
+
+        const region = getNoteHitRegion(hit, point.x);
+        if (region === "left" || region === "right") {
+          canvas.style.cursor = "ew-resize";
+          return;
+        }
+
+        canvas.style.cursor = "move";
       }
 
       function selectNoteById(noteId, additive) {
@@ -1518,6 +1692,39 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           state.selectedNoteIds.add(id);
         }
         updateSelectionUi();
+      }
+
+      function drawDrawPreview() {
+        if (!state.drawDrag) {
+          return;
+        }
+
+        const drag = state.drawDrag;
+        const minDuration = minimumDurationTicks();
+        const startTick = Number(drag.startTick);
+        const currentTick = Number(drag.currentTick);
+
+        let leftTick = Math.min(startTick, currentTick);
+        let rightTick = Math.max(startTick, currentTick);
+        if (!drag.active || rightTick <= leftTick) {
+          rightTick = leftTick + minDuration;
+        }
+
+        const x = xForTick(leftTick);
+        const rightX = xForTick(rightTick);
+        const w = Math.max(1, rightX - x);
+        const pitch = clampPitchMidi(drag.currentPitch);
+        const y = yForPitch(pitch) + 1;
+        const h = Math.max(3, NOTE_ROW_HEIGHT - 2);
+
+        ctx.fillStyle = "rgba(154, 184, 255, 0.45)";
+        ctx.fillRect(x, y, w, h);
+        ctx.strokeStyle = "#d6e5ff";
+        ctx.lineWidth = 2;
+        ctx.setLineDash([4, 3]);
+        ctx.strokeRect(x + 0.5, y + 0.5, Math.max(0, w - 1), Math.max(0, h - 1));
+        ctx.setLineDash([]);
+        ctx.lineWidth = 1;
       }
 
       function selectNotesInRect(rect, additive) {
@@ -1546,6 +1753,343 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         };
       }
 
+      function startNoteEditDrag(hitBox, point, additive) {
+        const hitNoteId = String(hitBox.note.note_id);
+        const hitRegion = getNoteHitRegion(hitBox, point.x);
+        const mode = hitRegion === "left"
+          ? "resize-left"
+          : (hitRegion === "right" ? "resize-right" : "move");
+
+        if (mode === "move") {
+          if (!state.selectedNoteIds.has(hitNoteId)) {
+            if (additive) {
+              state.selectedNoteIds.add(hitNoteId);
+            } else {
+              state.selectedNoteIds.clear();
+              state.selectedNoteIds.add(hitNoteId);
+            }
+            updateSelectionUi();
+          }
+        } else {
+          setSelectionFromList([hitNoteId]);
+        }
+
+        const selection = mode === "move"
+          ? Array.from(state.selectedNoteIds).filter(function (noteId) {
+              return state.noteById.has(String(noteId));
+            })
+          : [hitNoteId];
+
+        const beforeNotes = selection
+          .map(function (noteId) {
+            const note = state.noteById.get(String(noteId));
+            return note ? cloneNoteSnapshot(note) : null;
+          })
+          .filter(function (note) { return Boolean(note); });
+
+        const beforeById = new Map(
+          beforeNotes.map(function (note) {
+            return [String(note.note_id), note];
+          })
+        );
+
+        state.noteEditDrag = {
+          mode: mode,
+          startX: point.x,
+          startY: point.y,
+          active: false,
+          noteIds: selection,
+          targetNoteId: hitNoteId,
+          selectionBefore: selection.slice(),
+          beforeNotes: beforeNotes,
+          beforeById: beforeById,
+          appliedDeltaTicks: 0,
+          appliedDeltaPitch: 0,
+          appliedTick: null,
+        };
+      }
+
+      function applyMovePreview(drag, point) {
+        const rawDeltaTicks = (point.x - drag.startX) / state.pixelsPerTick;
+        let deltaTicks = snapDeltaTicks(rawDeltaTicks);
+
+        const minStart = Math.min.apply(
+          null,
+          drag.beforeNotes.map(function (note) {
+            return Number(note.start_tick || 0);
+          })
+        );
+        if (minStart + deltaTicks < 0) {
+          deltaTicks = -minStart;
+        }
+
+        const rawDeltaPitch = Math.round((drag.startY - point.y) / NOTE_ROW_HEIGHT);
+        let deltaPitch = rawDeltaPitch;
+        const minPitch = Math.min.apply(
+          null,
+          drag.beforeNotes.map(function (note) {
+            return Number(note.pitch_midi || 0);
+          })
+        );
+        const maxPitch = Math.max.apply(
+          null,
+          drag.beforeNotes.map(function (note) {
+            return Number(note.pitch_midi || 0);
+          })
+        );
+        if (minPitch + deltaPitch < 0) {
+          deltaPitch = -minPitch;
+        }
+        if (maxPitch + deltaPitch > 127) {
+          deltaPitch = 127 - maxPitch;
+        }
+
+        if (drag.appliedDeltaTicks === deltaTicks && drag.appliedDeltaPitch === deltaPitch) {
+          return;
+        }
+
+        drag.appliedDeltaTicks = deltaTicks;
+        drag.appliedDeltaPitch = deltaPitch;
+
+        for (const before of drag.beforeNotes) {
+          const note = state.noteById.get(String(before.note_id));
+          if (!note) {
+            continue;
+          }
+
+          const duration = noteDurationTicks(before);
+          note.start_tick = Math.max(0, Math.round(Number(before.start_tick || 0) + deltaTicks));
+          note.end_tick = note.start_tick + duration;
+          note.pitch_midi = clampPitchMidi(Number(before.pitch_midi || 0) + deltaPitch);
+          syncNoteTimingFromTicks(note);
+        }
+      }
+
+      function applyResizePreview(drag, point) {
+        const before = drag.beforeById.get(String(drag.targetNoteId));
+        const note = state.noteById.get(String(drag.targetNoteId));
+        if (!before || !note) {
+          return;
+        }
+
+        const requestedTick = Math.max(0, snapAbsoluteTick(tickFromCanvasX(point.x)));
+        if (drag.appliedTick === requestedTick) {
+          return;
+        }
+        drag.appliedTick = requestedTick;
+
+        const beforeStart = Math.round(Number(before.start_tick || 0));
+        const beforeEnd = Math.max(beforeStart, Math.round(Number(before.end_tick || beforeStart)));
+        const minDuration = Math.max(1, Math.min(minimumDurationTicks(), Math.max(1, beforeEnd)));
+
+        if (drag.mode === "resize-left") {
+          const maxStart = Math.max(0, beforeEnd - minDuration);
+          note.start_tick = Math.max(0, Math.min(requestedTick, maxStart));
+          note.end_tick = beforeEnd;
+        } else {
+          const minEnd = beforeStart + minDuration;
+          note.start_tick = beforeStart;
+          note.end_tick = Math.max(requestedTick, minEnd);
+        }
+
+        syncNoteTimingFromTicks(note);
+      }
+
+      function noteSnapshotsChanged(beforeNote, afterNote) {
+        return JSON.stringify(beforeNote) !== JSON.stringify(afterNote);
+      }
+
+      function finalizeNoteEditDrag(drag) {
+        if (!drag.active) {
+          return;
+        }
+
+        const afterNotes = drag.noteIds
+          .map(function (noteId) {
+            const note = state.noteById.get(String(noteId));
+            return note ? cloneNoteSnapshot(note) : null;
+          })
+          .filter(function (note) { return Boolean(note); });
+
+        const changedBefore = [];
+        const changedAfter = [];
+        for (const after of afterNotes) {
+          const before = drag.beforeById.get(String(after.note_id));
+          if (!before) {
+            continue;
+          }
+          if (noteSnapshotsChanged(before, after)) {
+            changedBefore.push(cloneNoteSnapshot(before));
+            changedAfter.push(cloneNoteSnapshot(after));
+          }
+        }
+
+        if (!changedAfter.length) {
+          return;
+        }
+
+        const selectionAfter = drag.mode === "move"
+          ? drag.noteIds.slice()
+          : [String(drag.targetNoteId)];
+
+        pushHistoryTransaction({
+          label: drag.mode === "move" ? "drag-move-notes" : "resize-note",
+          beforeNotes: changedBefore,
+          afterNotes: changedAfter,
+          selectionBefore: drag.selectionBefore,
+          selectionAfter: selectionAfter,
+        });
+
+        sortNotes();
+        rebuildTrackSources();
+        rebuildNoteLookup();
+        setSelectionFromList(selectionAfter);
+        updateTargetTrackDropdown();
+        renderTrackPanel();
+        redraw();
+        updateEditorActionButtons();
+
+        if (drag.mode === "move") {
+          setStatus("Moved " + String(changedAfter.length) + " note(s).", false);
+        } else {
+          setStatus("Resized note.", false);
+        }
+      }
+
+      function generateUniqueDrawnNoteId() {
+        const existing = new Set(
+          session.notes.map(function (note) {
+            return String(note.note_id);
+          })
+        );
+
+        for (let guard = 0; guard < 100000; guard += 1) {
+          const candidate = DRAW_NOTE_ID_PREFIX + "_" + String(state.drawNoteCounter).padStart(6, "0");
+          state.drawNoteCounter += 1;
+          if (!existing.has(candidate)) {
+            return candidate;
+          }
+        }
+
+        return DRAW_NOTE_ID_PREFIX + "_" + String(Date.now());
+      }
+
+      function resolveTargetTrackForDraw() {
+        const targetIndex = Number(targetTrackEl.value || 0);
+        const selectedTrack = getTrackByIndex(targetIndex);
+        if (selectedTrack) {
+          return selectedTrack;
+        }
+        if (session.tracks.length > 0) {
+          return session.tracks[0];
+        }
+        return null;
+      }
+
+      function resolveDefaultChannelForTrack(editableTrackIndex) {
+        for (const note of session.notes) {
+          if (Number(note.editable_track_index) !== Number(editableTrackIndex)) {
+            continue;
+          }
+          if (Number.isFinite(Number(note.channel))) {
+            return Math.max(0, Math.min(15, Math.round(Number(note.channel))));
+          }
+        }
+        return 0;
+      }
+
+      function startDrawDrag(point) {
+        const targetTrack = resolveTargetTrackForDraw();
+        if (!targetTrack) {
+          setStatus("No target track available for drawing.", true);
+          return;
+        }
+
+        const snappedTick = Math.max(0, snapAbsoluteTick(tickFromCanvasX(point.x)));
+        const pitch = pitchFromCanvasY(point.y);
+        state.drawDrag = {
+          startX: point.x,
+          startY: point.y,
+          currentX: point.x,
+          currentY: point.y,
+          startTick: snappedTick,
+          currentTick: snappedTick,
+          currentPitch: pitch,
+          active: false,
+          selectionBefore: Array.from(state.selectedNoteIds),
+          trackIndex: Number(targetTrack.editable_track_index),
+          trackName: String(targetTrack.name || "Track"),
+          channel: resolveDefaultChannelForTrack(targetTrack.editable_track_index),
+        };
+      }
+
+      function finalizeDrawDrag(drag) {
+        const minDuration = minimumDurationTicks();
+        let startTick = Math.round(Number(drag.startTick || 0));
+        let endTick = Math.round(Number(drag.currentTick || startTick));
+
+        if (!drag.active || endTick === startTick) {
+          endTick = startTick + minDuration;
+        }
+
+        if (endTick < startTick) {
+          const temp = startTick;
+          startTick = endTick;
+          endTick = temp;
+        }
+
+        if (endTick <= startTick) {
+          endTick = startTick + minDuration;
+        }
+
+        const noteId = generateUniqueDrawnNoteId();
+        const newNote = {
+          note_id: noteId,
+          source_track_index: Number(drag.trackIndex),
+          source_track_name: String(drag.trackName),
+          editable_track_index: Number(drag.trackIndex),
+          editable_track_name: String(drag.trackName),
+          channel: Number(drag.channel),
+          pitch_midi: clampPitchMidi(drag.currentPitch),
+          pitch_name: pitchNameFromMidi(clampPitchMidi(drag.currentPitch)),
+          velocity: DEFAULT_DRAW_VELOCITY,
+          start_tick: Math.max(0, startTick),
+          end_tick: Math.max(0, endTick),
+          duration_ticks: 0,
+          start_sec: 0,
+          end_sec: 0,
+          duration_sec: 0,
+          muted: false,
+          metadata: {},
+        };
+
+        syncNoteTimingFromTicks(newNote);
+        if (Number(newNote.end_tick) <= Number(newNote.start_tick)) {
+          newNote.end_tick = Number(newNote.start_tick) + minDuration;
+          syncNoteTimingFromTicks(newNote);
+        }
+
+        session.notes.push(newNote);
+
+        pushHistoryTransaction({
+          label: "draw-note",
+          beforeNotes: [],
+          afterNotes: [cloneNoteSnapshot(newNote)],
+          selectionBefore: Array.isArray(drag.selectionBefore) ? drag.selectionBefore.slice() : [],
+          selectionAfter: [String(noteId)],
+        });
+
+        sortNotes();
+        rebuildTrackSources();
+        rebuildNoteLookup();
+        setSelectionFromList([String(noteId)]);
+        updateTargetTrackDropdown();
+        renderTrackPanel();
+        redraw();
+        updateEditorActionButtons();
+        setStatus("Added note.", false);
+      }
+
       function handleCanvasMouseDown(event) {
         if (event.button !== 0) {
           return;
@@ -1565,19 +2109,33 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           return;
         }
 
+        if (currentTool === "draw") {
+          startDrawDrag(point);
+          redraw();
+          return;
+        }
+
         if (currentTool !== "select") {
           return;
         }
 
+        const additive = Boolean(event.ctrlKey || event.metaKey);
         const hit = getNoteBoxAt(point.x, point.y);
+        if (hit) {
+          startNoteEditDrag(hit, point, additive);
+          updateCanvasCursorForPoint(point);
+          redraw();
+          return;
+        }
+
         state.dragSelect = {
           startX: point.x,
           startY: point.y,
           currentX: point.x,
           currentY: point.y,
           active: false,
-          hitNoteId: hit ? String(hit.note.note_id) : null,
-          additive: Boolean(event.ctrlKey || event.metaKey),
+          hitNoteId: null,
+          additive: additive,
         };
       }
 
@@ -1592,7 +2150,47 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           return;
         }
 
+        if (state.noteEditDrag) {
+          const drag = state.noteEditDrag;
+          const dx = Math.abs(point.x - drag.startX);
+          const dy = Math.abs(point.y - drag.startY);
+          if (!drag.active && (dx >= DRAG_THRESHOLD_PX || dy >= DRAG_THRESHOLD_PX)) {
+            drag.active = true;
+          }
+
+          if (drag.active) {
+            if (drag.mode === "move") {
+              applyMovePreview(drag, point);
+            } else {
+              applyResizePreview(drag, point);
+            }
+            redraw();
+          }
+          updateCanvasCursorForPoint(point);
+          return;
+        }
+
+        if (state.drawDrag) {
+          const drag = state.drawDrag;
+          drag.currentX = point.x;
+          drag.currentY = point.y;
+          const snappedTick = Math.max(0, snapAbsoluteTick(tickFromCanvasX(point.x)));
+          drag.currentTick = snappedTick;
+          drag.currentPitch = pitchFromCanvasY(point.y);
+
+          const dx = Math.abs(drag.currentX - drag.startX);
+          const dy = Math.abs(drag.currentY - drag.startY);
+          if (!drag.active && (dx >= DRAG_THRESHOLD_PX || dy >= DRAG_THRESHOLD_PX)) {
+            drag.active = true;
+          }
+
+          redraw();
+          updateCanvasCursorForPoint(point);
+          return;
+        }
+
         if (!state.dragSelect) {
+          updateCanvasCursorForPoint(point);
           return;
         }
 
@@ -1608,16 +2206,35 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         redraw();
       }
 
-      function handleCanvasMouseUp() {
+      function handleCanvasMouseUp(event) {
+        const point = event ? canvasPointFromEvent(event) : null;
+
         if (state.panDrag) {
           state.panDrag = null;
-          if (currentTool === "pan") {
-            canvas.style.cursor = "grab";
-          }
+          updateCanvasCursorForPoint(point);
+          return;
+        }
+
+        if (state.noteEditDrag) {
+          const drag = state.noteEditDrag;
+          finalizeNoteEditDrag(drag);
+          state.noteEditDrag = null;
+          redraw();
+          updateCanvasCursorForPoint(point);
+          return;
+        }
+
+        if (state.drawDrag) {
+          const drag = state.drawDrag;
+          finalizeDrawDrag(drag);
+          state.drawDrag = null;
+          redraw();
+          updateCanvasCursorForPoint(point);
           return;
         }
 
         if (!state.dragSelect) {
+          updateCanvasCursorForPoint(point);
           return;
         }
 
@@ -1638,6 +2255,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
 
         state.dragSelect = null;
         redraw();
+        updateCanvasCursorForPoint(point);
       }
 
       function handleCanvasWheel(event) {
@@ -2055,14 +2673,41 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         });
 
         toolButtons.select.addEventListener("click", function () { setTool("select"); });
+        toolButtons.draw.addEventListener("click", function () { setTool("draw"); });
         toolButtons.zoom.addEventListener("click", function () { setTool("zoom"); });
         toolButtons.pan.addEventListener("click", function () { setTool("pan"); });
+
+        if (snapEnabledEl) {
+          snapEnabledEl.addEventListener("change", function () {
+            redraw();
+            setStatus(
+              "Snap " + (isSnapEnabled() ? "on" : "off") + " (" + "1/" + String(currentSnapDivision()) + ").",
+              false
+            );
+          });
+        }
+
+        if (snapGridEl) {
+          snapGridEl.addEventListener("change", function () {
+            redraw();
+            setStatus(
+              "Snap grid: 1/" + String(currentSnapDivision()) + (isSnapEnabled() ? "" : " (snap disabled)"),
+              false
+            );
+          });
+        }
       }
 
       function bindCanvasActions() {
         canvas.addEventListener("mousedown", handleCanvasMouseDown);
         window.addEventListener("mousemove", handleCanvasMouseMove);
         window.addEventListener("mouseup", handleCanvasMouseUp);
+        canvas.addEventListener("mouseleave", function () {
+          if (state.panDrag || state.noteEditDrag || state.drawDrag || state.dragSelect) {
+            return;
+          }
+          updateCanvasCursorForPoint(null);
+        });
         canvas.addEventListener("wheel", handleCanvasWheel, { passive: false });
         window.addEventListener("resize", redraw);
       }
@@ -2121,6 +2766,22 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           },
           setTool: setTool,
           getTool: function () { return currentTool; },
+          setSnapEnabled: function (enabled) {
+            if (!snapEnabledEl) {
+              return;
+            }
+            snapEnabledEl.checked = Boolean(enabled);
+            redraw();
+          },
+          isSnapEnabled: isSnapEnabled,
+          setSnapDivision: function (division) {
+            if (!snapGridEl) {
+              return;
+            }
+            snapGridEl.value = String(Math.max(1, Math.round(Number(division || 16))));
+            redraw();
+          },
+          getSnapDivision: currentSnapDivision,
           moveSelectedToTrack: moveSelectedToTrack,
           mergeSelectedNotes: mergeSelectedNotes,
           deleteSelectedNotes: deleteSelectedNotes,

@@ -13,6 +13,9 @@ from midi_cleaner.midi_split.editor_logic import apply_note_transaction
 from midi_cleaner.midi_split.editor_logic import build_timeline_layout
 from midi_cleaner.midi_split.editor_logic import clone_note_payload
 from midi_cleaner.midi_split.editor_logic import delete_selected_notes
+from midi_cleaner.midi_split.editor_logic import draw_note
+from midi_cleaner.midi_split.editor_logic import move_selected_notes
+from midi_cleaner.midi_split.editor_logic import resize_note_edge
 from midi_cleaner.midi_split.editor_logic import resolve_selected_mute_action
 from midi_cleaner.midi_split.editor_logic import merge_selected_notes
 from midi_cleaner.midi_split.editor_logic import set_selected_notes_muted
@@ -217,6 +220,127 @@ def test_merge_generates_unique_note_id() -> None:
     )["merged_note"]
 
     assert merged["note_id"] not in {"n1", "n2", "n1_merged"}
+
+
+def test_move_selected_notes_applies_tick_and_pitch_delta() -> None:
+    notes = [
+        _note("n1", 100, 160, pitch=40),
+        _note("n2", 240, 300, pitch=43),
+        _note("keep", 400, 480, pitch=55),
+    ]
+
+    result = move_selected_notes(
+        all_notes=notes,
+        selected_note_ids=["n1", "n2"],
+        delta_ticks=120,
+        delta_pitch=3,
+        ticks_per_beat=480,
+        tempo_events=_tempo_map(),
+    )
+
+    assert result["moved_count"] == 2
+    assert result["applied_delta_ticks"] == 120
+    assert result["applied_delta_pitch"] == 3
+
+    by_id = {str(note["note_id"]): note for note in result["notes_after"]}
+    assert by_id["n1"]["start_tick"] == 220
+    assert by_id["n1"]["end_tick"] == 280
+    assert by_id["n1"]["duration_ticks"] == 60
+    assert by_id["n1"]["pitch_midi"] == 43
+    assert by_id["n2"]["start_tick"] == 360
+    assert by_id["n2"]["end_tick"] == 420
+    assert by_id["n2"]["duration_ticks"] == 60
+    assert by_id["n2"]["pitch_midi"] == 46
+    assert by_id["keep"]["start_tick"] == 400
+    assert by_id["keep"]["pitch_midi"] == 55
+
+
+def test_move_selected_notes_clamps_tick_and_pitch_deltas() -> None:
+    notes = [
+        _note("n1", 10, 70, pitch=1),
+        _note("n2", 100, 160, pitch=126),
+    ]
+
+    result = move_selected_notes(
+        all_notes=notes,
+        selected_note_ids=["n1", "n2"],
+        delta_ticks=-50,
+        delta_pitch=10,
+        ticks_per_beat=480,
+        tempo_events=_tempo_map(),
+    )
+
+    assert result["applied_delta_ticks"] == -10
+    assert result["applied_delta_pitch"] == 1
+
+    by_id = {str(note["note_id"]): note for note in result["notes_after"]}
+    assert by_id["n1"]["start_tick"] == 0
+    assert by_id["n1"]["end_tick"] == 60
+    assert by_id["n1"]["pitch_midi"] == 2
+    assert by_id["n2"]["start_tick"] == 90
+    assert by_id["n2"]["end_tick"] == 150
+    assert by_id["n2"]["pitch_midi"] == 127
+
+
+def test_resize_note_edge_respects_bounds_and_min_duration() -> None:
+    notes = [_note("n1", 100, 200, pitch=40)]
+
+    left = resize_note_edge(
+        all_notes=notes,
+        note_id="n1",
+        edge="left",
+        target_tick=190,
+        ticks_per_beat=480,
+        tempo_events=_tempo_map(),
+        min_duration_ticks=30,
+    )
+    assert left["after_note"]["start_tick"] == 170
+    assert left["after_note"]["end_tick"] == 200
+    assert left["after_note"]["duration_ticks"] == 30
+
+    right = resize_note_edge(
+        all_notes=notes,
+        note_id="n1",
+        edge="right",
+        target_tick=110,
+        ticks_per_beat=480,
+        tempo_events=_tempo_map(),
+        min_duration_ticks=40,
+    )
+    assert right["after_note"]["start_tick"] == 100
+    assert right["after_note"]["end_tick"] == 140
+    assert right["after_note"]["duration_ticks"] == 40
+
+
+def test_draw_note_generates_unique_id_and_normalizes_payload() -> None:
+    notes = [_note("drawn_000001", 100, 180, pitch=40, track_index=2, track_name="Track 2")]
+
+    result = draw_note(
+        all_notes=notes,
+        start_tick=480,
+        end_tick=480,
+        pitch_midi=130,
+        editable_track_index=2,
+        editable_track_name="Track 2",
+        ticks_per_beat=480,
+        tempo_events=_tempo_map(),
+        min_duration_ticks=30,
+        velocity=200,
+        metadata={"origin": "draw"},
+    )
+
+    drawn = result["drawn_note"]
+    assert drawn["note_id"] == "drawn_000002"
+    assert drawn["start_tick"] == 480
+    assert drawn["end_tick"] == 510
+    assert drawn["duration_ticks"] == 30
+    assert drawn["pitch_midi"] == 127
+    assert drawn["velocity"] == 127
+    assert drawn["editable_track_index"] == 2
+    assert drawn["source_track_index"] == 2
+    assert drawn["metadata"] == {"origin": "draw"}
+    assert result["selection_after"] == ["drawn_000002"]
+    assert len(result["notes_after"]) == 2
 
 
 def test_delete_selected_notes_returns_remaining_and_deleted() -> None:

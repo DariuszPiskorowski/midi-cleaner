@@ -283,8 +283,12 @@ def test_generate_piano_roll_preview_contains_editor_toolbar_actions(tmp_path: P
     assert "Server: checking" in html
     assert "midi-split-editor-build" in html
     assert "Select" in html
+    assert "Draw" in html
     assert "Zoom" in html
     assert "Hand" in html
+    assert 'id="tool-draw-btn"' in html
+    assert 'id="snap-enabled"' in html
+    assert 'id="snap-grid"' in html
 
 
 def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tmp_path: Path) -> None:
@@ -310,7 +314,13 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function exportMultitrackMidi" in html
     assert "function exportSeparateTracks" in html
     assert "let currentTool" in html
+    assert "function drawDrawPreview" in html
+    assert "function startDrawDrag" in html
+    assert "function finalizeDrawDrag" in html
+    assert "function applyMovePreview" in html
+    assert "function applyResizePreview" in html
     assert "function handleCanvasWheel" in html
+    assert "currentTool === \"draw\"" in html
     assert "currentTool === \"zoom\"" in html
     assert "currentTool === \"pan\"" in html
     assert "function checkServerConnection" in html
@@ -321,6 +331,19 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function drawTimelineRuler" in html
     assert "function setErrorStatus" in html
     assert "console.error(\"MIDI split editor error:\", details);" in script
+
+
+def test_generate_piano_roll_preview_exposes_snap_controls_in_test_api(tmp_path: Path) -> None:
+    session = _create_session(tmp_path)
+    output_html = tmp_path / "split_editor.html"
+
+    generate_piano_roll_preview(session, output_html)
+
+    script = _extract_editor_script(output_html.read_text(encoding="utf-8"))
+    assert "setSnapEnabled: function (enabled)" in script
+    assert "isSnapEnabled: isSnapEnabled" in script
+    assert "setSnapDivision: function (division)" in script
+    assert "getSnapDivision: currentSnapDivision" in script
 
 
 def test_generate_piano_roll_preview_wires_history_shortcuts_without_editable_interception(tmp_path: Path) -> None:
