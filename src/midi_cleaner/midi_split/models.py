@@ -21,6 +21,7 @@ class SplitNote(BaseModel):
     start_sec: float
     end_sec: float
     duration_sec: float
+    muted: bool = False
     metadata: dict[str, object] = Field(default_factory=dict)
 
 

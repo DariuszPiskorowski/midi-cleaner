@@ -467,6 +467,89 @@ def merge_selected_notes(
     }
 
 
+def is_note_muted(note: Mapping[str, Any]) -> bool:
+    return bool(note.get("muted", False))
+
+
+def delete_selected_notes(
+    *,
+    all_notes: Sequence[object],
+    selected_note_ids: Sequence[str],
+) -> dict[str, Any]:
+    payloads = [note_to_payload(note) for note in all_notes]
+    selected_set = {str(note_id) for note_id in selected_note_ids}
+
+    deleted_notes = [note for note in payloads if _note_id(note) in selected_set]
+    deleted_sorted = sort_note_payloads(deleted_notes)
+
+    remaining_notes = [note for note in payloads if _note_id(note) not in selected_set]
+    notes_after = sort_note_payloads(remaining_notes)
+
+    return {
+        "deleted_notes": deleted_sorted,
+        "notes_after": notes_after,
+        "selection_after": [],
+    }
+
+
+def resolve_selected_mute_action(selected_notes: Sequence[object]) -> str | None:
+    payloads = [note_to_payload(note) for note in selected_notes]
+    if not payloads:
+        return None
+
+    all_muted = all(is_note_muted(note) for note in payloads)
+    return "unmute" if all_muted else "mute"
+
+
+def set_selected_notes_muted(
+    *,
+    all_notes: Sequence[object],
+    selected_note_ids: Sequence[str],
+    mute: bool | None = None,
+) -> dict[str, Any]:
+    payloads = [note_to_payload(note) for note in all_notes]
+    selected_set = {str(note_id) for note_id in selected_note_ids}
+    selected_notes = [note for note in payloads if _note_id(note) in selected_set]
+
+    resolved_action = "mute" if bool(mute) else "unmute"
+    if mute is None:
+        dynamic_action = resolve_selected_mute_action(selected_notes)
+        if dynamic_action is None:
+            resolved_action = "mute"
+        else:
+            resolved_action = dynamic_action
+
+    should_mute = resolved_action == "mute"
+    before_notes = sort_note_payloads(selected_notes)
+
+    after_notes: list[dict[str, Any]] = []
+    changed_count = 0
+    for note in before_notes:
+        updated = clone_note_payload(note)
+        prior_muted = is_note_muted(note)
+        updated["muted"] = should_mute
+        if prior_muted != should_mute:
+            changed_count += 1
+        after_notes.append(updated)
+
+    by_after_id = {_note_id(note): note for note in after_notes}
+    notes_after: list[dict[str, Any]] = []
+    for note in payloads:
+        note_id = _note_id(note)
+        if note_id in by_after_id:
+            notes_after.append(clone_note_payload(by_after_id[note_id]))
+        else:
+            notes_after.append(clone_note_payload(note))
+
+    return {
+        "action": resolved_action,
+        "before_notes": before_notes,
+        "after_notes": sort_note_payloads(after_notes),
+        "notes_after": sort_note_payloads(notes_after),
+        "changed_count": int(changed_count),
+    }
+
+
 @dataclass(slots=True)
 class NoteEditTransaction:
     before_notes: list[dict[str, Any]]

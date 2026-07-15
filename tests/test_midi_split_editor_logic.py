@@ -12,9 +12,13 @@ from midi_cleaner.midi_split.editor_logic import NoteHistory
 from midi_cleaner.midi_split.editor_logic import apply_note_transaction
 from midi_cleaner.midi_split.editor_logic import build_timeline_layout
 from midi_cleaner.midi_split.editor_logic import clone_note_payload
+from midi_cleaner.midi_split.editor_logic import delete_selected_notes
+from midi_cleaner.midi_split.editor_logic import resolve_selected_mute_action
 from midi_cleaner.midi_split.editor_logic import merge_selected_notes
+from midi_cleaner.midi_split.editor_logic import set_selected_notes_muted
 from midi_cleaner.midi_split.editor_logic import tick_to_bar_beat
 from midi_cleaner.midi_split.editor_logic import tick_to_seconds
+from midi_cleaner.midi_split.exporter import export_split_separate_midi_files
 from midi_cleaner.midi_split.exporter import export_split_multitrack_midi
 from midi_cleaner.midi_split.models import MidiSplitSession
 from midi_cleaner.midi_split.models import SplitNote
@@ -31,6 +35,7 @@ def _note(
     channel: int | None = 0,
     track_index: int = 1,
     track_name: str = "Bass",
+    muted: bool = False,
 ) -> dict[str, object]:
     duration_ticks = max(0, end_tick - start_tick)
     return {
@@ -49,6 +54,7 @@ def _note(
         "start_sec": start_tick / 960.0,
         "end_sec": end_tick / 960.0,
         "duration_sec": duration_ticks / 960.0,
+        "muted": muted,
         "metadata": {"tag": "x"},
     }
 
@@ -211,6 +217,71 @@ def test_merge_generates_unique_note_id() -> None:
     )["merged_note"]
 
     assert merged["note_id"] not in {"n1", "n2", "n1_merged"}
+
+
+def test_delete_selected_notes_returns_remaining_and_deleted() -> None:
+    notes = [
+        _note("n1", 100, 140),
+        _note("n2", 150, 190),
+        _note("n3", 200, 250),
+    ]
+
+    result = delete_selected_notes(all_notes=notes, selected_note_ids=["n2", "n3", "missing"])
+
+    assert [str(note["note_id"]) for note in result["notes_after"]] == ["n1"]
+    assert [str(note["note_id"]) for note in result["deleted_notes"]] == ["n2", "n3"]
+
+
+def test_delete_selected_notes_with_empty_selection_leaves_all_notes() -> None:
+    notes = [
+        _note("n1", 100, 140),
+        _note("n2", 150, 190),
+    ]
+
+    result = delete_selected_notes(all_notes=notes, selected_note_ids=[])
+
+    assert [str(note["note_id"]) for note in result["notes_after"]] == ["n1", "n2"]
+    assert result["deleted_notes"] == []
+
+
+def test_resolve_selected_mute_action_prefers_mute_for_empty_mixed_or_unmuted() -> None:
+    assert resolve_selected_mute_action([]) is None
+    assert resolve_selected_mute_action([_note("n1", 0, 120, muted=False)]) == "mute"
+    assert (
+        resolve_selected_mute_action(
+            [
+                _note("n1", 0, 120, muted=True),
+                _note("n2", 140, 260, muted=False),
+            ]
+        )
+        == "mute"
+    )
+    assert (
+        resolve_selected_mute_action(
+            [
+                _note("n1", 0, 120, muted=True),
+                _note("n2", 140, 260, muted=True),
+            ]
+        )
+        == "unmute"
+    )
+
+
+def test_set_selected_notes_muted_updates_only_selected_notes() -> None:
+    notes = [
+        _note("n1", 100, 140, muted=False),
+        _note("n2", 150, 190, muted=False),
+        _note("n3", 200, 250, muted=True),
+    ]
+
+    result = set_selected_notes_muted(all_notes=notes, selected_note_ids=["n1", "n2"], mute=True)
+    by_id = {str(note["note_id"]): note for note in result["notes_after"]}
+
+    assert by_id["n1"]["muted"] is True
+    assert by_id["n2"]["muted"] is True
+    assert by_id["n3"]["muted"] is True
+    assert result["action"] == "mute"
+    assert result["changed_count"] == 2
 
 
 @pytest.mark.parametrize(
@@ -394,6 +465,31 @@ def test_export_reflects_current_undo_redo_state(tmp_path: Path) -> None:
     export_split_multitrack_midi(undone_session, undone_path)
     undone_spans = [span for span in _collect_exported_spans(undone_path) if span[0] > 0]
     assert len(undone_spans) == 2
+
+
+def test_export_skips_muted_notes_in_multitrack_and_separate_exports(tmp_path: Path) -> None:
+    notes = [
+        _note("audible", 100, 180, pitch=40, velocity=100, track_index=1, muted=False),
+        _note("muted", 220, 300, pitch=43, velocity=90, track_index=1, muted=True),
+    ]
+    session = _session_from_notes(notes)
+
+    multitrack_path = tmp_path / "multitrack.mid"
+    export_split_multitrack_midi(session, multitrack_path)
+    multitrack_spans = [span for span in _collect_exported_spans(multitrack_path) if span[0] > 0]
+    assert len(multitrack_spans) == 1
+    assert multitrack_spans[0][1] == 40
+    assert multitrack_spans[0][4] == 100
+    assert multitrack_spans[0][5] == 180
+
+    separate_dir = tmp_path / "separate"
+    exported = export_split_separate_midi_files(session, separate_dir, skip_empty=False)
+    assert len(exported) == 1
+    separate_spans = _collect_exported_spans(exported[0])
+    assert len(separate_spans) == 1
+    assert separate_spans[0][1] == 40
+    assert separate_spans[0][4] == 100
+    assert separate_spans[0][5] == 180
 
 
 def test_tick_to_bar_conversion_for_4_4_boundaries() -> None:

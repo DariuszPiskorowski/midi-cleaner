@@ -106,6 +106,7 @@ def test_split_init_imports_notes_and_creates_tracks_from_note_tracks(tmp_path: 
     assert [track.source_track_indices for track in session.tracks] == [[1], [2]]
     assert [track.name for track in session.tracks] == ["Lead", "Pad"]
     assert {note.editable_track_index for note in session.notes} == {1, 2}
+    assert {note.muted for note in session.notes} == {False}
 
 
 def test_add_empty_track_creates_new_track_up_to_max_limit(tmp_path: Path) -> None:
@@ -275,6 +276,8 @@ def test_generate_piano_roll_preview_contains_editor_toolbar_actions(tmp_path: P
     assert 'id="undo-btn"' in html
     assert 'id="redo-btn"' in html
     assert 'id="merge-notes-btn"' in html
+    assert 'id="delete-notes-btn"' in html
+    assert 'id="mute-notes-btn"' in html
     assert 'id="save-session-btn"' not in html
     assert 'id="download-session-btn"' not in html
     assert "Server: checking" in html
@@ -298,6 +301,9 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function addTrack" in html
     assert "function mergeSelectedTracks" in html
     assert "function mergeSelectedNotes" in html
+    assert "function deleteSelectedNotes" in html
+    assert "function setMuteStateForSelected" in html
+    assert "function toggleMuteSelectedNotes" in html
     assert "function undoHistory" in html
     assert "function redoHistory" in html
     assert "function importMidi" in html
@@ -330,6 +336,21 @@ def test_generate_piano_roll_preview_wires_history_shortcuts_without_editable_in
     assert "undoHistory();" in script
     assert "if (isModifierDown && (key === \"y\" || (key === \"z\" && event.shiftKey)))" in script
     assert "redoHistory();" in script
+    assert "if (key === \"delete\" || key === \"backspace\")" in script
+    assert "deleteSelectedNotes();" in script
+
+
+def test_generate_piano_roll_preview_muted_notes_have_distinct_visual_style(tmp_path: Path) -> None:
+    session = _create_session(tmp_path)
+    output_html = tmp_path / "split_editor.html"
+
+    generate_piano_roll_preview(session, output_html)
+
+    script = _extract_editor_script(output_html.read_text(encoding="utf-8"))
+    assert "const muted = note.muted === true;" in script
+    assert "ctx.globalAlpha = muted ? 0.35 : 1.0;" in script
+    assert "ctx.setLineDash([4, 2]);" in script
+    assert "ctx.fillText(\"M\"" in script
 
 
 def test_generate_piano_roll_preview_import_flow_wires_file_input_and_resets_value(tmp_path: Path) -> None:

@@ -114,9 +114,15 @@ def _track_file_name(track: SplitTrack) -> str:
     return f"{track.editable_track_index:02d}_.mid"
 
 
+def _note_is_muted(note: SplitNote) -> bool:
+    return bool(getattr(note, "muted", False))
+
+
 def _notes_for_track(session: MidiSplitSession, editable_track_index: int) -> list[SplitNote]:
     notes = [
-        note for note in session.notes if int(note.editable_track_index) == int(editable_track_index)
+        note
+        for note in session.notes
+        if int(note.editable_track_index) == int(editable_track_index) and not _note_is_muted(note)
     ]
     notes.sort(key=_note_sort_key)
     return notes

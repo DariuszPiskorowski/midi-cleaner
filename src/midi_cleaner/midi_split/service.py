@@ -112,6 +112,7 @@ def create_split_session(
                 start_sec=float(note.start_sec),
                 end_sec=float(note.end_sec),
                 duration_sec=float(note.duration_sec),
+                muted=False,
                 metadata=dict(note.metadata),
             )
         )

@@ -158,6 +158,8 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
     <select id="target-track"></select>
     <button id="move-selected-btn" type="button">Move selected to track</button>
     <button id="merge-notes-btn" type="button">Merge Notes</button>
+    <button id="delete-notes-btn" type="button" disabled>Delete Notes</button>
+    <button id="mute-notes-btn" type="button" disabled>Mute Notes</button>
     <button id="add-track-btn" type="button">Add track</button>
     <button id="merge-tracks-btn" type="button">Merge selected tracks</button>
     <button id="clear-selection-btn" type="button">Clear selection</button>
@@ -238,6 +240,12 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         } else {
           session.ticks_per_beat = Number(session.ticks_per_beat);
         }
+        for (const note of session.notes) {
+          if (!note || typeof note !== "object") {
+            continue;
+          }
+          note.muted = note.muted === true;
+        }
         return session;
       }
 
@@ -260,6 +268,8 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       const undoButton = document.getElementById("undo-btn");
       const redoButton = document.getElementById("redo-btn");
       const mergeNotesButton = document.getElementById("merge-notes-btn");
+      const deleteNotesButton = document.getElementById("delete-notes-btn");
+      const muteNotesButton = document.getElementById("mute-notes-btn");
 
       const toolButtons = {
         select: document.getElementById("tool-select-btn"),
@@ -508,6 +518,24 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         updateSelectionUi();
       }
 
+      function getSelectedNotes() {
+        return Array.from(state.selectedNoteIds)
+          .map(function (noteId) {
+            return state.noteById.get(String(noteId));
+          })
+          .filter(function (note) { return Boolean(note); });
+      }
+
+      function resolveSelectedMuteAction(selectedNotes) {
+        if (!selectedNotes.length) {
+          return "mute";
+        }
+        const allMuted = selectedNotes.every(function (note) {
+          return note.muted === true;
+        });
+        return allMuted ? "unmute" : "mute";
+      }
+
       function updateHistoryControls() {
         undoButton.disabled = state.undoStack.length === 0;
         redoButton.disabled = state.redoStack.length === 0;
@@ -517,9 +545,28 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         mergeNotesButton.disabled = state.selectedNoteIds.size < 2;
       }
 
+      function updateDeleteButtonState() {
+        deleteNotesButton.disabled = state.selectedNoteIds.size === 0;
+      }
+
+      function updateMuteButtonState() {
+        const selectedNotes = getSelectedNotes();
+        if (!selectedNotes.length) {
+          muteNotesButton.disabled = true;
+          muteNotesButton.textContent = "Mute Notes";
+          return;
+        }
+
+        muteNotesButton.disabled = false;
+        const mode = resolveSelectedMuteAction(selectedNotes);
+        muteNotesButton.textContent = mode === "unmute" ? "Unmute Notes" : "Mute Notes";
+      }
+
       function updateEditorActionButtons() {
         updateHistoryControls();
         updateMergeButtonState();
+        updateDeleteButtonState();
+        updateMuteButtonState();
       }
 
       function pushHistoryTransaction(transaction) {
@@ -705,6 +752,112 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         redraw();
         updateEditorActionButtons();
         setStatus("Merged " + String(orderedSelection.length) + " notes into one note.", false);
+      }
+
+      function deleteSelectedNotes() {
+        const selectionBefore = Array.from(state.selectedNoteIds).filter(function (noteId) {
+          return state.noteById.has(String(noteId));
+        });
+        if (!selectionBefore.length) {
+          setStatus("No notes selected.");
+          return;
+        }
+
+        const selectedSet = new Set(selectionBefore);
+        const deletedNotes = session.notes
+          .filter(function (note) {
+            return selectedSet.has(String(note.note_id));
+          })
+          .map(function (note) {
+            return cloneNoteSnapshot(note);
+          });
+
+        if (!deletedNotes.length) {
+          setStatus("No notes selected.");
+          return;
+        }
+
+        session.notes = session.notes.filter(function (note) {
+          return !selectedSet.has(String(note.note_id));
+        });
+
+        pushHistoryTransaction({
+          label: "delete-notes",
+          beforeNotes: deletedNotes,
+          afterNotes: [],
+          selectionBefore: selectionBefore,
+          selectionAfter: [],
+        });
+
+        sortNotes();
+        rebuildTrackSources();
+        rebuildNoteLookup();
+        setSelectionFromList([]);
+        updateTargetTrackDropdown();
+        renderTrackPanel();
+        redraw();
+        updateEditorActionButtons();
+        setStatus("Deleted " + String(deletedNotes.length) + " notes.", false);
+      }
+
+      function setMuteStateForSelected(shouldMute) {
+        const selectionBefore = Array.from(state.selectedNoteIds).filter(function (noteId) {
+          return state.noteById.has(String(noteId));
+        });
+        if (!selectionBefore.length) {
+          setStatus("No notes selected.");
+          return;
+        }
+
+        const selectedSet = new Set(selectionBefore);
+        const beforeNotes = [];
+        const afterNotes = [];
+
+        for (const note of session.notes) {
+          if (!selectedSet.has(String(note.note_id))) {
+            continue;
+          }
+          beforeNotes.push(cloneNoteSnapshot(note));
+          note.muted = Boolean(shouldMute);
+          afterNotes.push(cloneNoteSnapshot(note));
+        }
+
+        if (!beforeNotes.length) {
+          setStatus("No notes selected.");
+          return;
+        }
+
+        pushHistoryTransaction({
+          label: Boolean(shouldMute) ? "mute-notes" : "unmute-notes",
+          beforeNotes: beforeNotes,
+          afterNotes: afterNotes,
+          selectionBefore: selectionBefore,
+          selectionAfter: selectionBefore,
+        });
+
+        sortNotes();
+        rebuildTrackSources();
+        rebuildNoteLookup();
+        setSelectionFromList(selectionBefore);
+        updateTargetTrackDropdown();
+        renderTrackPanel();
+        redraw();
+        updateEditorActionButtons();
+        if (Boolean(shouldMute)) {
+          setStatus("Muted " + String(beforeNotes.length) + " notes.", false);
+        } else {
+          setStatus("Unmuted " + String(beforeNotes.length) + " notes.", false);
+        }
+      }
+
+      function toggleMuteSelectedNotes() {
+        const selectedNotes = getSelectedNotes();
+        if (!selectedNotes.length) {
+          setStatus("No notes selected.");
+          return;
+        }
+        const mode = resolveSelectedMuteAction(selectedNotes);
+        setMuteStateForSelected(mode !== "unmute");
       }
 
       function isEditableTypingTarget(target) {
@@ -1287,14 +1440,32 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           const trackIndex = Number(note.editable_track_index || 0);
           const color = colorForTrack(trackIndex);
           const selected = state.selectedNoteIds.has(String(note.note_id));
+          const muted = note.muted === true;
 
           ctx.fillStyle = color;
+          ctx.globalAlpha = muted ? 0.35 : 1.0;
           ctx.fillRect(box.x, box.y, box.w, box.h);
+          ctx.globalAlpha = 1.0;
 
-          ctx.strokeStyle = selected ? "#ffffff" : "#000000";
-          ctx.lineWidth = selected ? 2 : 1;
-          ctx.strokeRect(box.x + 0.5, box.y + 0.5, Math.max(0, box.w - 1), Math.max(0, box.h - 1));
+          if (muted) {
+            ctx.strokeStyle = selected ? "#ffffff" : "#8a8a8a";
+            ctx.lineWidth = selected ? 2 : 1;
+            ctx.setLineDash([4, 2]);
+            ctx.strokeRect(box.x + 0.5, box.y + 0.5, Math.max(0, box.w - 1), Math.max(0, box.h - 1));
+            ctx.setLineDash([]);
+            if (box.w >= 10) {
+              ctx.fillStyle = "#d0d0d0";
+              ctx.font = "9px Arial";
+              ctx.fillText("M", box.x + 2, box.y + Math.max(8, box.h - 1));
+            }
+          } else {
+            ctx.strokeStyle = selected ? "#ffffff" : "#000000";
+            ctx.lineWidth = selected ? 2 : 1;
+            ctx.strokeRect(box.x + 0.5, box.y + 0.5, Math.max(0, box.w - 1), Math.max(0, box.h - 1));
+          }
         }
+        ctx.globalAlpha = 1.0;
+        ctx.setLineDash([]);
         ctx.lineWidth = 1;
       }
 
@@ -1839,6 +2010,8 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       function bindToolbarActions() {
         document.getElementById("move-selected-btn").addEventListener("click", moveSelectedToTrack);
         document.getElementById("merge-notes-btn").addEventListener("click", mergeSelectedNotes);
+        document.getElementById("delete-notes-btn").addEventListener("click", deleteSelectedNotes);
+        document.getElementById("mute-notes-btn").addEventListener("click", toggleMuteSelectedNotes);
         undoButton.addEventListener("click", undoHistory);
         redoButton.addEventListener("click", redoHistory);
         document.getElementById("add-track-btn").addEventListener("click", addTrack);
@@ -1926,6 +2099,12 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
             return;
           }
 
+          if (key === "delete" || key === "backspace") {
+            event.preventDefault();
+            deleteSelectedNotes();
+            return;
+          }
+
           if (event.key === "Escape") {
             clearSelection();
             redraw();
@@ -1944,6 +2123,10 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           getTool: function () { return currentTool; },
           moveSelectedToTrack: moveSelectedToTrack,
           mergeSelectedNotes: mergeSelectedNotes,
+          deleteSelectedNotes: deleteSelectedNotes,
+          toggleMuteSelectedNotes: toggleMuteSelectedNotes,
+          muteSelectedNotes: function () { setMuteStateForSelected(true); },
+          unmuteSelectedNotes: function () { setMuteStateForSelected(false); },
           undo: undoHistory,
           redo: redoHistory,
           addTrack: addTrack,
