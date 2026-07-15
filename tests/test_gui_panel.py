@@ -171,7 +171,7 @@ class _FakePanelController:
         return SplitEditorLaunchResult(
             success=True,
             url=f"http://{host}:{port}/",
-            message=f"MIDI Split Editor opened at http://{host}:{port}/",
+            message=f"MIDI Editor opened at http://{host}:{port}/",
             reused_existing_server=False,
             started_new_server=True,
         )
@@ -346,7 +346,7 @@ def test_open_split_editor_without_selected_midi_still_opens_editor(tmp_path: Pa
         assert call["midi_file"] is None
         assert call["host"] == "127.0.0.1"
         assert call["port"] == 8765
-        assert panel._status_var.get().startswith("MIDI Split Editor opened at http://127.0.0.1:8765/")
+        assert panel._status_var.get().startswith("MIDI Editor opened at http://127.0.0.1:8765/")
     finally:
         panel.close()
 
@@ -364,6 +364,6 @@ def test_open_split_editor_with_selected_midi_passes_path(tmp_path: Path) -> Non
         assert call["midi_file"] == midi_file
         assert call["host"] == "127.0.0.1"
         assert call["port"] == 8765
-        assert panel._status_var.get().startswith("MIDI Split Editor opened at http://127.0.0.1:8765/")
+        assert panel._status_var.get().startswith("MIDI Editor opened at http://127.0.0.1:8765/")
     finally:
         panel.close()

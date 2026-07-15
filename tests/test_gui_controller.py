@@ -221,7 +221,7 @@ class _FakeSplitEditorLauncher:
         return SplitEditorLaunchResult(
             success=True,
             url=f"http://{host}:{port}/",
-            message=f"MIDI Split Editor opened at http://{host}:{port}/",
+            message=f"MIDI Editor opened at http://{host}:{port}/",
             reused_existing_server=False,
             started_new_server=True,
         )

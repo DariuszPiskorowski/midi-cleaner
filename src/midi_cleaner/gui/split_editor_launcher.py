@@ -99,7 +99,7 @@ class SplitEditorLauncher:
                         success=False,
                         url=url,
                         message=(
-                            f"Port {port} is busy and is not responding as Hermes MIDI Split Editor. "
+                            f"Port {port} is busy and is not responding as Hermes MIDI Editor. "
                             "Stop the conflicting process and try again."
                         ),
                         reused_existing_server=False,
@@ -132,7 +132,7 @@ class SplitEditorLauncher:
                         return SplitEditorLaunchResult(
                             success=False,
                             url=url,
-                            message=f"Failed to start MIDI Split Editor server: {exc}",
+                            message=f"Failed to start MIDI Editor server: {exc}",
                             reused_existing_server=False,
                             started_new_server=False,
                         )
@@ -173,11 +173,11 @@ class SplitEditorLauncher:
 
         browser_opened = self._open_browser(url)
 
-        message_parts = [f"MIDI Split Editor opened at {url}"]
+        message_parts = [f"MIDI Editor opened at {url}"]
         if reused_existing_server:
-            message_parts.append("Reused existing split editor server.")
+            message_parts.append("Reused existing MIDI Editor server.")
         if started_new_server:
-            message_parts.append("Started new split editor server.")
+            message_parts.append("Started new MIDI Editor server.")
         if preload_message:
             message_parts.append(preload_message)
         if midi_warning:
@@ -273,11 +273,11 @@ class SplitEditorLauncher:
                 return None
 
             if not handle.thread.is_alive():
-                return "MIDI Split Editor server stopped before becoming ready."
+                return "MIDI Editor server stopped before becoming ready."
 
             time.sleep(0.1)
 
-        return f"MIDI Split Editor server did not become ready at {url}"
+        return f"MIDI Editor server did not become ready at {url}"
 
     def _import_midi_into_server(self, *, url: str, midi_file: Path) -> str | None:
         payload = midi_file.read_bytes()

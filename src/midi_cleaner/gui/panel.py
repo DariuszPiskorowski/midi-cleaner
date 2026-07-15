@@ -141,7 +141,7 @@ class HermesGuiPanel:
         ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(
             button_row,
-            text="Open MIDI Split Editor",
+            text="Open MIDI Editor",
             command=self._open_split_editor,
         ).pack(side=tk.LEFT, padx=(8, 0))
 
