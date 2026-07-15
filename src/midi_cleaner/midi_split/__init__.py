@@ -7,7 +7,12 @@ from midi_cleaner.midi_split.exporter import (
 )
 from midi_cleaner.midi_split.html_preview import generate_piano_roll_preview
 from midi_cleaner.midi_split.models import MidiSplitSession, SplitNote, SplitTrack
-from midi_cleaner.midi_split.server import MidiSplitEditorServerError, run_split_editor_server
+from midi_cleaner.midi_split.server import (
+    MidiSplitEditorServerError,
+    MidiSplitEditorServerHandle,
+    run_split_editor_server,
+    start_split_editor_server,
+)
 from midi_cleaner.midi_split.service import (
     DEFAULT_MAX_TRACKS,
     MidiSplitSessionError,
@@ -23,6 +28,7 @@ __all__ = [
     "DEFAULT_MAX_TRACKS",
     "MidiSplitExportError",
     "MidiSplitEditorServerError",
+    "MidiSplitEditorServerHandle",
     "MidiSplitSession",
     "MidiSplitSessionError",
     "SplitNote",
@@ -33,6 +39,7 @@ __all__ = [
     "export_split_separate_midi_files",
     "generate_piano_roll_preview",
     "run_split_editor_server",
+    "start_split_editor_server",
     "load_session",
     "merge_tracks",
     "move_notes_to_track",

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable
 
 from midi_cleaner.gui.service import HermesGuiWorkflowError, HermesWorkflowResult, HermesWorkflowService
+from midi_cleaner.gui.split_editor_launcher import SplitEditorLaunchResult, SplitEditorLauncher
 
 ROLE_DRUMS = "drums"
 ROLE_BASS = "bass"
@@ -87,9 +88,13 @@ class HermesGuiController:
         self,
         service: HermesWorkflowService | None = None,
         desktop_dir: Path | None = None,
+        split_editor_launcher: SplitEditorLauncher | None = None,
     ) -> None:
         self._service = service if service is not None else HermesWorkflowService()
         self._desktop_dir = desktop_dir if desktop_dir is not None else Path.home() / "Desktop"
+        self._split_editor_launcher = (
+            split_editor_launcher if split_editor_launcher is not None else SplitEditorLauncher()
+        )
 
     @property
     def desktop_dir(self) -> Path:
@@ -156,6 +161,18 @@ class HermesGuiController:
             if not candidate.exists():
                 return candidate
             index += 1
+
+    def open_split_editor(
+        self,
+        midi_file: Path | None,
+        host: str = "127.0.0.1",
+        port: int = 8765,
+    ) -> SplitEditorLaunchResult:
+        return self._split_editor_launcher.open_split_editor(
+            midi_file=midi_file,
+            host=host,
+            port=port,
+        )
 
     def requires_midi(self, role: str, action: str) -> bool:
         if action == ACTION_SET_BPM:

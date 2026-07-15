@@ -13,6 +13,7 @@ from midi_cleaner.gui.controller import (
     HermesGuiController,
 )
 from midi_cleaner.gui.service import HermesWorkflowResult
+from midi_cleaner.gui.split_editor_launcher import SplitEditorLaunchResult
 
 
 class _FakeWorkflowService:
@@ -198,6 +199,32 @@ class _FakeWorkflowService:
             )
         )
         return destination_file
+
+
+class _FakeSplitEditorLauncher:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def open_split_editor(
+        self,
+        midi_file: Path | None,
+        host: str = "127.0.0.1",
+        port: int = 8765,
+    ) -> SplitEditorLaunchResult:
+        self.calls.append(
+            {
+                "midi_file": midi_file,
+                "host": host,
+                "port": port,
+            }
+        )
+        return SplitEditorLaunchResult(
+            success=True,
+            url=f"http://{host}:{port}/",
+            message=f"MIDI Split Editor opened at http://{host}:{port}/",
+            reused_existing_server=False,
+            started_new_server=True,
+        )
 
 
 def test_unique_output_path_suffixing(tmp_path: Path) -> None:
@@ -402,3 +429,24 @@ def test_controller_exposes_drums_mapping_helpers(tmp_path: Path) -> None:
     )
     assert saved_path == tmp_path / "saved_mapping.json"
     assert any(call[0] == "save_mapping" for call in service.calls)
+
+
+def test_controller_exposes_split_editor_launch_method(tmp_path: Path) -> None:
+    launcher = _FakeSplitEditorLauncher()
+    controller = HermesGuiController(
+        service=_FakeWorkflowService(),
+        desktop_dir=tmp_path,
+        split_editor_launcher=launcher,
+    )
+
+    midi = tmp_path / "selected.mid"
+    midi.write_bytes(b"midi")
+
+    result = controller.open_split_editor(midi_file=midi)
+
+    assert result.success is True
+    assert result.url == "http://127.0.0.1:8765/"
+    assert len(launcher.calls) == 1
+    assert launcher.calls[0]["midi_file"] == midi
+    assert launcher.calls[0]["host"] == "127.0.0.1"
+    assert launcher.calls[0]["port"] == 8765

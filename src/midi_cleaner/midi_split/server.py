@@ -7,6 +7,7 @@ import tempfile
 import threading
 import webbrowser
 import zipfile
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,6 +29,20 @@ from midi_cleaner.midi_split.service import (
 
 class MidiSplitEditorServerError(Exception):
     """Raised when MIDI split editor server operations fail."""
+
+
+@dataclass
+class MidiSplitEditorServerHandle:
+    server: ThreadingHTTPServer
+    thread: threading.Thread
+    host: str
+    port: int
+    url: str
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.thread.join(timeout=2)
+        self.server.server_close()
 
 
 def _session_to_html(session: MidiSplitSession) -> str:
@@ -278,14 +293,13 @@ def _build_initial_session(
     return _default_session()
 
 
-def run_split_editor_server(
+def start_split_editor_server(
     *,
     input_midi: Path | None = None,
     session_path: Path | None = None,
     host: str = "127.0.0.1",
     port: int = 0,
-    open_browser: bool = True,
-) -> str:
+) -> MidiSplitEditorServerHandle:
     try:
         initial_session = _build_initial_session(input_midi=input_midi, session_path=session_path)
     except MidiSplitSessionError as exc:
@@ -299,6 +313,39 @@ def run_split_editor_server(
     actual_host, actual_port = server.server_address
     url = f"http://{actual_host}:{actual_port}/"
 
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.2},
+        daemon=True,
+        name=f"midi-split-editor-{actual_host}:{actual_port}",
+    )
+    thread.start()
+
+    return MidiSplitEditorServerHandle(
+        server=server,
+        thread=thread,
+        host=actual_host,
+        port=int(actual_port),
+        url=url,
+    )
+
+
+def run_split_editor_server(
+    *,
+    input_midi: Path | None = None,
+    session_path: Path | None = None,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    open_browser: bool = True,
+) -> str:
+    handle = start_split_editor_server(
+        input_midi=input_midi,
+        session_path=session_path,
+        host=host,
+        port=port,
+    )
+    url = handle.url
+
     if open_browser:
         webbrowser.open(url)
 
@@ -306,12 +353,12 @@ def run_split_editor_server(
     print("Press Ctrl+C to stop.")
 
     try:
-        server.serve_forever(poll_interval=0.2)
+        while handle.thread.is_alive():
+            handle.thread.join(timeout=0.2)
     except KeyboardInterrupt:  # pragma: no cover - interactive path
         pass
     finally:
-        server.shutdown()
-        server.server_close()
+        handle.stop()
 
     return url
 

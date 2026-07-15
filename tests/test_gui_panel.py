@@ -17,6 +17,7 @@ from midi_cleaner.gui.controller import (
     HermesDrumsRequest,
 )
 from midi_cleaner.gui.panel import HermesGuiPanel
+from midi_cleaner.gui.split_editor_launcher import SplitEditorLaunchResult
 
 
 class _FakePanelController:
@@ -24,6 +25,7 @@ class _FakePanelController:
         self.desktop_dir = desktop_dir
         self.calls: list[HermesActionRequest] = []
         self.saved_mapping_payload: dict[str, object] | None = None
+        self.split_editor_calls: list[dict[str, object]] = []
 
     @staticmethod
     def requires_midi(role: str, action: str) -> bool:
@@ -151,6 +153,27 @@ class _FakePanelController:
             message="Bass make-MIDI workflow complete.",
             output_file=output_file,
             report_file=report_file,
+        )
+
+    def open_split_editor(
+        self,
+        midi_file: Path | None,
+        host: str = "127.0.0.1",
+        port: int = 8765,
+    ) -> SplitEditorLaunchResult:
+        self.split_editor_calls.append(
+            {
+                "midi_file": midi_file,
+                "host": host,
+                "port": port,
+            }
+        )
+        return SplitEditorLaunchResult(
+            success=True,
+            url=f"http://{host}:{port}/",
+            message=f"MIDI Split Editor opened at http://{host}:{port}/",
+            reused_existing_server=False,
+            started_new_server=True,
         )
 
 
@@ -308,5 +331,39 @@ def test_old_non_drums_gui_workflow_still_works(
         assert panel._output_var.get().endswith("hermes_bass_working.mid")
         assert panel._report_var.get().endswith("hermes_bass_working_report.json")
         assert panel._created_files_count_var.get() == "0"
+    finally:
+        panel.close()
+
+
+def test_open_split_editor_without_selected_midi_still_opens_editor(tmp_path: Path) -> None:
+    panel, controller = _new_panel(tmp_path)
+    try:
+        panel._midi_var.set("")
+        panel._open_split_editor()
+
+        assert len(controller.split_editor_calls) == 1
+        call = controller.split_editor_calls[0]
+        assert call["midi_file"] is None
+        assert call["host"] == "127.0.0.1"
+        assert call["port"] == 8765
+        assert panel._status_var.get().startswith("MIDI Split Editor opened at http://127.0.0.1:8765/")
+    finally:
+        panel.close()
+
+
+def test_open_split_editor_with_selected_midi_passes_path(tmp_path: Path) -> None:
+    panel, controller = _new_panel(tmp_path)
+    try:
+        midi_file = tmp_path / "selected.mid"
+        midi_file.write_bytes(b"midi")
+        panel._midi_var.set(str(midi_file))
+        panel._open_split_editor()
+
+        assert len(controller.split_editor_calls) == 1
+        call = controller.split_editor_calls[0]
+        assert call["midi_file"] == midi_file
+        assert call["host"] == "127.0.0.1"
+        assert call["port"] == 8765
+        assert panel._status_var.get().startswith("MIDI Split Editor opened at http://127.0.0.1:8765/")
     finally:
         panel.close()

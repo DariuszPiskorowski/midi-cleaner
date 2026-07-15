@@ -13,6 +13,7 @@ from midi_cleaner.gui.controller import (
     HermesActionResult,
     HermesGuiController,
 )
+from midi_cleaner.gui.split_editor_launcher import SplitEditorLaunchResult
 
 
 def launch_hermes_gui(controller: HermesGuiController | None = None) -> None:
@@ -32,5 +33,6 @@ __all__ = [
     "HermesActionRequest",
     "HermesActionResult",
     "HermesGuiController",
+    "SplitEditorLaunchResult",
     "launch_hermes_gui",
 ]

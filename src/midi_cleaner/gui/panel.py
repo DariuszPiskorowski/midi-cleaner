@@ -139,6 +139,11 @@ class HermesGuiPanel:
             text="Open Desktop/output folder",
             command=self._open_output_folder,
         ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            button_row,
+            text="Open MIDI Split Editor",
+            command=self._open_split_editor,
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         row += 1
         ttk.Label(frame, text="Status").grid(row=row, column=0, sticky="w", pady=(10, 0))
@@ -752,6 +757,22 @@ class HermesGuiPanel:
             os.startfile(str(desktop))  # type: ignore[attr-defined]
         except Exception:
             self._append_log(f"Output folder: {desktop}")
+
+    def _open_split_editor(self) -> None:
+        midi_text = self._midi_var.get().strip()
+        midi_path = Path(midi_text) if midi_text else None
+
+        result = self._controller.open_split_editor(
+            midi_file=midi_path,
+            host="127.0.0.1",
+            port=8765,
+        )
+
+        self._status_var.set(result.message)
+        if result.success:
+            self._append_log(result.message)
+        else:
+            self._append_log(f"Error: {result.message}")
 
     def _open_report_json(self) -> None:
         report = self._report_var.get().strip()
