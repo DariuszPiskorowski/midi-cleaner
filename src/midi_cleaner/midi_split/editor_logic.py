@@ -67,6 +67,29 @@ def _clamp_pitch_midi(value: int) -> int:
     return max(0, min(127, int(value)))
 
 
+def clamp_velocity(value: object) -> int:
+    return max(0, min(127, _as_int(value, 0)))
+
+
+def selected_velocity_summary(selected_notes: Sequence[object]) -> dict[str, int | None]:
+    payloads = [note_to_payload(note) for note in selected_notes]
+    if not payloads:
+        return {
+            "count": 0,
+            "min": None,
+            "avg": None,
+            "max": None,
+        }
+
+    velocities = [clamp_velocity(note.get("velocity")) for note in payloads]
+    return {
+        "count": len(velocities),
+        "min": min(velocities),
+        "avg": int(round(sum(velocities) / len(velocities))),
+        "max": max(velocities),
+    }
+
+
 def _normalize_note_timing_and_pitch(
     note: dict[str, Any],
     *,

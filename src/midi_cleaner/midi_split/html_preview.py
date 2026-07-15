@@ -162,6 +162,10 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       <option value="16" selected>1/16</option>
       <option value="32">1/32</option>
     </select>
+    <label for="velocity-lane-visible">Velocity lane</label>
+    <input id="velocity-lane-visible" type="checkbox" checked />
+    <label for="velocity-values-visible">Velocity values</label>
+    <input id="velocity-values-visible" type="checkbox" />
 
     <span>|</span>
     <label for="target-track">Target track:</label>
@@ -202,6 +206,11 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       const RULER_DIVIDER_Y = 42;
       const MIN_CANVAS_WIDTH = 1000;
       const NOTE_ROW_HEIGHT = 10;
+      const VELOCITY_LANE_HEIGHT = 124;
+      const VELOCITY_LANE_GAP = 8;
+      const VELOCITY_AXIS_TEXT_PAD = 4;
+      const VELOCITY_BAR_DRAW_WIDTH = 6;
+      const VELOCITY_BAR_HIT_WIDTH = 10;
       const DEFAULT_PIXELS_PER_TICK = 0.18;
       const DEFAULT_DRAW_VELOCITY = 100;
       const MIN_PIXELS_PER_TICK = 0.03;
@@ -285,6 +294,8 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       const muteNotesButton = document.getElementById("mute-notes-btn");
       const snapEnabledEl = document.getElementById("snap-enabled");
       const snapGridEl = document.getElementById("snap-grid");
+      const velocityLaneVisibleEl = document.getElementById("velocity-lane-visible");
+      const velocityValuesVisibleEl = document.getElementById("velocity-values-visible");
 
       const toolButtons = {
         select: document.getElementById("tool-select-btn"),
@@ -304,12 +315,15 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         mergeTrackIndices: new Set(),
         noteById: new Map(),
         noteBoxes: [],
+        velocityBars: [],
         dragSelect: null,
         noteEditDrag: null,
         drawDrag: null,
         panDrag: null,
         pitchMin: 24,
         pitchMax: 108,
+        velocityLaneVisible: true,
+        velocityValuesVisible: false,
         pixelsPerTick: DEFAULT_PIXELS_PER_TICK,
         xOffsetTicks: 0,
         serverConnected: false,
@@ -520,6 +534,18 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
 
       function clampPitchMidi(value) {
         return Math.max(0, Math.min(127, Math.round(Number(value || 0))));
+      }
+
+      function velocityValue(note) {
+        const raw = Number(note && note.velocity);
+        if (!Number.isFinite(raw)) {
+          return 0;
+        }
+        return Math.max(0, Math.min(127, Math.round(raw)));
+      }
+
+      function velocityRatio(note) {
+        return velocityValue(note) / 127;
       }
 
       function currentSnapDivision() {
@@ -1091,9 +1117,38 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       function updateCanvasSize() {
         const width = Math.max(MIN_CANVAS_WIDTH, Number(rollWrapEl.clientWidth || MIN_CANVAS_WIDTH));
         const rows = state.pitchMax - state.pitchMin + 1;
-        const height = Math.max(420, Math.ceil(TOP_PAD + rows * NOTE_ROW_HEIGHT + BOTTOM_PAD));
+        const pianoHeight = TOP_PAD + rows * NOTE_ROW_HEIGHT;
+        const velocityHeight = state.velocityLaneVisible ? (VELOCITY_LANE_GAP + VELOCITY_LANE_HEIGHT) : 0;
+        const height = Math.max(420, Math.ceil(pianoHeight + velocityHeight + BOTTOM_PAD));
         canvas.width = Math.ceil(width);
         canvas.height = height;
+      }
+
+      function pianoRollBottomY() {
+        const rows = state.pitchMax - state.pitchMin + 1;
+        return TOP_PAD + rows * NOTE_ROW_HEIGHT;
+      }
+
+      function velocityLaneTopY() {
+        return pianoRollBottomY() + VELOCITY_LANE_GAP;
+      }
+
+      function velocityLaneBottomY() {
+        return velocityLaneTopY() + VELOCITY_LANE_HEIGHT;
+      }
+
+      function isPointInPianoRollArea(point) {
+        if (!point) {
+          return false;
+        }
+        return point.y >= TOP_PAD && point.y <= pianoRollBottomY();
+      }
+
+      function isPointInVelocityLane(point) {
+        if (!point || !state.velocityLaneVisible) {
+          return false;
+        }
+        return point.y >= velocityLaneTopY() && point.y <= velocityLaneBottomY();
       }
 
       function yForPitch(pitch) {
@@ -1118,6 +1173,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         sanitizeSelection();
         selectedCountEl.textContent = String(state.selectedNoteIds.size);
         updateEditorActionButtons();
+        updateSelectionStatusLine();
       }
 
       function clearSelection() {
@@ -1252,9 +1308,19 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         state.drawDrag = null;
         state.panDrag = null;
         state.noteBoxes = [];
+        state.velocityBars = [];
+        state.velocityLaneVisible = true;
+        state.velocityValuesVisible = false;
         state.pixelsPerTick = DEFAULT_PIXELS_PER_TICK;
         state.xOffsetTicks = 0;
         clearSelection();
+        if (velocityLaneVisibleEl) {
+          velocityLaneVisibleEl.checked = true;
+        }
+        if (velocityValuesVisibleEl) {
+          velocityValuesVisibleEl.checked = false;
+          velocityValuesVisibleEl.disabled = false;
+        }
       }
 
       function resetDrawNoteCounter() {
@@ -1539,7 +1605,8 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           ctx.strokeStyle = marker.isBarStart ? "#4b4b4b" : "#2f2f2f";
           ctx.beginPath();
           ctx.moveTo(x, TOP_PAD);
-          ctx.lineTo(x, canvas.height - BOTTOM_PAD);
+          const gridBottom = state.velocityLaneVisible ? velocityLaneBottomY() : canvas.height - BOTTOM_PAD;
+          ctx.lineTo(x, gridBottom);
           ctx.stroke();
         }
 
@@ -1549,6 +1616,161 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           const y = yForPitch(pitch) + NOTE_ROW_HEIGHT - 1;
           ctx.fillText(String(pitch), 8, y);
         }
+      }
+
+      function velocityBarForNote(note) {
+        if (!state.velocityLaneVisible) {
+          return null;
+        }
+
+        const startTick = Number(note.start_tick || 0);
+        const x = xForTick(startTick);
+        const laneTop = velocityLaneTopY();
+        const laneBottom = velocityLaneBottomY();
+        const ratio = velocityRatio(note);
+        const barHeight = Math.max(1, Math.round(ratio * VELOCITY_LANE_HEIGHT));
+        const barTop = laneBottom - barHeight;
+        const hitInset = Math.max(0, (VELOCITY_BAR_HIT_WIDTH - VELOCITY_BAR_DRAW_WIDTH) / 2);
+        const hitX = x - hitInset;
+
+        if (x + VELOCITY_BAR_DRAW_WIDTH < LEFT_PAD - 2 || x > canvas.width - RIGHT_PAD + 2) {
+          return null;
+        }
+
+        return {
+          noteId: String(note.note_id),
+          startTick: startTick,
+          velocity: velocityValue(note),
+          muted: note.muted === true,
+          selected: state.selectedNoteIds.has(String(note.note_id)),
+          x: x,
+          y: barTop,
+          w: VELOCITY_BAR_DRAW_WIDTH,
+          hitX: hitX,
+          hitW: VELOCITY_BAR_HIT_WIDTH,
+          h: Math.max(1, laneBottom - barTop),
+          laneTop: laneTop,
+          laneBottom: laneBottom,
+          note: note,
+        };
+      }
+
+      function rebuildVelocityBars() {
+        state.velocityBars = [];
+        if (!state.velocityLaneVisible) {
+          return;
+        }
+
+        for (const note of session.notes) {
+          const bar = velocityBarForNote(note);
+          if (bar) {
+            state.velocityBars.push(bar);
+          }
+        }
+      }
+
+      function getVelocityBars() {
+        return state.velocityBars.map(function (bar) {
+          return {
+            note_id: bar.noteId,
+            start_tick: bar.startTick,
+            velocity: bar.velocity,
+            muted: bar.muted,
+            selected: bar.selected,
+            x: bar.x,
+            y: bar.y,
+            w: bar.w,
+            h: bar.h,
+            hit_x: bar.hitX,
+            hit_w: bar.hitW,
+            lane_top: bar.laneTop,
+            lane_bottom: bar.laneBottom,
+          };
+        });
+      }
+
+      function velocityBarForNoteId(noteId) {
+        const normalized = String(noteId);
+        for (const bar of state.velocityBars) {
+          if (String(bar.noteId) === normalized) {
+            return {
+              note_id: bar.noteId,
+              start_tick: bar.startTick,
+              velocity: bar.velocity,
+              muted: bar.muted,
+              selected: bar.selected,
+              x: bar.x,
+              y: bar.y,
+              w: bar.w,
+              h: bar.h,
+              hit_x: bar.hitX,
+              hit_w: bar.hitW,
+              lane_top: bar.laneTop,
+              lane_bottom: bar.laneBottom,
+            };
+          }
+        }
+        return null;
+      }
+
+      function drawVelocityLane() {
+        if (!state.velocityLaneVisible) {
+          return;
+        }
+
+        const laneTop = velocityLaneTopY();
+        const laneBottom = velocityLaneBottomY();
+
+        ctx.fillStyle = "#0f0f0f";
+        ctx.fillRect(LEFT_PAD, laneTop, canvas.width - LEFT_PAD - RIGHT_PAD, VELOCITY_LANE_HEIGHT);
+
+        ctx.strokeStyle = "#2f2f2f";
+        ctx.beginPath();
+        ctx.moveTo(LEFT_PAD + 0.5, laneTop + 0.5);
+        ctx.lineTo(canvas.width - RIGHT_PAD + 0.5, laneTop + 0.5);
+        ctx.moveTo(LEFT_PAD + 0.5, laneBottom + 0.5);
+        ctx.lineTo(canvas.width - RIGHT_PAD + 0.5, laneBottom + 0.5);
+        ctx.stroke();
+
+        ctx.fillStyle = "#a9a9a9";
+        ctx.font = "10px Arial";
+        ctx.fillText("127", VELOCITY_AXIS_TEXT_PAD, laneTop + 10);
+        ctx.fillText("64", VELOCITY_AXIS_TEXT_PAD + 8, laneTop + Math.round(VELOCITY_LANE_HEIGHT / 2));
+        ctx.fillText("0", VELOCITY_AXIS_TEXT_PAD + 18, laneBottom - 2);
+        ctx.fillStyle = "#d8d8d8";
+        ctx.fillText("Velocity", VELOCITY_AXIS_TEXT_PAD, laneTop - 2);
+
+        for (const bar of state.velocityBars) {
+          const note = bar.note;
+          const selected = state.selectedNoteIds.has(String(note.note_id));
+          const muted = note.muted === true;
+          const color = colorForTrack(Number(note.editable_track_index || 0));
+
+          ctx.fillStyle = color;
+          ctx.globalAlpha = muted ? 0.22 : 0.95;
+          ctx.fillRect(bar.x, bar.y, bar.w, bar.h);
+          ctx.globalAlpha = 1.0;
+
+          if (muted) {
+            ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
+            ctx.fillRect(bar.x, bar.y, bar.w, bar.h);
+          }
+
+          if (selected) {
+            ctx.strokeStyle = muted ? "#ffd29a" : "#ffffff";
+            ctx.lineWidth = 2;
+            ctx.strokeRect(bar.x + 0.5, bar.y + 0.5, Math.max(1, bar.w - 1), Math.max(1, bar.h - 1));
+            ctx.lineWidth = 1;
+          }
+
+          if (state.velocityValuesVisible && state.pixelsPerTick >= 0.18 && bar.h >= 18 && bar.w >= 6) {
+            ctx.fillStyle = "#f3f3f3";
+            ctx.font = "10px Arial";
+            ctx.fillText(String(velocityValue(note)), bar.x - 2, Math.max(laneTop + 10, bar.y - 2));
+          }
+        }
+
+        ctx.globalAlpha = 1.0;
       }
 
       function drawNotes() {
@@ -1609,10 +1831,33 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         updateCanvasSize();
         clampXOffsetTicks();
         rebuildNoteBoxes();
+        rebuildVelocityBars();
         drawGrid();
         drawNotes();
+        drawVelocityLane();
         drawSelectionRectangle();
         drawDrawPreview();
+      }
+
+      function hitTestVelocityBar(x, y) {
+        if (!state.velocityLaneVisible) {
+          return null;
+        }
+        for (let index = state.velocityBars.length - 1; index >= 0; index -= 1) {
+          const bar = state.velocityBars[index];
+          if (x >= bar.hitX && x <= bar.hitX + bar.hitW && y >= bar.y && y <= bar.y + bar.h) {
+            return bar;
+          }
+        }
+        return null;
+      }
+
+      function hitTestVelocityBarForApi(x, y) {
+        const hit = hitTestVelocityBar(Number(x), Number(y));
+        if (!hit) {
+          return null;
+        }
+        return String(hit.noteId);
       }
 
       function getNoteBoxAt(x, y) {
@@ -1661,7 +1906,18 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           return;
         }
 
-        if (!point || point.y < TOP_PAD || point.x < LEFT_PAD || point.x > canvas.width - RIGHT_PAD) {
+        if (!point || point.x < LEFT_PAD || point.x > canvas.width - RIGHT_PAD) {
+          canvas.style.cursor = "default";
+          return;
+        }
+
+        if (isPointInVelocityLane(point)) {
+          const velocityHit = hitTestVelocityBar(point.x, point.y);
+          canvas.style.cursor = velocityHit ? "pointer" : "default";
+          return;
+        }
+
+        if (!isPointInPianoRollArea(point)) {
           canvas.style.cursor = "default";
           return;
         }
@@ -1692,6 +1948,76 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           state.selectedNoteIds.add(id);
         }
         updateSelectionUi();
+      }
+
+      function selectedVelocitySummary() {
+        const selectedNotes = getSelectedNotes();
+        if (!selectedNotes.length) {
+          return {
+            count: 0,
+            min: null,
+            avg: null,
+            max: null,
+            text: "Ready.",
+          };
+        }
+
+        if (selectedNotes.length === 1) {
+          const note = selectedNotes[0];
+          return {
+            count: 1,
+            min: velocityValue(note),
+            avg: velocityValue(note),
+            max: velocityValue(note),
+            text: "Selected: 1 note | pitch: "
+              + String(pitchNameFromMidi(Number(note.pitch_midi || 0)))
+              + " | velocity: " + String(velocityValue(note))
+              + " | start: " + String(Math.round(Number(note.start_tick || 0)))
+              + " | duration: " + String(Math.max(0, Math.round(Number(note.duration_ticks || 0))))
+              + " ticks",
+          };
+        }
+
+        let minVelocity = 127;
+        let maxVelocity = 0;
+        let sumVelocity = 0;
+        for (const note of selectedNotes) {
+          const value = velocityValue(note);
+          minVelocity = Math.min(minVelocity, value);
+          maxVelocity = Math.max(maxVelocity, value);
+          sumVelocity += value;
+        }
+        const avgVelocity = Math.round(sumVelocity / selectedNotes.length);
+
+        return {
+          count: selectedNotes.length,
+          min: minVelocity,
+          avg: avgVelocity,
+          max: maxVelocity,
+          text: "Selected: " + String(selectedNotes.length)
+            + " notes | velocity min/avg/max: "
+            + String(minVelocity) + "/" + String(avgVelocity) + "/" + String(maxVelocity),
+        };
+      }
+
+      function updateSelectionStatusLine() {
+        const summary = selectedVelocitySummary();
+        setStatus(summary.text, false);
+      }
+
+      function setVelocityLaneVisible(visible) {
+        state.velocityLaneVisible = Boolean(visible);
+        if (velocityLaneVisibleEl) {
+          velocityLaneVisibleEl.checked = state.velocityLaneVisible;
+        }
+        if (velocityValuesVisibleEl) {
+          velocityValuesVisibleEl.disabled = !state.velocityLaneVisible;
+          if (!state.velocityLaneVisible) {
+            velocityValuesVisibleEl.checked = false;
+            state.velocityValuesVisible = false;
+          }
+        }
+        redraw();
       }
 
       function drawDrawPreview() {
@@ -2105,7 +2431,27 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           return;
         }
 
-        if (point.y < TOP_PAD || point.x < LEFT_PAD || point.x > canvas.width - RIGHT_PAD) {
+        if (point.x < LEFT_PAD || point.x > canvas.width - RIGHT_PAD) {
+          return;
+        }
+
+        if (isPointInVelocityLane(point)) {
+          if (currentTool !== "select") {
+            return;
+          }
+          const additive = Boolean(event.ctrlKey || event.metaKey);
+          const hitVelocityBar = hitTestVelocityBar(point.x, point.y);
+          if (hitVelocityBar) {
+            selectNoteById(String(hitVelocityBar.note.note_id), additive);
+            redraw();
+          } else if (!additive) {
+            clearSelection();
+            redraw();
+          }
+          return;
+        }
+
+        if (!isPointInPianoRollArea(point)) {
           return;
         }
 
@@ -2696,6 +3042,21 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
             );
           });
         }
+
+        if (velocityLaneVisibleEl) {
+          velocityLaneVisibleEl.addEventListener("change", function () {
+            setVelocityLaneVisible(Boolean(velocityLaneVisibleEl.checked));
+            setStatus("Velocity lane " + (state.velocityLaneVisible ? "on." : "off."), false);
+          });
+        }
+
+        if (velocityValuesVisibleEl) {
+          velocityValuesVisibleEl.addEventListener("change", function () {
+            state.velocityValuesVisible = Boolean(velocityValuesVisibleEl.checked);
+            redraw();
+            setStatus("Velocity values " + (state.velocityValuesVisible ? "on." : "off."), false);
+          });
+        }
       }
 
       function bindCanvasActions() {
@@ -2720,9 +3081,17 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         setServerStatus(false, "Server: checking");
         setSessionData(session);
         renderAll();
+        state.velocityValuesVisible = false;
+        if (velocityValuesVisibleEl) {
+          velocityValuesVisibleEl.checked = false;
+        }
         setTool("select");
         bindToolbarActions();
         bindCanvasActions();
+
+        // Future milestone note:
+        // - velocity editing should drag bars up/down in this lane
+        // - copy/paste selected notes should be added as a separate note-edit transaction feature
 
         window.addEventListener("keydown", function (event) {
           if (isEditableTypingTarget(event.target)) {
@@ -2782,6 +3151,12 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
             redraw();
           },
           getSnapDivision: currentSnapDivision,
+          setVelocityLaneVisible: setVelocityLaneVisible,
+          getVelocityLaneVisible: function () { return state.velocityLaneVisible; },
+          selectedVelocitySummary: selectedVelocitySummary,
+          getVelocityBars: getVelocityBars,
+          velocityBarForNoteId: velocityBarForNoteId,
+          hitTestVelocityBar: hitTestVelocityBarForApi,
           moveSelectedToTrack: moveSelectedToTrack,
           mergeSelectedNotes: mergeSelectedNotes,
           deleteSelectedNotes: deleteSelectedNotes,

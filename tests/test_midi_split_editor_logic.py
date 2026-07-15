@@ -12,12 +12,14 @@ from midi_cleaner.midi_split.editor_logic import NoteHistory
 from midi_cleaner.midi_split.editor_logic import apply_note_transaction
 from midi_cleaner.midi_split.editor_logic import build_timeline_layout
 from midi_cleaner.midi_split.editor_logic import clone_note_payload
+from midi_cleaner.midi_split.editor_logic import clamp_velocity
 from midi_cleaner.midi_split.editor_logic import delete_selected_notes
 from midi_cleaner.midi_split.editor_logic import draw_note
 from midi_cleaner.midi_split.editor_logic import move_selected_notes
 from midi_cleaner.midi_split.editor_logic import resize_note_edge
 from midi_cleaner.midi_split.editor_logic import resolve_selected_mute_action
 from midi_cleaner.midi_split.editor_logic import merge_selected_notes
+from midi_cleaner.midi_split.editor_logic import selected_velocity_summary
 from midi_cleaner.midi_split.editor_logic import set_selected_notes_muted
 from midi_cleaner.midi_split.editor_logic import tick_to_bar_beat
 from midi_cleaner.midi_split.editor_logic import tick_to_seconds
@@ -141,6 +143,39 @@ def test_merge_two_adjacent_notes_merges_to_one_contiguous_note() -> None:
     assert merged["end_tick"] == 190
     assert merged["duration_ticks"] == 90
     assert len(result["notes_after"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (-1, 0),
+        (0, 0),
+        (1, 1),
+        (64, 64),
+        (127, 127),
+        (200, 127),
+    ],
+)
+def test_clamp_velocity_handles_boundaries(value: int, expected: int) -> None:
+    assert clamp_velocity(value) == expected
+
+
+def test_selected_velocity_summary_returns_min_avg_max_for_selection() -> None:
+    notes = [
+        _note("n1", 0, 120, velocity=48),
+        _note("n2", 120, 240, velocity=82),
+        _note("n3", 240, 360, velocity=117),
+    ]
+
+    summary = selected_velocity_summary(notes)
+
+    assert summary == {"count": 3, "min": 48, "avg": 82, "max": 117}
+
+
+def test_selected_velocity_summary_is_safe_for_empty_selection() -> None:
+    summary = selected_velocity_summary([])
+
+    assert summary == {"count": 0, "min": None, "avg": None, "max": None}
 
 
 def test_merge_notes_with_gaps_fills_full_span() -> None:

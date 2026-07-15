@@ -289,6 +289,10 @@ def test_generate_piano_roll_preview_contains_editor_toolbar_actions(tmp_path: P
     assert 'id="tool-draw-btn"' in html
     assert 'id="snap-enabled"' in html
     assert 'id="snap-grid"' in html
+    assert "Velocity lane" in html
+    assert 'id="velocity-lane-visible"' in html
+    assert "Velocity values" in html
+    assert 'id="velocity-values-visible"' in html
 
 
 def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tmp_path: Path) -> None:
@@ -315,6 +319,14 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function exportSeparateTracks" in html
     assert "let currentTool" in html
     assert "function drawDrawPreview" in html
+    assert "function velocityValue(note)" in html
+    assert "function velocityRatio(note)" in html
+    assert "function velocityBarForNote(note)" in html
+    assert "function getVelocityBars()" in html
+    assert "function velocityBarForNoteId(noteId)" in html
+    assert "function drawVelocityLane()" in html
+    assert "function hitTestVelocityBar(x, y)" in html
+    assert "function hitTestVelocityBarForApi(x, y)" in html
     assert "function startDrawDrag" in html
     assert "function finalizeDrawDrag" in html
     assert "function applyMovePreview" in html
@@ -344,6 +356,38 @@ def test_generate_piano_roll_preview_exposes_snap_controls_in_test_api(tmp_path:
     assert "isSnapEnabled: isSnapEnabled" in script
     assert "setSnapDivision: function (division)" in script
     assert "getSnapDivision: currentSnapDivision" in script
+    assert "setVelocityLaneVisible: setVelocityLaneVisible" in script
+    assert "getVelocityLaneVisible: function () { return state.velocityLaneVisible; }" in script
+    assert "selectedVelocitySummary: selectedVelocitySummary" in script
+    assert "getVelocityBars: getVelocityBars" in script
+    assert "velocityBarForNoteId: velocityBarForNoteId" in script
+    assert "hitTestVelocityBar: hitTestVelocityBarForApi" in script
+
+
+def test_generate_piano_roll_preview_velocity_bar_geometry_and_hit_zone_logic(tmp_path: Path) -> None:
+    session = _create_session(tmp_path)
+    output_html = tmp_path / "split_editor.html"
+
+    generate_piano_roll_preview(session, output_html)
+
+    script = _extract_editor_script(output_html.read_text(encoding="utf-8"))
+    assert "const VELOCITY_BAR_DRAW_WIDTH = 6;" in script
+    assert "const VELOCITY_BAR_HIT_WIDTH = 10;" in script
+    assert "const barHeight = Math.max(1, Math.round(ratio * VELOCITY_LANE_HEIGHT));" in script
+    assert "const hitInset = Math.max(0, (VELOCITY_BAR_HIT_WIDTH - VELOCITY_BAR_DRAW_WIDTH) / 2);" in script
+    assert "if (x >= bar.hitX && x <= bar.hitX + bar.hitW && y >= bar.y && y <= bar.y + bar.h)" in script
+
+
+def test_generate_piano_roll_preview_velocity_bar_muted_visual_is_strongly_dimmed(tmp_path: Path) -> None:
+    session = _create_session(tmp_path)
+    output_html = tmp_path / "split_editor.html"
+
+    generate_piano_roll_preview(session, output_html)
+
+    script = _extract_editor_script(output_html.read_text(encoding="utf-8"))
+    assert "ctx.globalAlpha = muted ? 0.22 : 0.95;" in script
+    assert "ctx.fillStyle = \"rgba(0, 0, 0, 0.35)\";" in script
+    assert "ctx.strokeStyle = muted ? \"#ffd29a\" : \"#ffffff\";" in script
 
 
 def test_generate_piano_roll_preview_wires_history_shortcuts_without_editable_interception(tmp_path: Path) -> None:
