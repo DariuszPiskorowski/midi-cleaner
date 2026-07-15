@@ -216,6 +216,9 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       const VELOCITY_BAR_DRAW_WIDTH = 6;
       const VELOCITY_BAR_HIT_WIDTH = 10;
       const PASTE_CURSOR_COLOR = "#8ed1ff";
+      const VELOCITY_DRAG_PX_PER_STEP_NORMAL = 4;
+      const VELOCITY_DRAG_PX_PER_STEP_FINE = 8;
+      const VELOCITY_DRAG_PX_PER_STEP_COARSE = 2;
       const DEFAULT_PIXELS_PER_TICK = 0.18;
       const DEFAULT_DRAW_VELOCITY = 100;
       const MIN_PIXELS_PER_TICK = 0.03;
@@ -2283,6 +2286,45 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         state.pasteCursorTick = normalized;
       }
 
+      function viewportTickStart() {
+        return Number(state.xOffsetTicks || 0);
+      }
+
+      function viewportTickEnd() {
+        return viewportTickStart() + getVisibleTickSpan();
+      }
+
+      function isTickRangeVisible(startTick, endTick) {
+        const start = Number(startTick || 0);
+        const end = Math.max(start, Number(endTick || start));
+        const viewStart = viewportTickStart();
+        const viewEnd = viewportTickEnd();
+        return start >= viewStart && end <= viewEnd;
+      }
+
+      function ensureTickRangeVisible(startTick, endTick) {
+        const start = Math.max(0, Math.round(Number(startTick || 0)));
+        const end = Math.max(start, Math.round(Number(endTick || start)));
+        const margin = Math.max(1, Math.round(Number(session.ticks_per_beat || 480) * 0.25));
+        const desiredStart = Math.max(0, start - margin);
+        const desiredEnd = end + margin;
+        const span = Math.max(1, getVisibleTickSpan());
+
+        let nextOffset = Number(state.xOffsetTicks || 0);
+        if (desiredStart < viewportTickStart()) {
+          nextOffset = desiredStart;
+        } else if (desiredEnd > viewportTickEnd()) {
+          nextOffset = Math.max(0, desiredEnd - span);
+        }
+
+        if (nextOffset !== Number(state.xOffsetTicks || 0)) {
+          state.xOffsetTicks = nextOffset;
+          clampXOffsetTicks();
+          return true;
+        }
+        return false;
+      }
+
       function getPasteCursorTick() {
         if (!Number.isFinite(Number(state.pasteCursorTick))) {
           return null;
@@ -2391,32 +2433,77 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           appliedDelta: 0,
           active: false,
           mode: String(params.mode || "bar"),
+          sensitivityMode: "normal",
         };
       }
 
-      function applyVelocityDragPreview(drag, point) {
+      function velocityDragPxPerStep(sensitivityMode) {
+        if (sensitivityMode === "fine") {
+          return VELOCITY_DRAG_PX_PER_STEP_FINE;
+        }
+        if (sensitivityMode === "coarse") {
+          return VELOCITY_DRAG_PX_PER_STEP_COARSE;
+        }
+        return VELOCITY_DRAG_PX_PER_STEP_NORMAL;
+      }
+
+      function sensitivityModeFromEvent(event) {
+        if (event && event.shiftKey) {
+          return "fine";
+        }
+        if (event && (event.altKey || event.ctrlKey || event.metaKey)) {
+          return "coarse";
+        }
+        return "normal";
+      }
+
+      function applyVelocityDragPreview(drag, point, event) {
         if (!drag || !point) {
           return;
         }
-        const targetVelocity = velocityFromLaneY(point.y);
-        const delta = targetVelocity - Number(drag.startVelocity || 0);
+
+        const mode = sensitivityModeFromEvent(event);
+        drag.sensitivityMode = mode;
+        const pxPerStep = velocityDragPxPerStep(mode);
+        const deltaPixels = Number(drag.startY || 0) - Number(point.y || 0);
+        const delta = Math.round(deltaPixels / Math.max(1, pxPerStep));
+
         if (drag.appliedDelta === delta && drag.active) {
           return;
         }
 
+        let changedCount = 0;
+        for (const noteId of drag.noteIds) {
+          const before = drag.beforeById.get(String(noteId));
+          const note = state.noteById.get(String(noteId));
+          if (!before || !note) {
+            continue;
+          }
+          const baseline = clampEditedVelocity(velocityValue(before));
+          const nextVelocity = clampEditedVelocity(baseline + delta);
+          if (clampEditedVelocity(velocityValue(note)) !== nextVelocity) {
+            note.velocity = nextVelocity;
+            changedCount += 1;
+          }
+        }
+
         drag.appliedDelta = delta;
-        const result = setVelocityForNotes(drag.noteIds, { delta: delta });
-        if (result.changedCount > 0) {
+        if (changedCount > 0) {
           drag.active = true;
         }
 
         if (drag.noteIds.length === 1) {
           const note = state.noteById.get(String(drag.noteIds[0]));
-          setStatus("Velocity: " + String(note ? clampEditedVelocity(velocityValue(note)) : targetVelocity), false);
+          const prefix = delta >= 0 ? "+" : "";
+          setStatus(
+            "Velocity " + prefix + String(delta) + " for 1 note(s): "
+              + String(note ? clampEditedVelocity(velocityValue(note)) : clampEditedVelocity(drag.startVelocity + delta)),
+            false
+          );
         } else {
           const prefix = delta >= 0 ? "+" : "";
           setStatus(
-            "Adjusted velocity for " + String(drag.noteIds.length) + " note(s): " + prefix + String(delta),
+            "Velocity " + prefix + String(delta) + " for " + String(drag.noteIds.length) + " note(s).",
             false
           );
         }
@@ -2532,9 +2619,11 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
 
         const clipboard = state.clipboard;
         const durationTicks = Math.max(1, Math.round(Number(clipboard.regionDurationTicks || 1)));
+        const defaultVisibleTick = Math.max(0, snapAbsoluteTick(viewportTickStart()));
+        const defaultClipboardTick = Math.max(0, Math.round(Number(clipboard.regionEndTick || 0)));
         const requestedCursor = Number.isFinite(Number(state.pasteCursorTick))
           ? Number(state.pasteCursorTick)
-          : Math.round(Number(clipboard.regionEndTick || 0));
+          : (isTickRangeVisible(defaultClipboardTick, defaultClipboardTick) ? defaultClipboardTick : defaultVisibleTick);
         const baseTick = isSnapEnabled() ? Math.max(0, snapAbsoluteTick(requestedCursor)) : Math.max(0, Math.round(requestedCursor));
 
         const selectionBefore = Array.from(state.selectedNoteIds);
@@ -2594,7 +2683,17 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         setSelectionFromList(pastedIds.slice());
         updateTargetTrackDropdown();
         renderTrackPanel();
+
+        const pastedStartTick = Math.min.apply(null, pastedSnapshots.map(function (note) {
+          return Math.round(Number(note.start_tick || 0));
+        }));
+        const pastedEndTick = Math.max.apply(null, pastedSnapshots.map(function (note) {
+          return Math.round(Number(note.end_tick || note.start_tick || 0));
+        }));
+        ensureTickRangeVisible(pastedStartTick, pastedEndTick);
+
         setPasteCursorTick(baseTick + durationTicks, { snap: true });
+        ensureTickRangeVisible(Number(state.pasteCursorTick || 0), Number(state.pasteCursorTick || 0));
         redraw();
         updateEditorActionButtons();
 
@@ -3160,7 +3259,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           if (!drag.active && (dx >= DRAG_THRESHOLD_PX || dy >= DRAG_THRESHOLD_PX)) {
             drag.active = true;
           }
-          applyVelocityDragPreview(drag, point);
+          applyVelocityDragPreview(drag, point, event);
           redraw();
           updateCanvasCursorForPoint(point);
           return;
@@ -3260,8 +3359,10 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         } else if (state.dragSelect.hitNoteId) {
           selectNoteById(state.dragSelect.hitNoteId, state.dragSelect.additive);
         } else if (!state.dragSelect.additive) {
+          const cursorTick = Math.max(0, snapAbsoluteTick(tickFromCanvasX(state.dragSelect.currentX)));
+          setPasteCursorTick(cursorTick, { snap: true });
           clearSelection();
-          setStatus("Selection cleared.");
+          setStatus("Selection cleared. Paste cursor set to tick " + String(cursorTick) + ".", false);
         }
 
         state.dragSelect = null;
@@ -3853,6 +3954,9 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
             redraw();
           },
           getPasteCursorTick: getPasteCursorTick,
+          getSelectedNoteIds: function () {
+            return Array.from(state.selectedNoteIds);
+          },
           moveSelectedToTrack: moveSelectedToTrack,
           mergeSelectedNotes: mergeSelectedNotes,
           deleteSelectedNotes: deleteSelectedNotes,

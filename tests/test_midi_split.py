@@ -338,12 +338,18 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function hitTestVelocityBarForApi(x, y)" in html
     assert "function setPasteCursorTick(tick, options)" in html
     assert "function getPasteCursorTick()" in html
+    assert "function viewportTickStart()" in html
+    assert "function viewportTickEnd()" in html
+    assert "function isTickRangeVisible(startTick, endTick)" in html
+    assert "function ensureTickRangeVisible(startTick, endTick)" in html
     assert "function getClipboardSummary()" in html
     assert "function copySelectedNotes()" in html
     assert "function pasteCopiedNotes()" in html
     assert "function setVelocityForNotes(noteIds, options)" in html
     assert "function startVelocityDrag(params)" in html
-    assert "function applyVelocityDragPreview(drag, point)" in html
+    assert "function velocityDragPxPerStep(sensitivityMode)" in html
+    assert "function sensitivityModeFromEvent(event)" in html
+    assert "function applyVelocityDragPreview(drag, point, event)" in html
     assert "function finalizeVelocityDrag(drag)" in html
     assert "function startDrawDrag" in html
     assert "function finalizeDrawDrag" in html
@@ -387,6 +393,7 @@ def test_generate_piano_roll_preview_exposes_snap_controls_in_test_api(tmp_path:
     assert "getClipboardSummary: getClipboardSummary" in script
     assert "setPasteCursorTick: function (tick)" in script
     assert "getPasteCursorTick: getPasteCursorTick" in script
+    assert "getSelectedNoteIds: function ()" in script
 
 
 def test_generate_piano_roll_preview_velocity_bar_geometry_and_hit_zone_logic(tmp_path: Path) -> None:
@@ -400,6 +407,9 @@ def test_generate_piano_roll_preview_velocity_bar_geometry_and_hit_zone_logic(tm
     assert "const VELOCITY_BAR_HIT_WIDTH = 10;" in script
     assert "const VELOCITY_GROUP_HANDLE_HEIGHT = 8;" in script
     assert "const VELOCITY_FAN_SPACING = 3;" in script
+    assert "const VELOCITY_DRAG_PX_PER_STEP_NORMAL = 4;" in script
+    assert "const VELOCITY_DRAG_PX_PER_STEP_FINE = 8;" in script
+    assert "const VELOCITY_DRAG_PX_PER_STEP_COARSE = 2;" in script
     assert "const barHeight = Math.max(1, Math.round(ratio * VELOCITY_LANE_HEIGHT));" in script
     assert "const hitInset = Math.max(0, (VELOCITY_BAR_HIT_WIDTH - VELOCITY_BAR_DRAW_WIDTH) / 2);" in script
     assert "if (x >= bar.hitX && x <= bar.hitX + bar.hitW && y >= bar.y && y <= bar.y + bar.h)" in script
@@ -452,6 +462,8 @@ def test_generate_piano_roll_preview_wires_copy_paste_toolbar_and_paste_cursor(t
     assert "pasteNotesButton.addEventListener(\"click\", pasteCopiedNotes);" in script
     assert "const PASTE_CURSOR_COLOR = \"#8ed1ff\";" in script
     assert "ctx.setLineDash([4, 3]);" in script
+    assert "Selection cleared. Paste cursor set to tick " in script
+    assert "ensureTickRangeVisible(pastedStartTick, pastedEndTick);" in script
 
 
 def test_generate_piano_roll_preview_muted_notes_have_distinct_visual_style(tmp_path: Path) -> None:

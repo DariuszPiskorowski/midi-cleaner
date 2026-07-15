@@ -154,6 +154,141 @@ async function main() {
   const secondInputValue = await page.$eval("#import-midi-input", (el) => el.value);
   const secondSession = await page.evaluate(() => window.__midiSplitEditor.getSession());
 
+  const copyPasteReport = await page.evaluate(() => {
+    const editor = window.__midiSplitEditor;
+    const before = editor.getSession();
+    const preIds = new Set(before.notes.map((n) => String(n.note_id)));
+    const selectedIds = before.notes.slice(0, Math.min(2, before.notes.length)).map((n) => String(n.note_id));
+    editor.selectNotesByIds(selectedIds);
+    editor.copySelectedNotes();
+    const statusAfterCopy = String(document.getElementById("status-line")?.textContent || "");
+    const clipboard = editor.getClipboardSummary();
+
+    const beforePasteCount = editor.getSession().notes.length;
+    editor.pasteCopiedNotes();
+    const afterFirstPaste = editor.getSession();
+    const addedAfterFirstPaste = afterFirstPaste.notes.filter((n) => !preIds.has(String(n.note_id)));
+    const selectedAfterFirstPaste = editor.getSelectedNoteIds();
+    const noteBoxesAfterFirstPaste = editor.getNoteBoxes();
+    const velocityBarsAfterFirstPaste = editor.getVelocityBars();
+    const statusAfterFirstPaste = String(document.getElementById("status-line")?.textContent || "");
+    const cursorAfterFirstPaste = editor.getPasteCursorTick();
+
+    const firstAddedIdSet = new Set(addedAfterFirstPaste.map((n) => String(n.note_id)));
+    editor.pasteCopiedNotes();
+    const afterSecondPaste = editor.getSession();
+    const addedAfterSecondPaste = afterSecondPaste.notes.filter(
+      (n) => !preIds.has(String(n.note_id)) && !firstAddedIdSet.has(String(n.note_id))
+    );
+    const cursorAfterSecondPaste = editor.getPasteCursorTick();
+
+    const beforeFarPasteView = editor.getViewState();
+    editor.setPasteCursorTick(Math.round(beforeFarPasteView.xOffsetTicks + 6000));
+    editor.pasteCopiedNotes();
+    const afterFarPasteView = editor.getViewState();
+
+    const getIdSet = (items) => new Set(items.map((item) => String(item.note_id)));
+    const noteBoxIdSet = getIdSet(noteBoxesAfterFirstPaste);
+    const velocityBarIdSet = getIdSet(velocityBarsAfterFirstPaste);
+
+    return {
+      statusAfterCopy,
+      statusAfterFirstPaste,
+      clipboard,
+      beforePasteCount,
+      afterFirstPasteCount: afterFirstPaste.notes.length,
+      afterSecondPasteCount: afterSecondPaste.notes.length,
+      addedAfterFirstPaste,
+      addedAfterSecondPaste,
+      selectedAfterFirstPaste,
+      noteBoxContainsAllFirstPasteIds: addedAfterFirstPaste.every((n) => noteBoxIdSet.has(String(n.note_id))),
+      velocityBarContainsAllFirstPasteIds: addedAfterFirstPaste.every((n) => velocityBarIdSet.has(String(n.note_id))),
+      firstPasteIdsUnique: (new Set(addedAfterFirstPaste.map((n) => String(n.note_id)))).size === addedAfterFirstPaste.length,
+      cursorAfterFirstPaste,
+      cursorAfterSecondPaste,
+      beforeFarPasteOffset: beforeFarPasteView.xOffsetTicks,
+      afterFarPasteOffset: afterFarPasteView.xOffsetTicks,
+    };
+  });
+
+  const velocityTargetId = secondSession.notes[0]?.note_id;
+  if (!velocityTargetId) {
+    throw new Error("No note available for velocity drag test");
+  }
+
+  await page.evaluate((noteId) => {
+    const editor = window.__midiSplitEditor;
+    editor.selectNotesByIds([noteId]);
+    editor.setVelocityForNoteIds([noteId], { targetVelocity: 60 });
+  }, velocityTargetId);
+
+  async function dragVelocityBar(noteId, deltaY, useShift) {
+    const point = await page.evaluate((id) => {
+      const editor = window.__midiSplitEditor;
+      const bar = editor.velocityBarForNoteId(id);
+      if (!bar) {
+        return null;
+      }
+      const canvas = document.getElementById("roll-canvas");
+      if (!canvas) {
+        return null;
+      }
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: rect.left + bar.x + Math.max(1, bar.w / 2),
+        y: rect.top + bar.y + Math.max(1, Math.min(bar.h - 1, 4)),
+      };
+    }, noteId);
+
+    if (!point) {
+      throw new Error("Velocity bar point not found for note " + String(noteId));
+    }
+
+    if (useShift) {
+      await page.keyboard.down("Shift");
+    }
+    await page.mouse.move(point.x, point.y);
+    await page.mouse.down();
+    await page.mouse.move(point.x, point.y - deltaY);
+    await page.mouse.up();
+    if (useShift) {
+      await page.keyboard.up("Shift");
+    }
+  }
+
+  function getVelocity(noteId) {
+    return page.evaluate((id) => {
+      const editor = window.__midiSplitEditor;
+      const note = editor.getSession().notes.find((n) => String(n.note_id) === String(id));
+      return note ? Number(note.velocity) : null;
+    }, noteId);
+  }
+
+  const velocityBefore = await getVelocity(velocityTargetId);
+  await dragVelocityBar(velocityTargetId, 1, false);
+  const velocityAfter1px = await getVelocity(velocityTargetId);
+
+  await page.evaluate((noteId) => {
+    const editor = window.__midiSplitEditor;
+    editor.setVelocityForNoteIds([noteId], { targetVelocity: 60 });
+  }, velocityTargetId);
+  await dragVelocityBar(velocityTargetId, 20, false);
+  const velocityAfter20pxUp = await getVelocity(velocityTargetId);
+
+  await page.evaluate((noteId) => {
+    const editor = window.__midiSplitEditor;
+    editor.setVelocityForNoteIds([noteId], { targetVelocity: 60 });
+  }, velocityTargetId);
+  await dragVelocityBar(velocityTargetId, -20, false);
+  const velocityAfter20pxDown = await getVelocity(velocityTargetId);
+
+  await page.evaluate((noteId) => {
+    const editor = window.__midiSplitEditor;
+    editor.setVelocityForNoteIds([noteId], { targetVelocity: 60 });
+  }, velocityTargetId);
+  await dragVelocityBar(velocityTargetId, 20, true);
+  const velocityAfter20pxUpShift = await getVelocity(velocityTargetId);
+
   const [multitrackDownload] = await Promise.all([
     page.waitForEvent("download"),
     page.click("#export-multitrack-btn"),
@@ -185,6 +320,12 @@ async function main() {
     hasDownloadJsonButton,
     multitrackSuggestedFilename: multitrackDownload.suggestedFilename(),
     separateSuggestedFilename: separateDownload.suggestedFilename(),
+    copyPasteReport,
+    velocityBefore,
+    velocityAfter1px,
+    velocityAfter20pxUp,
+    velocityAfter20pxDown,
+    velocityAfter20pxUpShift,
     consoleErrors,
     pageErrors,
   };
@@ -259,6 +400,32 @@ def test_browser_import_and_exports_via_real_controls(tmp_path: Path) -> None:
     assert "Imported" in result["secondStatus"]
     assert result["firstInputValue"] == ""
     assert result["secondInputValue"] == ""
+
+    copy_paste = result["copyPasteReport"]
+    assert "Copied" in copy_paste["statusAfterCopy"]
+    assert "Pasted" in copy_paste["statusAfterFirstPaste"]
+    assert copy_paste["clipboard"]["note_count"] >= 1
+    assert copy_paste["afterFirstPasteCount"] > copy_paste["beforePasteCount"]
+    assert copy_paste["firstPasteIdsUnique"] is True
+    assert copy_paste["noteBoxContainsAllFirstPasteIds"] is True
+    assert copy_paste["velocityBarContainsAllFirstPasteIds"] is True
+    assert len(copy_paste["selectedAfterFirstPaste"]) == len(copy_paste["addedAfterFirstPaste"])
+    assert copy_paste["cursorAfterSecondPaste"] == (
+      copy_paste["cursorAfterFirstPaste"] + copy_paste["clipboard"]["region_duration_ticks"]
+    )
+    assert copy_paste["afterFarPasteOffset"] >= copy_paste["beforeFarPasteOffset"]
+
+    added_first = copy_paste["addedAfterFirstPaste"]
+    assert added_first
+    assert all(int(note["start_tick"]) >= 0 for note in added_first)
+    assert all(int(note["end_tick"]) >= int(note["start_tick"]) for note in added_first)
+    assert all(int(note["duration_ticks"]) == int(note["end_tick"]) - int(note["start_tick"]) for note in added_first)
+
+    assert result["velocityBefore"] == 60
+    assert result["velocityAfter1px"] == 60
+    assert 64 <= result["velocityAfter20pxUp"] <= 66
+    assert 54 <= result["velocityAfter20pxDown"] <= 56
+    assert 62 <= result["velocityAfter20pxUpShift"] <= 63
 
     assert result["consoleErrors"] == []
     assert result["pageErrors"] == []
