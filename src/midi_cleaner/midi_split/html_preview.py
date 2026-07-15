@@ -219,6 +219,9 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       const VELOCITY_DRAG_PX_PER_STEP_NORMAL = 4;
       const VELOCITY_DRAG_PX_PER_STEP_FINE = 8;
       const VELOCITY_DRAG_PX_PER_STEP_COARSE = 2;
+      const KEYBOARD_FOCUS_VIEWPORT = "viewport";
+      const KEYBOARD_FOCUS_NOTES = "notes";
+      const KEYBOARD_FOCUS_VELOCITY = "velocity";
       const DEFAULT_PIXELS_PER_TICK = 0.18;
       const DEFAULT_DRAW_VELOCITY = 100;
       const MIN_PIXELS_PER_TICK = 0.03;
@@ -337,6 +340,10 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         clipboard: null,
         pasteCursorTick: null,
         pasteIdCounter: 1,
+        keyboardFocusMode: KEYBOARD_FOCUS_VIEWPORT,
+        focusedVelocityNoteId: null,
+        focusedVelocityGroupNoteIds: null,
+        pitchViewportShift: 0,
         pitchMin: 24,
         pitchMax: 108,
         velocityLaneVisible: true,
@@ -674,6 +681,28 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
             state.selectedNoteIds.delete(String(noteId));
           }
         }
+      }
+
+      function setKeyboardFocusMode(mode, options) {
+        const opts = options && typeof options === "object" ? options : {};
+        const normalized = String(mode || "").toLowerCase();
+        if (
+          normalized !== KEYBOARD_FOCUS_VIEWPORT
+          && normalized !== KEYBOARD_FOCUS_NOTES
+          && normalized !== KEYBOARD_FOCUS_VELOCITY
+        ) {
+          return;
+        }
+
+        state.keyboardFocusMode = normalized;
+        if (normalized !== KEYBOARD_FOCUS_VELOCITY && !opts.preserveVelocityTarget) {
+          state.focusedVelocityGroupNoteIds = null;
+          state.focusedVelocityNoteId = null;
+        }
+      }
+
+      function getKeyboardFocusMode() {
+        return String(state.keyboardFocusMode || KEYBOARD_FOCUS_VIEWPORT);
       }
 
       function setSelectionFromList(noteIds) {
@@ -1167,22 +1196,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       }
 
       function updatePitchRange() {
-        if (session.notes.length === 0) {
-          state.pitchMin = 24;
-          state.pitchMax = 108;
-          return;
-        }
-
-        let minPitch = 127;
-        let maxPitch = 0;
-        for (const note of session.notes) {
-          const pitch = Number(note.pitch_midi || 0);
-          minPitch = Math.min(minPitch, pitch);
-          maxPitch = Math.max(maxPitch, pitch);
-        }
-
-        state.pitchMin = Math.max(0, minPitch - 2);
-        state.pitchMax = Math.min(127, maxPitch + 2);
+        applyPitchViewportShift(state.pitchViewportShift);
       }
 
       function updateCanvasSize() {
@@ -1250,7 +1264,40 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       function clearSelection() {
         state.selectionRegion = null;
         state.selectedNoteIds.clear();
+        setKeyboardFocusMode(KEYBOARD_FOCUS_VIEWPORT);
         updateSelectionUi();
+      }
+
+      function normalizedPitchBounds() {
+        if (session.notes.length === 0) {
+          return {
+            min: 24,
+            max: 108,
+          };
+        }
+
+        let minPitch = 127;
+        let maxPitch = 0;
+        for (const note of session.notes) {
+          const pitch = Number(note.pitch_midi || 0);
+          minPitch = Math.min(minPitch, pitch);
+          maxPitch = Math.max(maxPitch, pitch);
+        }
+
+        return {
+          min: Math.max(0, minPitch - 2),
+          max: Math.min(127, maxPitch + 2),
+        };
+      }
+
+      function applyPitchViewportShift(requestedShift) {
+        const bounds = normalizedPitchBounds();
+        const minAllowed = -bounds.min;
+        const maxAllowed = 127 - bounds.max;
+        const clampedShift = Math.max(minAllowed, Math.min(maxAllowed, Math.round(Number(requestedShift || 0))));
+        state.pitchViewportShift = clampedShift;
+        state.pitchMin = bounds.min + clampedShift;
+        state.pitchMax = bounds.max + clampedShift;
       }
 
       function buildTrackNoteCounts() {
@@ -1388,6 +1435,10 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         state.clipboard = null;
         state.pasteCursorTick = null;
         state.pasteIdCounter = 1;
+        state.keyboardFocusMode = KEYBOARD_FOCUS_VIEWPORT;
+        state.focusedVelocityNoteId = null;
+        state.focusedVelocityGroupNoteIds = null;
+        state.pitchViewportShift = 0;
         state.velocityLaneVisible = true;
         state.velocityValuesVisible = false;
         state.pixelsPerTick = DEFAULT_PIXELS_PER_TICK;
@@ -1463,6 +1514,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           Math.min(MAX_PIXELS_PER_TICK, suggestedPixelsPerTick)
         );
         state.xOffsetTicks = Math.max(0, minStartTick - ticksPerBeat * 0.5);
+        state.pitchViewportShift = 0;
         clampXOffsetTicks();
       }
 
@@ -2325,6 +2377,38 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         return false;
       }
 
+      function panViewportByTicks(deltaTicks) {
+        const parsed = Number(deltaTicks || 0);
+        if (!Number.isFinite(parsed) || parsed === 0) {
+          return false;
+        }
+        const before = Number(state.xOffsetTicks || 0);
+        state.xOffsetTicks = before + parsed;
+        clampXOffsetTicks();
+        return Number(state.xOffsetTicks || 0) !== before;
+      }
+
+      function panViewportBySemitones(deltaRows) {
+        const parsed = Math.round(Number(deltaRows || 0));
+        if (!Number.isFinite(parsed) || parsed === 0) {
+          return false;
+        }
+        const before = Number(state.pitchViewportShift || 0);
+        applyPitchViewportShift(before + parsed);
+        return Number(state.pitchViewportShift || 0) !== before;
+      }
+
+      function getViewportState() {
+        return {
+          pixelsPerTick: state.pixelsPerTick,
+          xOffsetTicks: state.xOffsetTicks,
+          pitchMin: state.pitchMin,
+          pitchMax: state.pitchMax,
+          pitchViewportShift: state.pitchViewportShift,
+          visibleTickSpan: getVisibleTickSpan(),
+        };
+      }
+
       function getPasteCursorTick() {
         if (!Number.isFinite(Number(state.pasteCursorTick))) {
           return null;
@@ -2347,6 +2431,336 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           region_end_tick: Number(state.clipboard.regionEndTick),
           region_duration_ticks: Number(state.clipboard.regionDurationTicks),
         };
+      }
+
+      function keyboardHorizontalNudgeTicks(event) {
+        const ticksPerBeat = Math.max(1, Number(session.ticks_per_beat || 480));
+        const snapTicks = isSnapEnabled() ? currentSnapTicks() : Math.max(1, Math.round(ticksPerBeat / 16));
+        const base = Math.max(1, Math.round(snapTicks));
+        if (event && event.shiftKey) {
+          return Math.max(1, base * 4);
+        }
+        if (event && event.altKey) {
+          return Math.max(1, Math.round(base / 4));
+        }
+        return base;
+      }
+
+      function keyboardPitchNudgeSemitones(event) {
+        if (event && event.shiftKey) {
+          return 12;
+        }
+        return 1;
+      }
+
+      function viewportHorizontalArrowStep(event) {
+        const visible = Math.max(1, getVisibleTickSpan());
+        let ratio = 0.10;
+        if (event && event.shiftKey) {
+          ratio = 0.25;
+        } else if (event && event.altKey) {
+          ratio = 0.03;
+        }
+        return Math.max(1, Math.round(visible * ratio));
+      }
+
+      function viewportVerticalArrowStep(event) {
+        if (event && event.shiftKey) {
+          return 12;
+        }
+        if (event && event.altKey) {
+          return 1;
+        }
+        return 3;
+      }
+
+      function moveSelectedNotesByKeyboard(deltaTicks, deltaPitch, label) {
+        const selection = Array.from(state.selectedNoteIds).filter(function (noteId) {
+          return state.noteById.has(String(noteId));
+        });
+        if (!selection.length) {
+          return {
+            changedCount: 0,
+            appliedDeltaTicks: 0,
+            appliedDeltaPitch: 0,
+          };
+        }
+
+        const selectedNotes = selection.map(function (noteId) {
+          return state.noteById.get(String(noteId));
+        }).filter(function (note) { return Boolean(note); });
+
+        const beforeNotes = selectedNotes.map(function (note) {
+          return cloneNoteSnapshot(note);
+        });
+        const beforeById = new Map(beforeNotes.map(function (note) {
+          return [String(note.note_id), note];
+        }));
+
+        let appliedTicks = Math.round(Number(deltaTicks || 0));
+        if (appliedTicks !== 0) {
+          const minStart = Math.min.apply(null, beforeNotes.map(function (note) {
+            return Number(note.start_tick || 0);
+          }));
+          if (minStart + appliedTicks < 0) {
+            appliedTicks = -Math.round(minStart);
+          }
+        }
+
+        let appliedPitch = Math.round(Number(deltaPitch || 0));
+        if (appliedPitch !== 0) {
+          const minPitch = Math.min.apply(null, beforeNotes.map(function (note) {
+            return Number(note.pitch_midi || 0);
+          }));
+          const maxPitch = Math.max.apply(null, beforeNotes.map(function (note) {
+            return Number(note.pitch_midi || 0);
+          }));
+          if (minPitch + appliedPitch < 0) {
+            appliedPitch = -minPitch;
+          }
+          if (maxPitch + appliedPitch > 127) {
+            appliedPitch = 127 - maxPitch;
+          }
+        }
+
+        if (appliedTicks === 0 && appliedPitch === 0) {
+          return {
+            changedCount: 0,
+            appliedDeltaTicks: 0,
+            appliedDeltaPitch: 0,
+          };
+        }
+
+        for (const before of beforeNotes) {
+          const note = state.noteById.get(String(before.note_id));
+          if (!note) {
+            continue;
+          }
+          const duration = noteDurationTicks(before);
+          note.start_tick = Math.max(0, Math.round(Number(before.start_tick || 0) + appliedTicks));
+          note.end_tick = note.start_tick + duration;
+          note.pitch_midi = clampPitchMidi(Number(before.pitch_midi || 0) + appliedPitch);
+          syncNoteTimingFromTicks(note);
+        }
+
+        const changedBefore = [];
+        const changedAfter = [];
+        for (const noteId of selection) {
+          const before = beforeById.get(String(noteId));
+          const after = state.noteById.get(String(noteId));
+          if (!before || !after) {
+            continue;
+          }
+          const afterSnapshot = cloneNoteSnapshot(after);
+          if (noteSnapshotsChanged(before, afterSnapshot)) {
+            changedBefore.push(cloneNoteSnapshot(before));
+            changedAfter.push(afterSnapshot);
+          }
+        }
+
+        if (!changedAfter.length) {
+          return {
+            changedCount: 0,
+            appliedDeltaTicks: 0,
+            appliedDeltaPitch: 0,
+          };
+        }
+
+        pushHistoryTransaction({
+          label: String(label || "keyboard-note-move"),
+          beforeNotes: changedBefore,
+          afterNotes: changedAfter,
+          selectionBefore: selection.slice(),
+          selectionAfter: selection.slice(),
+        });
+
+        sortNotes();
+        rebuildTrackSources();
+        rebuildNoteLookup();
+        setSelectionFromList(selection.slice());
+        updateTargetTrackDropdown();
+        renderTrackPanel();
+        redraw();
+        updateEditorActionButtons();
+
+        return {
+          changedCount: changedAfter.length,
+          appliedDeltaTicks: appliedTicks,
+          appliedDeltaPitch: appliedPitch,
+        };
+      }
+
+      function focusedVelocityTargetNoteIds() {
+        if (Array.isArray(state.focusedVelocityGroupNoteIds) && state.focusedVelocityGroupNoteIds.length) {
+          const groupIds = state.focusedVelocityGroupNoteIds.map(function (noteId) {
+            return String(noteId);
+          }).filter(function (noteId) {
+            return state.noteById.has(noteId);
+          });
+          if (groupIds.length) {
+            return groupIds;
+          }
+        }
+
+        const selected = Array.from(state.selectedNoteIds).filter(function (noteId) {
+          return state.noteById.has(String(noteId));
+        });
+        if (selected.length) {
+          return selected;
+        }
+
+        if (state.focusedVelocityNoteId && state.noteById.has(String(state.focusedVelocityNoteId))) {
+          return [String(state.focusedVelocityNoteId)];
+        }
+
+        return [];
+      }
+
+      function adjustSelectedVelocityByKeyboard(delta) {
+        const noteIds = focusedVelocityTargetNoteIds();
+        if (!noteIds.length) {
+          return {
+            changedCount: 0,
+            noteCount: 0,
+          };
+        }
+
+        const selectionBefore = Array.from(state.selectedNoteIds).filter(function (noteId) {
+          return state.noteById.has(String(noteId));
+        });
+        const effectiveSelectionBefore = selectionBefore.length ? selectionBefore : noteIds.slice();
+
+        const beforeNotes = noteIds.map(function (noteId) {
+          const note = state.noteById.get(String(noteId));
+          return note ? cloneNoteSnapshot(note) : null;
+        }).filter(function (note) { return Boolean(note); });
+
+        const result = setVelocityForNotes(noteIds, { delta: Number(delta || 0) });
+        if (result.changedCount <= 0) {
+          return {
+            changedCount: 0,
+            noteCount: noteIds.length,
+          };
+        }
+
+        const afterNotes = noteIds.map(function (noteId) {
+          const note = state.noteById.get(String(noteId));
+          return note ? cloneNoteSnapshot(note) : null;
+        }).filter(function (note) { return Boolean(note); });
+
+        pushHistoryTransaction({
+          label: "keyboard-velocity-edit",
+          beforeNotes: beforeNotes,
+          afterNotes: afterNotes,
+          selectionBefore: effectiveSelectionBefore,
+          selectionAfter: noteIds.slice(),
+        });
+
+        sortNotes();
+        rebuildTrackSources();
+        rebuildNoteLookup();
+        setSelectionFromList(noteIds.slice());
+        updateTargetTrackDropdown();
+        renderTrackPanel();
+        redraw();
+        updateEditorActionButtons();
+
+        return {
+          changedCount: result.changedCount,
+          noteCount: noteIds.length,
+        };
+      }
+
+      function handleArrowKey(event) {
+        const key = String(event.key || "");
+        if (key !== "ArrowLeft" && key !== "ArrowRight" && key !== "ArrowUp" && key !== "ArrowDown") {
+          return false;
+        }
+
+        const mode = getKeyboardFocusMode();
+
+        if (mode === KEYBOARD_FOCUS_VIEWPORT) {
+          let handled = false;
+          if (key === "ArrowLeft") {
+            handled = panViewportByTicks(-viewportHorizontalArrowStep(event));
+          } else if (key === "ArrowRight") {
+            handled = panViewportByTicks(viewportHorizontalArrowStep(event));
+          } else if (key === "ArrowUp") {
+            handled = panViewportBySemitones(viewportVerticalArrowStep(event));
+          } else if (key === "ArrowDown") {
+            handled = panViewportBySemitones(-viewportVerticalArrowStep(event));
+          }
+
+          if (handled) {
+            redraw();
+            updateCanvasCursorForPoint(null);
+            setStatus("Viewport moved.", false);
+          }
+          return true;
+        }
+
+        if (mode === KEYBOARD_FOCUS_NOTES && state.selectedNoteIds.size > 0) {
+          let deltaTicks = 0;
+          let deltaPitch = 0;
+
+          if (key === "ArrowLeft") {
+            deltaTicks = -keyboardHorizontalNudgeTicks(event);
+          } else if (key === "ArrowRight") {
+            deltaTicks = keyboardHorizontalNudgeTicks(event);
+          } else if (key === "ArrowUp") {
+            deltaPitch = keyboardPitchNudgeSemitones(event);
+          } else if (key === "ArrowDown") {
+            deltaPitch = -keyboardPitchNudgeSemitones(event);
+          }
+
+          const result = moveSelectedNotesByKeyboard(deltaTicks, deltaPitch, "keyboard-note-move");
+          if (result.changedCount > 0) {
+            if (deltaTicks > 0) {
+              setStatus("Moved " + String(result.changedCount) + " note(s) right.", false);
+            } else if (deltaTicks < 0) {
+              setStatus("Moved " + String(result.changedCount) + " note(s) left.", false);
+            } else if (deltaPitch > 0) {
+              setStatus("Moved " + String(result.changedCount) + " note(s) up.", false);
+            } else if (deltaPitch < 0) {
+              setStatus("Moved " + String(result.changedCount) + " note(s) down.", false);
+            }
+          }
+          return true;
+        }
+
+        if (mode === KEYBOARD_FOCUS_VELOCITY) {
+          if (key === "ArrowLeft") {
+            const movedLeft = panViewportByTicks(-viewportHorizontalArrowStep(event));
+            if (movedLeft) {
+              redraw();
+              setStatus("Viewport moved.", false);
+            }
+            return true;
+          }
+          if (key === "ArrowRight") {
+            const movedRight = panViewportByTicks(viewportHorizontalArrowStep(event));
+            if (movedRight) {
+              redraw();
+              setStatus("Viewport moved.", false);
+            }
+            return true;
+          }
+          if (key === "ArrowUp" || key === "ArrowDown") {
+            const step = event.shiftKey ? 10 : 1;
+            const delta = key === "ArrowUp" ? step : -step;
+            const result = adjustSelectedVelocityByKeyboard(delta);
+            if (result.changedCount > 0) {
+              const prefix = delta > 0 ? "+" : "";
+              setStatus(
+                "Velocity " + prefix + String(delta) + " for " + String(result.noteCount) + " note(s).",
+                false
+              );
+            }
+            return true;
+          }
+        }
+
+        return false;
       }
 
       function setVelocityForNotes(noteIds, options) {
@@ -3134,6 +3548,9 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
               setSelectionFromList(hitGroup.noteIds.slice());
             }
             const selectionAfter = Array.from(state.selectedNoteIds);
+            state.focusedVelocityGroupNoteIds = hitGroup.noteIds.slice();
+            state.focusedVelocityNoteId = String(hitGroup.noteIds[0]);
+            setKeyboardFocusMode(KEYBOARD_FOCUS_VELOCITY, { preserveVelocityTarget: true });
             startVelocityDrag({
               mode: "group",
               noteIds: selectionAfter,
@@ -3149,7 +3566,13 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           if (hitVelocityBar) {
             const noteId = String(hitVelocityBar.note.note_id);
             const wasSelected = state.selectedNoteIds.has(noteId);
-            selectNoteById(noteId, additive);
+            if (!(wasSelected && !additive && state.selectedNoteIds.size > 1)) {
+              selectNoteById(noteId, additive);
+            }
+
+            state.focusedVelocityGroupNoteIds = null;
+            state.focusedVelocityNoteId = noteId;
+            setKeyboardFocusMode(KEYBOARD_FOCUS_VELOCITY, { preserveVelocityTarget: true });
 
             let dragNoteIds = [];
             if (additive && wasSelected) {
@@ -3202,6 +3625,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         const additive = Boolean(event.ctrlKey || event.metaKey);
         const hit = getNoteBoxAt(point.x, point.y);
         if (hit) {
+          setKeyboardFocusMode(KEYBOARD_FOCUS_NOTES);
           startNoteEditDrag(hit, point, additive);
           updateCanvasCursorForPoint(point);
           redraw();
@@ -3356,12 +3780,19 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
             endTick: Math.max(startTick, endTick),
           };
           selectNotesInRect(rect, state.dragSelect.additive);
+          if (state.selectedNoteIds.size > 0) {
+            setKeyboardFocusMode(KEYBOARD_FOCUS_NOTES);
+          } else {
+            setKeyboardFocusMode(KEYBOARD_FOCUS_VIEWPORT);
+          }
         } else if (state.dragSelect.hitNoteId) {
           selectNoteById(state.dragSelect.hitNoteId, state.dragSelect.additive);
+          setKeyboardFocusMode(KEYBOARD_FOCUS_NOTES);
         } else if (!state.dragSelect.additive) {
           const cursorTick = Math.max(0, snapAbsoluteTick(tickFromCanvasX(state.dragSelect.currentX)));
           setPasteCursorTick(cursorTick, { snap: true });
           clearSelection();
+          setKeyboardFocusMode(KEYBOARD_FOCUS_VIEWPORT);
           setStatus("Selection cleared. Paste cursor set to tick " + String(cursorTick) + ".", false);
         }
 
@@ -3865,6 +4296,14 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           const isModifierDown = Boolean(event.ctrlKey || event.metaKey);
           const key = String(event.key || "").toLowerCase();
 
+          if (!isModifierDown && String(event.key || "").startsWith("Arrow")) {
+            const handledArrow = handleArrowKey(event);
+            if (handledArrow) {
+              event.preventDefault();
+              return;
+            }
+          }
+
           if (isModifierDown && key === "z" && !event.shiftKey) {
             event.preventDefault();
             undoHistory();
@@ -3957,6 +4396,25 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           getSelectedNoteIds: function () {
             return Array.from(state.selectedNoteIds);
           },
+          setKeyboardFocusMode: setKeyboardFocusMode,
+          getKeyboardFocusMode: getKeyboardFocusMode,
+          panViewportByTicks: function (deltaTicks) {
+            const changed = panViewportByTicks(deltaTicks);
+            if (changed) {
+              redraw();
+            }
+            return changed;
+          },
+          panViewportBySemitones: function (deltaRows) {
+            const changed = panViewportBySemitones(deltaRows);
+            if (changed) {
+              redraw();
+            }
+            return changed;
+          },
+          getViewportState: getViewportState,
+          moveSelectedNotesByKeyboard: moveSelectedNotesByKeyboard,
+          adjustSelectedVelocityByKeyboard: adjustSelectedVelocityByKeyboard,
           moveSelectedToTrack: moveSelectedToTrack,
           mergeSelectedNotes: mergeSelectedNotes,
           deleteSelectedNotes: deleteSelectedNotes,
@@ -3975,10 +4433,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
             redraw();
           },
           getViewState: function () {
-            return {
-              pixelsPerTick: state.pixelsPerTick,
-              xOffsetTicks: state.xOffsetTicks,
-            };
+            return getViewportState();
           },
           isServerConnected: function () {
             return state.serverConnected;

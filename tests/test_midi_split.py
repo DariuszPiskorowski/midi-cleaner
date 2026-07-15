@@ -338,11 +338,23 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function hitTestVelocityBarForApi(x, y)" in html
     assert "function setPasteCursorTick(tick, options)" in html
     assert "function getPasteCursorTick()" in html
+    assert "function setKeyboardFocusMode(mode, options)" in html
+    assert "function getKeyboardFocusMode()" in html
     assert "function viewportTickStart()" in html
     assert "function viewportTickEnd()" in html
     assert "function isTickRangeVisible(startTick, endTick)" in html
     assert "function ensureTickRangeVisible(startTick, endTick)" in html
+    assert "function panViewportByTicks(deltaTicks)" in html
+    assert "function panViewportBySemitones(deltaRows)" in html
+    assert "function getViewportState()" in html
     assert "function getClipboardSummary()" in html
+    assert "function keyboardHorizontalNudgeTicks(event)" in html
+    assert "function keyboardPitchNudgeSemitones(event)" in html
+    assert "function viewportHorizontalArrowStep(event)" in html
+    assert "function viewportVerticalArrowStep(event)" in html
+    assert "function moveSelectedNotesByKeyboard(deltaTicks, deltaPitch, label)" in html
+    assert "function adjustSelectedVelocityByKeyboard(delta)" in html
+    assert "function handleArrowKey(event)" in html
     assert "function copySelectedNotes()" in html
     assert "function pasteCopiedNotes()" in html
     assert "function setVelocityForNotes(noteIds, options)" in html
@@ -394,6 +406,13 @@ def test_generate_piano_roll_preview_exposes_snap_controls_in_test_api(tmp_path:
     assert "setPasteCursorTick: function (tick)" in script
     assert "getPasteCursorTick: getPasteCursorTick" in script
     assert "getSelectedNoteIds: function ()" in script
+    assert "setKeyboardFocusMode: setKeyboardFocusMode" in script
+    assert "getKeyboardFocusMode: getKeyboardFocusMode" in script
+    assert "panViewportByTicks: function (deltaTicks)" in script
+    assert "panViewportBySemitones: function (deltaRows)" in script
+    assert "getViewportState: getViewportState" in script
+    assert "moveSelectedNotesByKeyboard: moveSelectedNotesByKeyboard" in script
+    assert "adjustSelectedVelocityByKeyboard: adjustSelectedVelocityByKeyboard" in script
 
 
 def test_generate_piano_roll_preview_velocity_bar_geometry_and_hit_zone_logic(tmp_path: Path) -> None:
@@ -437,6 +456,8 @@ def test_generate_piano_roll_preview_wires_history_shortcuts_without_editable_in
     script = _extract_editor_script(output_html.read_text(encoding="utf-8"))
     assert "function isEditableTypingTarget" in script
     assert "if (isEditableTypingTarget(event.target))" in script
+    assert "if (!isModifierDown && String(event.key || \"\").startsWith(\"Arrow\"))" in script
+    assert "const handledArrow = handleArrowKey(event);" in script
     assert "if (isModifierDown && key === \"z\" && !event.shiftKey)" in script
     assert "undoHistory();" in script
     assert "if (isModifierDown && (key === \"y\" || (key === \"z\" && event.shiftKey)))" in script
