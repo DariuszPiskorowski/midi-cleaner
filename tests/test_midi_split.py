@@ -278,6 +278,8 @@ def test_generate_piano_roll_preview_contains_editor_toolbar_actions(tmp_path: P
     assert 'id="merge-notes-btn"' in html
     assert 'id="delete-notes-btn"' in html
     assert 'id="mute-notes-btn"' in html
+    assert 'id="copy-notes-btn"' in html
+    assert 'id="paste-notes-btn"' in html
     assert 'id="save-session-btn"' not in html
     assert 'id="download-session-btn"' not in html
     assert "Server: checking" in html
@@ -321,12 +323,28 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function drawDrawPreview" in html
     assert "function velocityValue(note)" in html
     assert "function velocityRatio(note)" in html
+    assert "function clampEditedVelocity(value)" in html
+    assert "function velocityFromLaneY(y)" in html
+    assert "function velocityGroupKeyForNote(note)" in html
+    assert "function sortedNotesForVelocityGroup(notes)" in html
+    assert "function buildVelocityGroups()" in html
+    assert "function getVelocityGroups()" in html
+    assert "function hitTestVelocityGroupHandle(x, y)" in html
     assert "function velocityBarForNote(note)" in html
     assert "function getVelocityBars()" in html
     assert "function velocityBarForNoteId(noteId)" in html
     assert "function drawVelocityLane()" in html
     assert "function hitTestVelocityBar(x, y)" in html
     assert "function hitTestVelocityBarForApi(x, y)" in html
+    assert "function setPasteCursorTick(tick, options)" in html
+    assert "function getPasteCursorTick()" in html
+    assert "function getClipboardSummary()" in html
+    assert "function copySelectedNotes()" in html
+    assert "function pasteCopiedNotes()" in html
+    assert "function setVelocityForNotes(noteIds, options)" in html
+    assert "function startVelocityDrag(params)" in html
+    assert "function applyVelocityDragPreview(drag, point)" in html
+    assert "function finalizeVelocityDrag(drag)" in html
     assert "function startDrawDrag" in html
     assert "function finalizeDrawDrag" in html
     assert "function applyMovePreview" in html
@@ -360,8 +378,15 @@ def test_generate_piano_roll_preview_exposes_snap_controls_in_test_api(tmp_path:
     assert "getVelocityLaneVisible: function () { return state.velocityLaneVisible; }" in script
     assert "selectedVelocitySummary: selectedVelocitySummary" in script
     assert "getVelocityBars: getVelocityBars" in script
+    assert "getVelocityGroups: getVelocityGroups" in script
     assert "velocityBarForNoteId: velocityBarForNoteId" in script
     assert "hitTestVelocityBar: hitTestVelocityBarForApi" in script
+    assert "setVelocityForNoteIds: function (noteIds, options)" in script
+    assert "copySelectedNotes: copySelectedNotes" in script
+    assert "pasteCopiedNotes: pasteCopiedNotes" in script
+    assert "getClipboardSummary: getClipboardSummary" in script
+    assert "setPasteCursorTick: function (tick)" in script
+    assert "getPasteCursorTick: getPasteCursorTick" in script
 
 
 def test_generate_piano_roll_preview_velocity_bar_geometry_and_hit_zone_logic(tmp_path: Path) -> None:
@@ -373,9 +398,12 @@ def test_generate_piano_roll_preview_velocity_bar_geometry_and_hit_zone_logic(tm
     script = _extract_editor_script(output_html.read_text(encoding="utf-8"))
     assert "const VELOCITY_BAR_DRAW_WIDTH = 6;" in script
     assert "const VELOCITY_BAR_HIT_WIDTH = 10;" in script
+    assert "const VELOCITY_GROUP_HANDLE_HEIGHT = 8;" in script
+    assert "const VELOCITY_FAN_SPACING = 3;" in script
     assert "const barHeight = Math.max(1, Math.round(ratio * VELOCITY_LANE_HEIGHT));" in script
     assert "const hitInset = Math.max(0, (VELOCITY_BAR_HIT_WIDTH - VELOCITY_BAR_DRAW_WIDTH) / 2);" in script
     assert "if (x >= bar.hitX && x <= bar.hitX + bar.hitW && y >= bar.y && y <= bar.y + bar.h)" in script
+    assert "if (group.noteIds.length < 2)" in script
 
 
 def test_generate_piano_roll_preview_velocity_bar_muted_visual_is_strongly_dimmed(tmp_path: Path) -> None:
@@ -403,8 +431,27 @@ def test_generate_piano_roll_preview_wires_history_shortcuts_without_editable_in
     assert "undoHistory();" in script
     assert "if (isModifierDown && (key === \"y\" || (key === \"z\" && event.shiftKey)))" in script
     assert "redoHistory();" in script
+    assert "if (isModifierDown && key === \"c\")" in script
+    assert "copySelectedNotes();" in script
+    assert "if (isModifierDown && key === \"v\")" in script
+    assert "pasteCopiedNotes();" in script
     assert "if (key === \"delete\" || key === \"backspace\")" in script
     assert "deleteSelectedNotes();" in script
+
+
+def test_generate_piano_roll_preview_wires_copy_paste_toolbar_and_paste_cursor(tmp_path: Path) -> None:
+    session = _create_session(tmp_path)
+    output_html = tmp_path / "split_editor.html"
+
+    generate_piano_roll_preview(session, output_html)
+
+    script = _extract_editor_script(output_html.read_text(encoding="utf-8"))
+    assert "const copyNotesButton = document.getElementById(\"copy-notes-btn\");" in script
+    assert "const pasteNotesButton = document.getElementById(\"paste-notes-btn\");" in script
+    assert "copyNotesButton.addEventListener(\"click\", copySelectedNotes);" in script
+    assert "pasteNotesButton.addEventListener(\"click\", pasteCopiedNotes);" in script
+    assert "const PASTE_CURSOR_COLOR = \"#8ed1ff\";" in script
+    assert "ctx.setLineDash([4, 3]);" in script
 
 
 def test_generate_piano_roll_preview_muted_notes_have_distinct_visual_style(tmp_path: Path) -> None:

@@ -147,6 +147,8 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
     <button id="export-separate-btn" type="button">Export Separate Tracks ZIP</button>
     <button id="undo-btn" type="button" disabled>Undo</button>
     <button id="redo-btn" type="button" disabled>Redo</button>
+    <button id="copy-notes-btn" type="button" disabled>Copy</button>
+    <button id="paste-notes-btn" type="button" disabled>Paste</button>
 
     <span>|</span>
     <button id="tool-select-btn" type="button">Select</button>
@@ -209,8 +211,11 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       const VELOCITY_LANE_HEIGHT = 124;
       const VELOCITY_LANE_GAP = 8;
       const VELOCITY_AXIS_TEXT_PAD = 4;
+      const VELOCITY_GROUP_HANDLE_HEIGHT = 8;
+      const VELOCITY_FAN_SPACING = 3;
       const VELOCITY_BAR_DRAW_WIDTH = 6;
       const VELOCITY_BAR_HIT_WIDTH = 10;
+      const PASTE_CURSOR_COLOR = "#8ed1ff";
       const DEFAULT_PIXELS_PER_TICK = 0.18;
       const DEFAULT_DRAW_VELOCITY = 100;
       const MIN_PIXELS_PER_TICK = 0.03;
@@ -292,6 +297,8 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       const mergeNotesButton = document.getElementById("merge-notes-btn");
       const deleteNotesButton = document.getElementById("delete-notes-btn");
       const muteNotesButton = document.getElementById("mute-notes-btn");
+      const copyNotesButton = document.getElementById("copy-notes-btn");
+      const pasteNotesButton = document.getElementById("paste-notes-btn");
       const snapEnabledEl = document.getElementById("snap-enabled");
       const snapGridEl = document.getElementById("snap-grid");
       const velocityLaneVisibleEl = document.getElementById("velocity-lane-visible");
@@ -316,10 +323,17 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         noteById: new Map(),
         noteBoxes: [],
         velocityBars: [],
+        velocityGroups: [],
+        velocityGroupMetaByNoteId: new Map(),
         dragSelect: null,
         noteEditDrag: null,
+        velocityDrag: null,
         drawDrag: null,
         panDrag: null,
+        selectionRegion: null,
+        clipboard: null,
+        pasteCursorTick: null,
+        pasteIdCounter: 1,
         pitchMin: 24,
         pitchMax: 108,
         velocityLaneVisible: true,
@@ -544,8 +558,55 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         return Math.max(0, Math.min(127, Math.round(raw)));
       }
 
+      function clampEditedVelocity(value) {
+        return Math.max(1, Math.min(127, Math.round(Number(value || 0))));
+      }
+
       function velocityRatio(note) {
         return velocityValue(note) / 127;
+      }
+
+      function velocityFromLaneY(y) {
+        const laneTop = velocityLaneTopY();
+        const laneBottom = velocityLaneBottomY();
+        const clampedY = Math.max(laneTop, Math.min(laneBottom, Number(y || laneBottom)));
+        const ratio = (laneBottom - clampedY) / Math.max(1, VELOCITY_LANE_HEIGHT);
+        return clampEditedVelocity(Math.round(ratio * 127));
+      }
+
+      function velocityGroupKeyForNote(note) {
+        const startTick = Math.round(Number(note && note.start_tick || 0));
+        const trackIndex = Math.round(Number(note && note.editable_track_index || 0));
+        const channel = Number(note && note.channel);
+        const hasChannel = Number.isFinite(channel);
+        return String(startTick) + "|" + String(trackIndex) + "|" + (hasChannel ? String(Math.round(channel)) : "any");
+      }
+
+      function sortedNotesForVelocityGroup(notes) {
+        const list = notes.slice();
+        list.sort(function (a, b) {
+          if (Number(a.pitch_midi) !== Number(b.pitch_midi)) {
+            return Number(a.pitch_midi) - Number(b.pitch_midi);
+          }
+          return String(a.note_id).localeCompare(String(b.note_id));
+        });
+        return list;
+      }
+
+      function generateUniquePastedNoteId() {
+        const existing = new Set(session.notes.map(function (note) {
+          return String(note.note_id);
+        }));
+
+        for (let guard = 0; guard < 200000; guard += 1) {
+          const candidate = "pasted_" + String(Date.now()) + "_" + String(state.pasteIdCounter).padStart(6, "0");
+          state.pasteIdCounter += 1;
+          if (!existing.has(candidate)) {
+            return candidate;
+          }
+        }
+
+        return "pasted_" + String(Date.now()) + "_" + String(Math.floor(Math.random() * 1000000));
       }
 
       function currentSnapDivision() {
@@ -613,6 +674,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       }
 
       function setSelectionFromList(noteIds) {
+        state.selectionRegion = null;
         state.selectedNoteIds.clear();
         for (const noteId of noteIds || []) {
           const normalized = String(noteId);
@@ -667,11 +729,17 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         muteNotesButton.textContent = mode === "unmute" ? "Unmute Notes" : "Mute Notes";
       }
 
+      function updateClipboardButtons() {
+        copyNotesButton.disabled = state.selectedNoteIds.size === 0;
+        pasteNotesButton.disabled = !state.clipboard || !Array.isArray(state.clipboard.notes) || state.clipboard.notes.length === 0;
+      }
+
       function updateEditorActionButtons() {
         updateHistoryControls();
         updateMergeButtonState();
         updateDeleteButtonState();
         updateMuteButtonState();
+        updateClipboardButtons();
       }
 
       function pushHistoryTransaction(transaction) {
@@ -1177,6 +1245,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       }
 
       function clearSelection() {
+        state.selectionRegion = null;
         state.selectedNoteIds.clear();
         updateSelectionUi();
       }
@@ -1305,10 +1374,17 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         state.mergeTrackIndices.clear();
         state.dragSelect = null;
         state.noteEditDrag = null;
+        state.velocityDrag = null;
         state.drawDrag = null;
         state.panDrag = null;
         state.noteBoxes = [];
         state.velocityBars = [];
+        state.velocityGroups = [];
+        state.velocityGroupMetaByNoteId = new Map();
+        state.selectionRegion = null;
+        state.clipboard = null;
+        state.pasteCursorTick = null;
+        state.pasteIdCounter = 1;
         state.velocityLaneVisible = true;
         state.velocityValuesVisible = false;
         state.pixelsPerTick = DEFAULT_PIXELS_PER_TICK;
@@ -1616,6 +1692,82 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           const y = yForPitch(pitch) + NOTE_ROW_HEIGHT - 1;
           ctx.fillText(String(pitch), 8, y);
         }
+
+        if (Number.isFinite(Number(state.pasteCursorTick))) {
+          const pasteX = Math.round(xForTick(Number(state.pasteCursorTick))) + 0.5;
+          if (pasteX >= LEFT_PAD && pasteX <= canvas.width - RIGHT_PAD) {
+            ctx.strokeStyle = PASTE_CURSOR_COLOR;
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([4, 3]);
+            ctx.beginPath();
+            ctx.moveTo(pasteX, TOP_PAD);
+            const cursorBottom = state.velocityLaneVisible ? velocityLaneBottomY() : (canvas.height - BOTTOM_PAD);
+            ctx.lineTo(pasteX, cursorBottom);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.lineWidth = 1;
+          }
+        }
+      }
+
+      function buildVelocityGroups() {
+        const groupsByKey = new Map();
+
+        for (const note of session.notes) {
+          const key = velocityGroupKeyForNote(note);
+          if (!groupsByKey.has(key)) {
+            groupsByKey.set(key, []);
+          }
+          groupsByKey.get(key).push(note);
+        }
+
+        const groupMetaByNoteId = new Map();
+        const groups = [];
+
+        for (const notes of groupsByKey.values()) {
+          const ordered = sortedNotesForVelocityGroup(notes);
+          const first = ordered[0];
+          const groupSize = ordered.length;
+          const startTick = Number(first.start_tick || 0);
+          const baseX = xForTick(startTick);
+
+          let minFanX = Number.POSITIVE_INFINITY;
+          let maxFanX = Number.NEGATIVE_INFINITY;
+
+          for (let index = 0; index < ordered.length; index += 1) {
+            const fanOffset = (index - (groupSize - 1) / 2) * VELOCITY_FAN_SPACING;
+            const fanX = baseX + fanOffset;
+            const noteId = String(ordered[index].note_id);
+            groupMetaByNoteId.set(noteId, {
+              groupSize: groupSize,
+              fanOffset: fanOffset,
+              fanIndex: index,
+              baseX: baseX,
+            });
+            minFanX = Math.min(minFanX, fanX);
+            maxFanX = Math.max(maxFanX, fanX + VELOCITY_BAR_DRAW_WIDTH);
+          }
+
+          if (groupSize >= 2) {
+            const laneTop = velocityLaneTopY();
+            groups.push({
+              key: velocityGroupKeyForNote(first),
+              noteIds: ordered.map(function (note) { return String(note.note_id); }),
+              startTick: startTick,
+              editableTrackIndex: Number(first.editable_track_index || 0),
+              channel: first.channel,
+              handleX: minFanX - 1,
+              handleY: laneTop + 4,
+              handleW: Math.max(8, maxFanX - minFanX + 2),
+              handleH: VELOCITY_GROUP_HANDLE_HEIGHT,
+            });
+          }
+        }
+
+        return {
+          groups: groups,
+          groupMetaByNoteId: groupMetaByNoteId,
+        };
       }
 
       function velocityBarForNote(note) {
@@ -1623,8 +1775,11 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           return null;
         }
 
+        const noteId = String(note.note_id);
+        const groupMeta = state.velocityGroupMetaByNoteId ? state.velocityGroupMetaByNoteId.get(noteId) : null;
         const startTick = Number(note.start_tick || 0);
-        const x = xForTick(startTick);
+        const baseX = xForTick(startTick);
+        const x = baseX + Number(groupMeta && groupMeta.fanOffset || 0);
         const laneTop = velocityLaneTopY();
         const laneBottom = velocityLaneBottomY();
         const ratio = velocityRatio(note);
@@ -1638,11 +1793,14 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         }
 
         return {
-          noteId: String(note.note_id),
+          noteId: noteId,
           startTick: startTick,
           velocity: velocityValue(note),
           muted: note.muted === true,
-          selected: state.selectedNoteIds.has(String(note.note_id)),
+          selected: state.selectedNoteIds.has(noteId),
+          groupSize: Number(groupMeta && groupMeta.groupSize || 1),
+          fanIndex: Number(groupMeta && groupMeta.fanIndex || 0),
+          baseX: baseX,
           x: x,
           y: barTop,
           w: VELOCITY_BAR_DRAW_WIDTH,
@@ -1656,6 +1814,9 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       }
 
       function rebuildVelocityBars() {
+        const grouping = buildVelocityGroups();
+        state.velocityGroups = grouping.groups;
+        state.velocityGroupMetaByNoteId = grouping.groupMetaByNoteId;
         state.velocityBars = [];
         if (!state.velocityLaneVisible) {
           return;
@@ -1677,6 +1838,9 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
             velocity: bar.velocity,
             muted: bar.muted,
             selected: bar.selected,
+            group_size: bar.groupSize,
+            fan_index: bar.fanIndex,
+            base_x: bar.baseX,
             x: bar.x,
             y: bar.y,
             w: bar.w,
@@ -1699,6 +1863,9 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
               velocity: bar.velocity,
               muted: bar.muted,
               selected: bar.selected,
+              group_size: bar.groupSize,
+              fan_index: bar.fanIndex,
+              base_x: bar.baseX,
               x: bar.x,
               y: bar.y,
               w: bar.w,
@@ -1708,6 +1875,52 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
               lane_top: bar.laneTop,
               lane_bottom: bar.laneBottom,
             };
+          }
+        }
+        return null;
+      }
+
+      function getVelocityGroups() {
+        return state.velocityGroups.map(function (group) {
+          return {
+            key: group.key,
+            note_ids: group.noteIds.slice(),
+            start_tick: group.startTick,
+            editable_track_index: group.editableTrackIndex,
+            channel: group.channel,
+            handle_x: group.handleX,
+            handle_y: group.handleY,
+            handle_w: group.handleW,
+            handle_h: group.handleH,
+          };
+        });
+      }
+
+      function velocityGroupForBar(bar) {
+        if (!bar) {
+          return null;
+        }
+        for (const group of state.velocityGroups) {
+          if (group.noteIds.indexOf(String(bar.noteId)) >= 0) {
+            return group;
+          }
+        }
+        return null;
+      }
+
+      function hitTestVelocityGroupHandle(x, y) {
+        if (!state.velocityLaneVisible) {
+          return null;
+        }
+        for (let index = state.velocityGroups.length - 1; index >= 0; index -= 1) {
+          const group = state.velocityGroups[index];
+          if (
+            Number(x) >= Number(group.handleX)
+            && Number(x) <= Number(group.handleX) + Number(group.handleW)
+            && Number(y) >= Number(group.handleY)
+            && Number(y) <= Number(group.handleY) + Number(group.handleH)
+          ) {
+            return group;
           }
         }
         return null;
@@ -1768,6 +1981,19 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
             ctx.font = "10px Arial";
             ctx.fillText(String(velocityValue(note)), bar.x - 2, Math.max(laneTop + 10, bar.y - 2));
           }
+        }
+
+        for (const group of state.velocityGroups) {
+          if (group.noteIds.length < 2) {
+            continue;
+          }
+          ctx.strokeStyle = "#d9e9ff";
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(group.handleX + 0.5, group.handleY + group.handleH * 0.5 + 0.5);
+          ctx.lineTo(group.handleX + group.handleW + 0.5, group.handleY + group.handleH * 0.5 + 0.5);
+          ctx.stroke();
+          ctx.lineWidth = 1;
         }
 
         ctx.globalAlpha = 1.0;
@@ -1843,6 +2069,19 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         if (!state.velocityLaneVisible) {
           return null;
         }
+
+        // Priority 1: selected/active bars first for precise single-note editing.
+        for (let index = state.velocityBars.length - 1; index >= 0; index -= 1) {
+          const bar = state.velocityBars[index];
+          if (!bar.selected) {
+            continue;
+          }
+          if (x >= bar.hitX && x <= bar.hitX + bar.hitW && y >= bar.y && y <= bar.y + bar.h) {
+            return bar;
+          }
+        }
+
+        // Priority 2: any individual bar under cursor.
         for (let index = state.velocityBars.length - 1; index >= 0; index -= 1) {
           const bar = state.velocityBars[index];
           if (x >= bar.hitX && x <= bar.hitX + bar.hitW && y >= bar.y && y <= bar.y + bar.h) {
@@ -1906,14 +2145,24 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           return;
         }
 
+        if (state.velocityDrag) {
+          canvas.style.cursor = "ns-resize";
+          return;
+        }
+
         if (!point || point.x < LEFT_PAD || point.x > canvas.width - RIGHT_PAD) {
           canvas.style.cursor = "default";
           return;
         }
 
         if (isPointInVelocityLane(point)) {
+          const groupHandleHit = hitTestVelocityGroupHandle(point.x, point.y);
+          if (groupHandleHit) {
+            canvas.style.cursor = "ns-resize";
+            return;
+          }
           const velocityHit = hitTestVelocityBar(point.x, point.y);
-          canvas.style.cursor = velocityHit ? "pointer" : "default";
+          canvas.style.cursor = velocityHit ? "ns-resize" : "default";
           return;
         }
 
@@ -1938,6 +2187,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       }
 
       function selectNoteById(noteId, additive) {
+        state.selectionRegion = null;
         const id = String(noteId);
         if (!additive) {
           state.selectedNoteIds.clear();
@@ -2018,6 +2268,341 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           }
         }
         redraw();
+      }
+
+      function setPasteCursorTick(tick, options) {
+        const opts = options && typeof options === "object" ? options : {};
+        if (tick === null || tick === undefined || !Number.isFinite(Number(tick))) {
+          state.pasteCursorTick = null;
+          return;
+        }
+        let normalized = Math.max(0, Math.round(Number(tick)));
+        if (opts.snap !== false && isSnapEnabled()) {
+          normalized = Math.max(0, snapAbsoluteTick(normalized));
+        }
+        state.pasteCursorTick = normalized;
+      }
+
+      function getPasteCursorTick() {
+        if (!Number.isFinite(Number(state.pasteCursorTick))) {
+          return null;
+        }
+        return Number(state.pasteCursorTick);
+      }
+
+      function getClipboardSummary() {
+        if (!state.clipboard) {
+          return {
+            note_count: 0,
+            region_start_tick: null,
+            region_end_tick: null,
+            region_duration_ticks: null,
+          };
+        }
+        return {
+          note_count: Array.isArray(state.clipboard.notes) ? state.clipboard.notes.length : 0,
+          region_start_tick: Number(state.clipboard.regionStartTick),
+          region_end_tick: Number(state.clipboard.regionEndTick),
+          region_duration_ticks: Number(state.clipboard.regionDurationTicks),
+        };
+      }
+
+      function setVelocityForNotes(noteIds, options) {
+        const normalizedNoteIds = (noteIds || []).map(function (noteId) {
+          return String(noteId);
+        });
+        const uniqueIds = Array.from(new Set(normalizedNoteIds)).filter(function (noteId) {
+          return state.noteById.has(noteId);
+        });
+
+        const opts = options && typeof options === "object" ? options : {};
+        const hasTarget = Number.isFinite(Number(opts.targetVelocity));
+        const hasDelta = Number.isFinite(Number(opts.delta));
+        let changedCount = 0;
+
+        for (const noteId of uniqueIds) {
+          const note = state.noteById.get(noteId);
+          if (!note) {
+            continue;
+          }
+
+          const beforeVelocity = clampEditedVelocity(velocityValue(note));
+          let nextVelocity = beforeVelocity;
+          if (hasTarget) {
+            nextVelocity = clampEditedVelocity(Number(opts.targetVelocity));
+          } else if (hasDelta) {
+            nextVelocity = clampEditedVelocity(beforeVelocity + Number(opts.delta));
+          }
+
+          if (beforeVelocity !== nextVelocity) {
+            note.velocity = nextVelocity;
+            changedCount += 1;
+          }
+        }
+
+        return {
+          noteIds: uniqueIds,
+          changedCount: changedCount,
+        };
+      }
+
+      function startVelocityDrag(params) {
+        if (!params || !Array.isArray(params.noteIds) || !params.noteIds.length) {
+          return;
+        }
+        const normalizedIds = params.noteIds
+          .map(function (noteId) { return String(noteId); })
+          .filter(function (noteId) { return state.noteById.has(noteId); });
+        if (!normalizedIds.length) {
+          return;
+        }
+
+        const anchorId = state.noteById.has(String(params.anchorNoteId))
+          ? String(params.anchorNoteId)
+          : normalizedIds[0];
+        const anchorNote = state.noteById.get(anchorId);
+        if (!anchorNote) {
+          return;
+        }
+
+        const beforeById = new Map();
+        const beforeNotes = [];
+        for (const noteId of normalizedIds) {
+          const note = state.noteById.get(noteId);
+          if (!note) {
+            continue;
+          }
+          const snapshot = cloneNoteSnapshot(note);
+          beforeById.set(noteId, snapshot);
+          beforeNotes.push(snapshot);
+        }
+        if (!beforeNotes.length) {
+          return;
+        }
+
+        state.velocityDrag = {
+          noteIds: normalizedIds,
+          anchorNoteId: anchorId,
+          beforeById: beforeById,
+          beforeNotes: beforeNotes,
+          selectionBefore: Array.from(state.selectedNoteIds),
+          startY: Number(params.startY || 0),
+          startVelocity: clampEditedVelocity(velocityValue(anchorNote)),
+          appliedDelta: 0,
+          active: false,
+          mode: String(params.mode || "bar"),
+        };
+      }
+
+      function applyVelocityDragPreview(drag, point) {
+        if (!drag || !point) {
+          return;
+        }
+        const targetVelocity = velocityFromLaneY(point.y);
+        const delta = targetVelocity - Number(drag.startVelocity || 0);
+        if (drag.appliedDelta === delta && drag.active) {
+          return;
+        }
+
+        drag.appliedDelta = delta;
+        const result = setVelocityForNotes(drag.noteIds, { delta: delta });
+        if (result.changedCount > 0) {
+          drag.active = true;
+        }
+
+        if (drag.noteIds.length === 1) {
+          const note = state.noteById.get(String(drag.noteIds[0]));
+          setStatus("Velocity: " + String(note ? clampEditedVelocity(velocityValue(note)) : targetVelocity), false);
+        } else {
+          const prefix = delta >= 0 ? "+" : "";
+          setStatus(
+            "Adjusted velocity for " + String(drag.noteIds.length) + " note(s): " + prefix + String(delta),
+            false
+          );
+        }
+      }
+
+      function finalizeVelocityDrag(drag) {
+        if (!drag) {
+          return;
+        }
+
+        const changedBefore = [];
+        const changedAfter = [];
+        for (const noteId of drag.noteIds) {
+          const before = drag.beforeById.get(String(noteId));
+          const note = state.noteById.get(String(noteId));
+          if (!before || !note) {
+            continue;
+          }
+          const beforeVelocity = clampEditedVelocity(velocityValue(before));
+          const afterVelocity = clampEditedVelocity(velocityValue(note));
+          if (beforeVelocity !== afterVelocity) {
+            changedBefore.push(cloneNoteSnapshot(before));
+            changedAfter.push(cloneNoteSnapshot(note));
+          }
+        }
+
+        if (!changedAfter.length) {
+          return;
+        }
+
+        pushHistoryTransaction({
+          label: drag.mode === "group" ? "velocity-group-edit" : "velocity-edit",
+          beforeNotes: changedBefore,
+          afterNotes: changedAfter,
+          selectionBefore: Array.isArray(drag.selectionBefore) ? drag.selectionBefore.slice() : [],
+          selectionAfter: drag.noteIds.slice(),
+        });
+
+        sortNotes();
+        rebuildTrackSources();
+        rebuildNoteLookup();
+        setSelectionFromList(drag.noteIds.slice());
+        updateTargetTrackDropdown();
+        renderTrackPanel();
+        redraw();
+        updateEditorActionButtons();
+
+        if (drag.noteIds.length === 1) {
+          setStatus("Changed velocity for 1 note.", false);
+        } else {
+          setStatus("Changed velocity for " + String(drag.noteIds.length) + " notes.", false);
+        }
+      }
+
+      function copySelectedNotes() {
+        const selectedNotes = getSelectedNotes();
+        if (!selectedNotes.length) {
+          setStatus("No notes selected to copy.", false);
+          return;
+        }
+
+        let regionStart = null;
+        let regionEnd = null;
+        if (state.selectionRegion && Number.isFinite(Number(state.selectionRegion.startTick)) && Number.isFinite(Number(state.selectionRegion.endTick))) {
+          regionStart = Math.max(0, Math.round(Number(state.selectionRegion.startTick)));
+          regionEnd = Math.max(regionStart + 1, Math.round(Number(state.selectionRegion.endTick)));
+        } else {
+          regionStart = Math.min.apply(null, selectedNotes.map(function (note) {
+            return Math.round(Number(note.start_tick || 0));
+          }));
+          regionEnd = Math.max.apply(null, selectedNotes.map(function (note) {
+            return Math.round(Number(note.end_tick || note.start_tick || 0));
+          }));
+          regionEnd = Math.max(regionStart + 1, regionEnd);
+        }
+
+        const clipboardNotes = selectedNotes.map(function (note) {
+          const snapshot = cloneNoteSnapshot(note);
+          return {
+            sourceNoteId: String(snapshot.note_id),
+            payload: snapshot,
+            offsetStartTicks: Math.round(Number(snapshot.start_tick || 0)) - regionStart,
+            offsetEndTicks: Math.round(Number(snapshot.end_tick || snapshot.start_tick || 0)) - regionStart,
+            durationTicks: Math.max(0, Math.round(Number(snapshot.duration_ticks || 0))),
+          };
+        });
+
+        state.clipboard = {
+          notes: clipboardNotes,
+          regionStartTick: regionStart,
+          regionEndTick: regionEnd,
+          regionDurationTicks: Math.max(1, regionEnd - regionStart),
+        };
+
+        if (!Number.isFinite(Number(state.pasteCursorTick))) {
+          setPasteCursorTick(regionEnd, { snap: true });
+        }
+
+        updateEditorActionButtons();
+        redraw();
+        setStatus(
+          "Copied " + String(clipboardNotes.length) + " note(s), region "
+            + String(state.clipboard.regionDurationTicks) + " ticks.",
+          false
+        );
+      }
+
+      function pasteCopiedNotes() {
+        if (!state.clipboard || !Array.isArray(state.clipboard.notes) || !state.clipboard.notes.length) {
+          setStatus("Clipboard is empty.", false);
+          return;
+        }
+
+        const clipboard = state.clipboard;
+        const durationTicks = Math.max(1, Math.round(Number(clipboard.regionDurationTicks || 1)));
+        const requestedCursor = Number.isFinite(Number(state.pasteCursorTick))
+          ? Number(state.pasteCursorTick)
+          : Math.round(Number(clipboard.regionEndTick || 0));
+        const baseTick = isSnapEnabled() ? Math.max(0, snapAbsoluteTick(requestedCursor)) : Math.max(0, Math.round(requestedCursor));
+
+        const selectionBefore = Array.from(state.selectedNoteIds);
+        const pastedSnapshots = [];
+        const pastedIds = [];
+        let fallbackTrackCount = 0;
+
+        for (const item of clipboard.notes) {
+          const sourcePayload = cloneNoteSnapshot(item.payload || {});
+          const note = cloneNoteSnapshot(sourcePayload);
+          note.note_id = generateUniquePastedNoteId();
+
+          const offsetStart = Math.round(Number(item.offsetStartTicks || 0));
+          const offsetEnd = Math.round(Number(item.offsetEndTicks || 0));
+          const duration = Math.max(0, Math.round(Number(item.durationTicks || (offsetEnd - offsetStart))));
+
+          note.start_tick = Math.max(0, Math.round(baseTick + offsetStart));
+          note.end_tick = Math.max(note.start_tick, Math.round(baseTick + offsetEnd));
+          if (note.end_tick <= note.start_tick) {
+            note.end_tick = note.start_tick + Math.max(1, duration);
+          }
+          note.duration_ticks = Math.max(0, note.end_tick - note.start_tick);
+
+          const existingTrack = getTrackByIndex(Number(note.editable_track_index || 0));
+          if (!existingTrack) {
+            const fallbackTrack = getTrackByIndex(Number(targetTrackEl.value || 0)) || (session.tracks.length ? session.tracks[0] : null);
+            if (fallbackTrack) {
+              note.editable_track_index = Number(fallbackTrack.editable_track_index);
+              note.editable_track_name = String(fallbackTrack.name || "Track");
+              fallbackTrackCount += 1;
+            }
+          }
+
+          note.velocity = clampEditedVelocity(velocityValue(note));
+          syncNoteTimingFromTicks(note);
+          session.notes.push(note);
+          pastedSnapshots.push(cloneNoteSnapshot(note));
+          pastedIds.push(String(note.note_id));
+        }
+
+        if (!pastedSnapshots.length) {
+          setStatus("Clipboard is empty.", false);
+          return;
+        }
+
+        pushHistoryTransaction({
+          label: "paste-notes",
+          beforeNotes: [],
+          afterNotes: pastedSnapshots,
+          selectionBefore: selectionBefore,
+          selectionAfter: pastedIds.slice(),
+        });
+
+        sortNotes();
+        rebuildTrackSources();
+        rebuildNoteLookup();
+        setSelectionFromList(pastedIds.slice());
+        updateTargetTrackDropdown();
+        renderTrackPanel();
+        setPasteCursorTick(baseTick + durationTicks, { snap: true });
+        redraw();
+        updateEditorActionButtons();
+
+        if (fallbackTrackCount > 0) {
+          setStatus("Pasted " + String(pastedSnapshots.length) + " note(s). " + String(fallbackTrackCount) + " note(s) used fallback track.", false);
+        } else {
+          setStatus("Pasted " + String(pastedSnapshots.length) + " note(s).", false);
+        }
       }
 
       function drawDrawPreview() {
@@ -2440,13 +3025,63 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
             return;
           }
           const additive = Boolean(event.ctrlKey || event.metaKey);
+          const hitGroup = hitTestVelocityGroupHandle(point.x, point.y);
+          if (hitGroup && hitGroup.noteIds && hitGroup.noteIds.length) {
+            const selectionBefore = Array.from(state.selectedNoteIds);
+            if (additive) {
+              const merged = Array.from(new Set(selectionBefore.concat(hitGroup.noteIds)));
+              setSelectionFromList(merged);
+            } else {
+              setSelectionFromList(hitGroup.noteIds.slice());
+            }
+            const selectionAfter = Array.from(state.selectedNoteIds);
+            startVelocityDrag({
+              mode: "group",
+              noteIds: selectionAfter,
+              anchorNoteId: String(hitGroup.noteIds[0]),
+              startY: point.y,
+            });
+            redraw();
+            updateEditorActionButtons();
+            return;
+          }
+
           const hitVelocityBar = hitTestVelocityBar(point.x, point.y);
           if (hitVelocityBar) {
-            selectNoteById(String(hitVelocityBar.note.note_id), additive);
+            const noteId = String(hitVelocityBar.note.note_id);
+            const wasSelected = state.selectedNoteIds.has(noteId);
+            selectNoteById(noteId, additive);
+
+            let dragNoteIds = [];
+            if (additive && wasSelected) {
+              dragNoteIds = [noteId];
+            } else {
+              const selectedInGroup = getSelectedNotes().filter(function (note) {
+                return velocityGroupKeyForNote(note) === velocityGroupKeyForNote(hitVelocityBar.note);
+              });
+              if (selectedInGroup.length >= 2) {
+                dragNoteIds = selectedInGroup.map(function (note) {
+                  return String(note.note_id);
+                });
+              } else if (state.selectedNoteIds.size >= 2 && state.selectedNoteIds.has(noteId)) {
+                dragNoteIds = Array.from(state.selectedNoteIds);
+              } else {
+                dragNoteIds = [noteId];
+              }
+            }
+
+            startVelocityDrag({
+              mode: dragNoteIds.length >= 2 ? "group" : "bar",
+              noteIds: dragNoteIds,
+              anchorNoteId: noteId,
+              startY: point.y,
+            });
             redraw();
+            updateEditorActionButtons();
           } else if (!additive) {
             clearSelection();
             redraw();
+            updateEditorActionButtons();
           }
           return;
         }
@@ -2516,6 +3151,21 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           return;
         }
 
+        if (state.velocityDrag) {
+          const drag = state.velocityDrag;
+          const anchorNote = state.noteById.get(String(drag.anchorNoteId));
+          const anchorX = anchorNote ? xForTick(Number(anchorNote.start_tick || 0)) : point.x;
+          const dx = Math.abs(point.x - anchorX);
+          const dy = Math.abs(point.y - drag.startY);
+          if (!drag.active && (dx >= DRAG_THRESHOLD_PX || dy >= DRAG_THRESHOLD_PX)) {
+            drag.active = true;
+          }
+          applyVelocityDragPreview(drag, point);
+          redraw();
+          updateCanvasCursorForPoint(point);
+          return;
+        }
+
         if (state.drawDrag) {
           const drag = state.drawDrag;
           drag.currentX = point.x;
@@ -2570,6 +3220,15 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           return;
         }
 
+        if (state.velocityDrag) {
+          const drag = state.velocityDrag;
+          finalizeVelocityDrag(drag);
+          state.velocityDrag = null;
+          redraw();
+          updateCanvasCursorForPoint(point);
+          return;
+        }
+
         if (state.drawDrag) {
           const drag = state.drawDrag;
           finalizeDrawDrag(drag);
@@ -2590,6 +3249,12 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
             y: Math.min(state.dragSelect.startY, state.dragSelect.currentY),
             w: Math.abs(state.dragSelect.currentX - state.dragSelect.startX),
             h: Math.abs(state.dragSelect.currentY - state.dragSelect.startY),
+          };
+          const startTick = Math.max(0, snapAbsoluteTick(tickFromCanvasX(rect.x)));
+          const endTick = Math.max(startTick + 1, snapAbsoluteTick(tickFromCanvasX(rect.x + rect.w)));
+          state.selectionRegion = {
+            startTick: Math.min(startTick, endTick),
+            endTick: Math.max(startTick, endTick),
           };
           selectNotesInRect(rect, state.dragSelect.additive);
         } else if (state.dragSelect.hitNoteId) {
@@ -2976,6 +3641,8 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         document.getElementById("merge-notes-btn").addEventListener("click", mergeSelectedNotes);
         document.getElementById("delete-notes-btn").addEventListener("click", deleteSelectedNotes);
         document.getElementById("mute-notes-btn").addEventListener("click", toggleMuteSelectedNotes);
+        copyNotesButton.addEventListener("click", copySelectedNotes);
+        pasteNotesButton.addEventListener("click", pasteCopiedNotes);
         undoButton.addEventListener("click", undoHistory);
         redoButton.addEventListener("click", redoHistory);
         document.getElementById("add-track-btn").addEventListener("click", addTrack);
@@ -3064,7 +3731,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         window.addEventListener("mousemove", handleCanvasMouseMove);
         window.addEventListener("mouseup", handleCanvasMouseUp);
         canvas.addEventListener("mouseleave", function () {
-          if (state.panDrag || state.noteEditDrag || state.drawDrag || state.dragSelect) {
+          if (state.panDrag || state.noteEditDrag || state.velocityDrag || state.drawDrag || state.dragSelect) {
             return;
           }
           updateCanvasCursorForPoint(null);
@@ -3089,10 +3756,6 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         bindToolbarActions();
         bindCanvasActions();
 
-        // Future milestone note:
-        // - velocity editing should drag bars up/down in this lane
-        // - copy/paste selected notes should be added as a separate note-edit transaction feature
-
         window.addEventListener("keydown", function (event) {
           if (isEditableTypingTarget(event.target)) {
             return;
@@ -3110,6 +3773,18 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           if (isModifierDown && (key === "y" || (key === "z" && event.shiftKey))) {
             event.preventDefault();
             redoHistory();
+            return;
+          }
+
+          if (isModifierDown && key === "c") {
+            event.preventDefault();
+            copySelectedNotes();
+            return;
+          }
+
+          if (isModifierDown && key === "v") {
+            event.preventDefault();
+            pasteCopiedNotes();
             return;
           }
 
@@ -3155,8 +3830,29 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           getVelocityLaneVisible: function () { return state.velocityLaneVisible; },
           selectedVelocitySummary: selectedVelocitySummary,
           getVelocityBars: getVelocityBars,
+          getVelocityGroups: getVelocityGroups,
           velocityBarForNoteId: velocityBarForNoteId,
           hitTestVelocityBar: hitTestVelocityBarForApi,
+          setVelocityForNoteIds: function (noteIds, options) {
+            const result = setVelocityForNotes(noteIds || [], options || {});
+            sortNotes();
+            rebuildTrackSources();
+            rebuildNoteLookup();
+            redraw();
+            updateEditorActionButtons();
+            return {
+              note_ids: result.noteIds.slice(),
+              changed_count: result.changedCount,
+            };
+          },
+          copySelectedNotes: copySelectedNotes,
+          pasteCopiedNotes: pasteCopiedNotes,
+          getClipboardSummary: getClipboardSummary,
+          setPasteCursorTick: function (tick) {
+            setPasteCursorTick(tick, { snap: true });
+            redraw();
+          },
+          getPasteCursorTick: getPasteCursorTick,
           moveSelectedToTrack: moveSelectedToTrack,
           mergeSelectedNotes: mergeSelectedNotes,
           deleteSelectedNotes: deleteSelectedNotes,
