@@ -282,6 +282,19 @@ def test_generate_piano_roll_preview_contains_editor_toolbar_actions(tmp_path: P
     assert 'id="paste-notes-btn"' in html
     assert 'id="loop-notes-btn"' in html
     assert 'id="loop-repeats"' in html
+    assert 'id="midi-out-enable-btn"' in html
+    assert 'id="midi-out-port"' in html
+    assert 'id="audition-selected-btn"' in html
+    assert 'id="play-region-btn"' in html
+    assert 'id="play-all-btn"' in html
+    assert 'id="stop-midi-btn"' in html
+    assert 'id="panic-midi-btn"' in html
+    assert 'id="audition-on-click"' in html
+    assert "MIDI Out:" in html
+    assert "Play Selected" in html
+    assert "Play Region" in html
+    assert "Play All" in html
+    assert "Panic" in html
     assert "Repeats:" in html
     assert 'id="save-session-btn"' not in html
     assert 'id="download-session-btn"' not in html
@@ -351,6 +364,25 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function panViewportBySemitones(deltaRows)" in html
     assert "function getViewportState()" in html
     assert "function getClipboardSummary()" in html
+    assert "function clampMidiChannel(value)" in html
+    assert "function clampMidiVelocityOn(value)" in html
+    assert "function requestMidiOutAccess()" in html
+    assert "function getMidiOutputPorts()" in html
+    assert "function enableMidiOut()" in html
+    assert "function selectMidiOutputPort(portId)" in html
+    assert "function sendMidiNoteOn(note)" in html
+    assert "function sendMidiNoteOff(note)" in html
+    assert "function refreshMidiOutPortList()" in html
+    assert "function buildPlaybackEventsForNotes(notes, anchorTick)" in html
+    assert "function buildPlaybackEventsForRegion()" in html
+    assert "function buildPlaybackEventsForAll()" in html
+    assert "function playPlaybackEvents(events, statusLabel)" in html
+    assert "function playSelectedNotes()" in html
+    assert "function panicMidiOut()" in html
+    assert "function stopMidiPlayback(options)" in html
+    assert "function getMidiOutState()" in html
+    assert "function setMidiOutEnabledForTest(enabled)" in html
+    assert "function setSelectedMidiOutputForTest(outputId)" in html
     assert "function normalizeRepeatCount(value, options)" in html
     assert "function getLoopRepeatCount()" in html
     assert "function setLoopRepeatCount(value, options)" in html
@@ -386,6 +418,12 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function renderAll" in html
     assert "function buildTimelineMarkers" in html
     assert "function drawTimelineRuler" in html
+    assert "navigator.requestMIDIAccess({ sysex: false })" in script
+    assert "default basic app loopback" in script.lower()
+    assert "Web MIDI not available. Use Chrome or Edge." in script
+    assert "No MIDI outputs found. Enable Default Basic App Loopback or another virtual MIDI output." in script
+    assert "sendMidiMessage([0xB0 | channel, 123, 0]);" in script
+    assert "sendMidiMessage([0xB0 | channel, 120, 0]);" in script
     assert "function setErrorStatus" in html
     assert "console.error(\"MIDI split editor error:\", details);" in script
 
@@ -416,6 +454,24 @@ def test_generate_piano_roll_preview_exposes_snap_controls_in_test_api(tmp_path:
     assert "getSelectedRegionForLoop: getSelectedRegionForLoop" in script
     assert "getLoopRepeatCount: getLoopRepeatCount" in script
     assert "setLoopRepeatCount: function (value)" in script
+    assert "getMidiOutState: getMidiOutState" in script
+    assert "setMidiOutEnabledForTest: setMidiOutEnabledForTest" in script
+    assert "setSelectedMidiOutputForTest: setSelectedMidiOutputForTest" in script
+    assert "getMidiOutputPorts: getMidiOutputPorts" in script
+    assert "enableMidiOut: enableMidiOut" in script
+    assert "selectMidiOutputPort: selectMidiOutputPort" in script
+    assert "sendMidiNoteOn: sendMidiNoteOn" in script
+    assert "sendMidiNoteOff: sendMidiNoteOff" in script
+    assert "buildPlaybackEventsForNotes: buildPlaybackEventsForNotes" in script
+    assert "buildPlaybackEventsForRegion: buildPlaybackEventsForRegion" in script
+    assert "buildPlaybackEventsForAll: buildPlaybackEventsForAll" in script
+    assert "playPlaybackEvents: playPlaybackEvents" in script
+    assert "playSelectedNotes: playSelectedNotes" in script
+    assert "playSelectedRegion: playSelectedRegion" in script
+    assert "playAllNotes: playAllNotes" in script
+    assert "auditionNote: auditionNote" in script
+    assert "panicMidiOut: panicMidiOut" in script
+    assert "stopMidiPlayback: stopMidiPlayback" in script
     assert "setPasteCursorTick: function (tick)" in script
     assert "getPasteCursorTick: getPasteCursorTick" in script
     assert "getSelectedNoteIds: function ()" in script
@@ -426,6 +482,47 @@ def test_generate_piano_roll_preview_exposes_snap_controls_in_test_api(tmp_path:
     assert "getViewportState: getViewportState" in script
     assert "moveSelectedNotesByKeyboard: moveSelectedNotesByKeyboard" in script
     assert "adjustSelectedVelocityByKeyboard: adjustSelectedVelocityByKeyboard" in script
+
+
+def test_generate_piano_roll_preview_web_midi_playback_builder_behavior_markers(tmp_path: Path) -> None:
+    session = _create_session(tmp_path)
+    output_html = tmp_path / "split_editor.html"
+
+    generate_piano_roll_preview(session, output_html)
+
+    script = _extract_editor_script(output_html.read_text(encoding="utf-8"))
+    assert "return note && note.muted !== true;" in script
+    assert "const resolvedAnchorTick = Number.isFinite(Number(anchorTick))" in script
+    assert "const startMs = Math.max(0, Math.round((startSec - anchorSec) * 1000));" in script
+    assert "const allNotes = session.notes.filter(function (note) {" in script
+    assert "const earliestTick = Math.min.apply(null, allNotes.map(function (note) {" in script
+    assert "velocity: clampMidiVelocityOn(velocityValue(note))" in script
+    assert "channel: clampMidiChannel(note.channel)" in script
+    assert "setStatus(\"No notes selected to play.\", false);" in script
+    assert "setStatus(\"No region or notes selected to play.\", false);" in script
+    assert "schedulePlaybackTimer(function () {" in script
+    assert "sendMidiNoteOn(event);" in script
+    assert "sendMidiNoteOff(event);" in script
+
+
+def test_generate_piano_roll_preview_web_midi_stop_and_panic_behavior_markers(tmp_path: Path) -> None:
+    session = _create_session(tmp_path)
+    output_html = tmp_path / "split_editor.html"
+
+    generate_piano_roll_preview(session, output_html)
+
+    script = _extract_editor_script(output_html.read_text(encoding="utf-8"))
+    assert "for (const timerId of state.midiPlaybackTimerIds)" in script
+    assert "state.midiPlaybackTimerIds = [];" in script
+    assert "state.midiPlaybackRunning = false;" in script
+    assert "for (let channel = 0; channel < 16; channel += 1) {" in script
+    assert "for (let pitch = 0; pitch < 128; pitch += 1) {" in script
+    assert "sendMidiNoteOff({ channel: channel, pitch: pitch });" in script
+    assert "sendMidiMessage([0xB0 | channel, 123, 0]);" in script
+    assert "sendMidiMessage([0xB0 | channel, 120, 0]);" in script
+    assert "state.midiActiveNotes.clear();" in script
+    assert "setStatus(\"Playback stopped.\", false);" in script
+    assert "setStatus(\"MIDI panic sent.\", false);" in script
 
 
 def test_generate_piano_roll_preview_velocity_bar_geometry_and_hit_zone_logic(tmp_path: Path) -> None:

@@ -159,6 +159,19 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
     <input id="loop-repeats" type="number" min="1" max="64" step="1" value="2" />
 
     <span>|</span>
+    <span>MIDI Out:</span>
+    <button id="midi-out-enable-btn" type="button">Enable</button>
+    <label for="midi-out-port">Port:</label>
+    <select id="midi-out-port"></select>
+    <button id="audition-selected-btn" type="button" disabled>Play Selected</button>
+    <button id="play-region-btn" type="button" disabled>Play Region</button>
+    <button id="play-all-btn" type="button" disabled>Play All</button>
+    <button id="stop-midi-btn" type="button" disabled>Stop</button>
+    <button id="panic-midi-btn" type="button" disabled>Panic</button>
+    <label for="audition-on-click">Audition on click</label>
+    <input id="audition-on-click" type="checkbox" checked />
+
+    <span>|</span>
     <button id="tool-select-btn" type="button">Select</button>
     <button id="tool-draw-btn" type="button">Draw</button>
     <button id="tool-zoom-btn" type="button">Zoom</button>
@@ -315,6 +328,14 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       const pasteNotesButton = document.getElementById("paste-notes-btn");
       const loopNotesButton = document.getElementById("loop-notes-btn");
       const loopRepeatsEl = document.getElementById("loop-repeats");
+      const midiOutEnableButton = document.getElementById("midi-out-enable-btn");
+      const midiOutPortEl = document.getElementById("midi-out-port");
+      const auditionSelectedButton = document.getElementById("audition-selected-btn");
+      const playRegionButton = document.getElementById("play-region-btn");
+      const playAllButton = document.getElementById("play-all-btn");
+      const stopMidiButton = document.getElementById("stop-midi-btn");
+      const panicMidiButton = document.getElementById("panic-midi-btn");
+      const auditionOnClickEl = document.getElementById("audition-on-click");
       const snapEnabledEl = document.getElementById("snap-enabled");
       const snapGridEl = document.getElementById("snap-grid");
       const velocityLaneVisibleEl = document.getElementById("velocity-lane-visible");
@@ -351,6 +372,14 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         pasteCursorTick: null,
         pasteIdCounter: 1,
         loopIdCounter: 1,
+        midiAccess: null,
+        midiEnabled: false,
+        midiOutputId: null,
+        midiOutputTestOverride: null,
+        midiPlaybackTimerIds: [],
+        midiPlaybackRunning: false,
+        midiOutStateChangeHandler: null,
+        midiActiveNotes: new Set(),
         keyboardFocusMode: KEYBOARD_FOCUS_VIEWPORT,
         focusedVelocityNoteId: null,
         focusedVelocityGroupNoteIds: null,
@@ -784,6 +813,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         updateDeleteButtonState();
         updateMuteButtonState();
         updateClipboardButtons();
+        updateMidiOutControls();
       }
 
       function pushHistoryTransaction(transaction) {
@@ -1491,6 +1521,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       }
 
       function setSessionData(newSession) {
+        stopMidiPlayback({ sendPanic: true });
         session = normalizeSession(newSession);
         sortTracks();
         sortNotes();
@@ -2444,6 +2475,496 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           region_end_tick: Number(state.clipboard.regionEndTick),
           region_duration_ticks: Number(state.clipboard.regionDurationTicks),
         };
+      }
+
+      function clampMidiChannel(value) {
+        return Math.max(0, Math.min(15, Math.round(Number(value || 0))));
+      }
+
+      function clampMidiVelocityOn(value) {
+        return Math.max(1, Math.min(127, Math.round(Number(value || 0))));
+      }
+
+      function midiOutputStorageKey() {
+        return "hermesMidiOutPortId";
+      }
+
+      function midiOutputDisplayName(output) {
+        if (!output) {
+          return "";
+        }
+        return String(output.name || output.manufacturer || output.id || "").trim();
+      }
+
+      function isDefaultBasicAppLoopbackPort(output) {
+        const label = midiOutputDisplayName(output).toLowerCase();
+        return label.indexOf("default basic app loopback") >= 0;
+      }
+
+      function restoreStoredMidiOutputId() {
+        try {
+          const stored = window.localStorage ? window.localStorage.getItem(midiOutputStorageKey()) : null;
+          if (stored && stored.trim()) {
+            state.midiOutputId = stored.trim();
+          }
+        } catch (_error) {
+          // Ignore localStorage access failures in restricted browser contexts.
+        }
+      }
+
+      function persistMidiOutputId(outputId) {
+        try {
+          if (window.localStorage) {
+            if (outputId) {
+              window.localStorage.setItem(midiOutputStorageKey(), String(outputId));
+            } else {
+              window.localStorage.removeItem(midiOutputStorageKey());
+            }
+          }
+        } catch (_error) {
+          // Ignore localStorage persistence failures.
+        }
+      }
+
+      function webMidiAvailable() {
+        return typeof navigator !== "undefined" && typeof navigator.requestMIDIAccess === "function";
+      }
+
+      function midiOutputCount() {
+        if (!state.midiAccess || !state.midiAccess.outputs) {
+          return 0;
+        }
+        return Array.from(state.midiAccess.outputs.values()).length;
+      }
+
+      function resolveSelectedMidiOutput() {
+        if (state.midiOutputTestOverride && typeof state.midiOutputTestOverride.send === "function") {
+          return state.midiOutputTestOverride;
+        }
+        if (!state.midiAccess || !state.midiAccess.outputs || !state.midiOutputId) {
+          return null;
+        }
+        return state.midiAccess.outputs.get(String(state.midiOutputId)) || null;
+      }
+
+      function getMidiOutputPorts() {
+        if (!state.midiAccess || !state.midiAccess.outputs) {
+          return [];
+        }
+        return Array.from(state.midiAccess.outputs.values()).map(function (output) {
+          return {
+            id: String(output.id),
+            name: midiOutputDisplayName(output),
+            preferred_loopback: isDefaultBasicAppLoopbackPort(output),
+          };
+        });
+      }
+
+      function getMidiOutState() {
+        return {
+          web_midi_available: webMidiAvailable(),
+          enabled: Boolean(state.midiEnabled),
+          output_count: midiOutputCount(),
+          selected_output_id: state.midiOutputId,
+          playback_running: Boolean(state.midiPlaybackRunning),
+          audition_on_click: Boolean(auditionOnClickEl && auditionOnClickEl.checked),
+        };
+      }
+
+      function updateMidiOutControls() {
+        const output = resolveSelectedMidiOutput();
+        const canSend = Boolean(state.midiEnabled && output);
+        if (midiOutEnableButton) {
+          midiOutEnableButton.textContent = state.midiEnabled ? "Enabled" : "Enable";
+        }
+        if (midiOutPortEl) {
+          midiOutPortEl.disabled = !state.midiEnabled;
+        }
+        if (auditionSelectedButton) {
+          auditionSelectedButton.disabled = !canSend;
+        }
+        if (playRegionButton) {
+          playRegionButton.disabled = !canSend;
+        }
+        if (playAllButton) {
+          playAllButton.disabled = !canSend;
+        }
+        if (stopMidiButton) {
+          stopMidiButton.disabled = !state.midiEnabled;
+        }
+        if (panicMidiButton) {
+          panicMidiButton.disabled = !state.midiEnabled;
+        }
+      }
+
+      function refreshMidiOutPortList() {
+        if (!midiOutPortEl) {
+          return;
+        }
+        midiOutPortEl.innerHTML = "";
+
+        if (!state.midiEnabled || !state.midiAccess || !state.midiAccess.outputs) {
+          updateMidiOutControls();
+          return;
+        }
+
+        const outputs = Array.from(state.midiAccess.outputs.values());
+        if (!outputs.length) {
+          const option = document.createElement("option");
+          option.value = "";
+          option.textContent = "No MIDI outputs";
+          midiOutPortEl.appendChild(option);
+          state.midiOutputId = null;
+          updateMidiOutControls();
+          setStatus("No MIDI outputs found. Enable Default Basic App Loopback or another virtual MIDI output.", false);
+          return;
+        }
+
+        let selectedId = state.midiOutputId;
+        const storedId = selectedId;
+        if (!selectedId) {
+          const defaultLoopback = outputs.find(isDefaultBasicAppLoopbackPort);
+          selectedId = defaultLoopback ? defaultLoopback.id : outputs[0].id;
+        }
+        if (!outputs.some(function (output) { return String(output.id) === String(selectedId); })) {
+          const defaultLoopback = outputs.find(isDefaultBasicAppLoopbackPort);
+          selectedId = defaultLoopback ? defaultLoopback.id : outputs[0].id;
+        }
+
+        for (const output of outputs) {
+          const option = document.createElement("option");
+          option.value = String(output.id);
+          option.textContent = String(output.name || output.manufacturer || output.id);
+          midiOutPortEl.appendChild(option);
+        }
+
+        state.midiOutputId = String(selectedId);
+        midiOutPortEl.value = String(selectedId);
+        persistMidiOutputId(state.midiOutputId);
+        updateMidiOutControls();
+        if (!storedId && state.midiOutputId) {
+          const selectedOutput = resolveSelectedMidiOutput();
+          if (selectedOutput) {
+            setStatus("Selected MIDI output: " + midiOutputDisplayName(selectedOutput), false);
+          }
+        }
+      }
+
+      async function requestMidiOutAccess() {
+        if (!webMidiAvailable()) {
+          setStatus("Web MIDI not available. Use Chrome or Edge.", true);
+          return false;
+        }
+
+        try {
+          const access = await navigator.requestMIDIAccess({ sysex: false });
+          if (state.midiAccess && state.midiOutStateChangeHandler && typeof state.midiAccess.removeEventListener === "function") {
+            state.midiAccess.removeEventListener("statechange", state.midiOutStateChangeHandler);
+          }
+          state.midiAccess = access;
+          state.midiEnabled = true;
+          state.midiOutStateChangeHandler = function () {
+            refreshMidiOutPortList();
+          };
+          if (state.midiAccess && typeof state.midiAccess.addEventListener === "function") {
+            state.midiAccess.addEventListener("statechange", state.midiOutStateChangeHandler);
+          }
+          refreshMidiOutPortList();
+          if (midiOutputCount() > 0) {
+            setStatus("MIDI Out enabled.", false);
+          }
+          updateMidiOutControls();
+          return true;
+        } catch (error) {
+          state.midiEnabled = false;
+          state.midiAccess = null;
+          state.midiOutStateChangeHandler = null;
+          updateMidiOutControls();
+          setErrorStatus("MIDI permission denied.", error);
+          return false;
+        }
+      }
+
+      async function enableMidiOut() {
+        return requestMidiOutAccess();
+      }
+
+      function selectMidiOutputPort(portId) {
+        state.midiOutputId = portId === null || portId === undefined ? null : String(portId);
+        persistMidiOutputId(state.midiOutputId);
+        if (midiOutPortEl && state.midiOutputId) {
+          midiOutPortEl.value = state.midiOutputId;
+        }
+        updateMidiOutControls();
+        return state.midiOutputId;
+      }
+
+      function sendMidiMessage(message) {
+        const output = resolveSelectedMidiOutput();
+        if (!output || typeof output.send !== "function") {
+          return false;
+        }
+        try {
+          output.send(message);
+          return true;
+        } catch (error) {
+          setErrorStatus("Failed to send MIDI message.", error);
+          return false;
+        }
+      }
+
+      function midiActiveNoteKey(channel, pitch) {
+        return String(clampMidiChannel(channel)) + ":" + String(clampPitchMidi(pitch));
+      }
+
+      function sendMidiNoteOn(note) {
+        const channel = clampMidiChannel(note && note.channel);
+        const pitch = clampPitchMidi(note && note.pitch);
+        const velocity = clampMidiVelocityOn(note && note.velocity);
+        const sent = sendMidiMessage([0x90 | channel, pitch, velocity]);
+        if (sent) {
+          state.midiActiveNotes.add(midiActiveNoteKey(channel, pitch));
+        }
+        return sent;
+      }
+
+      function sendMidiNoteOff(note) {
+        const channel = clampMidiChannel(note && note.channel);
+        const pitch = clampPitchMidi(note && note.pitch);
+        const sent = sendMidiMessage([0x80 | channel, pitch, 0]);
+        if (sent) {
+          state.midiActiveNotes.delete(midiActiveNoteKey(channel, pitch));
+        }
+        return sent;
+      }
+
+      function panicMidiOut() {
+        if (!state.midiEnabled) {
+          return false;
+        }
+        for (let channel = 0; channel < 16; channel += 1) {
+          for (let pitch = 0; pitch < 128; pitch += 1) {
+            sendMidiNoteOff({ channel: channel, pitch: pitch });
+          }
+          sendMidiMessage([0xB0 | channel, 123, 0]);
+          sendMidiMessage([0xB0 | channel, 120, 0]);
+        }
+        state.midiActiveNotes.clear();
+        return true;
+      }
+
+      function stopMidiPlayback(options) {
+        const opts = options && typeof options === "object" ? options : {};
+        for (const timerId of state.midiPlaybackTimerIds) {
+          clearTimeout(timerId);
+        }
+        state.midiPlaybackTimerIds = [];
+        state.midiPlaybackRunning = false;
+        if (opts.sendPanic !== false) {
+          panicMidiOut();
+        }
+        updateMidiOutControls();
+      }
+
+      function schedulePlaybackTimer(callback, delayMs) {
+        const timerId = window.setTimeout(callback, Math.max(0, Math.round(Number(delayMs || 0))));
+        state.midiPlaybackTimerIds.push(timerId);
+        return timerId;
+      }
+
+      function buildPlaybackEventsForNotes(notes, anchorTick) {
+        const sourceNotes = Array.isArray(notes) ? notes : [];
+        if (!sourceNotes.length) {
+          return [];
+        }
+
+        const playable = sourceNotes.filter(function (note) {
+          return note && note.muted !== true;
+        });
+        if (!playable.length) {
+          return [];
+        }
+
+        const resolvedAnchorTick = Number.isFinite(Number(anchorTick))
+          ? Math.max(0, Math.round(Number(anchorTick)))
+          : Math.min.apply(null, playable.map(function (note) {
+              return Math.max(0, Math.round(Number(note.start_tick || 0)));
+            }));
+        const anchorSec = tickToSeconds(resolvedAnchorTick);
+
+        const events = playable.map(function (note) {
+          const startTick = Math.max(0, Math.round(Number(note.start_tick || 0)));
+          const endTick = Math.max(startTick, Math.round(Number(note.end_tick || startTick)));
+          const startSec = tickToSeconds(startTick);
+          const endSec = tickToSeconds(endTick);
+          const startMs = Math.max(0, Math.round((startSec - anchorSec) * 1000));
+          const durationMs = Math.max(30, Math.round((endSec - startSec) * 1000));
+
+          return {
+            note_id: String(note.note_id || ""),
+            start_tick: startTick,
+            end_tick: endTick,
+            start_ms: startMs,
+            duration_ms: durationMs,
+            pitch: clampPitchMidi(note.pitch_midi),
+            velocity: clampMidiVelocityOn(velocityValue(note)),
+            channel: clampMidiChannel(note.channel),
+          };
+        });
+
+        events.sort(function (a, b) {
+          if (Number(a.start_ms) !== Number(b.start_ms)) {
+            return Number(a.start_ms) - Number(b.start_ms);
+          }
+          if (Number(a.pitch) !== Number(b.pitch)) {
+            return Number(a.pitch) - Number(b.pitch);
+          }
+          return String(a.note_id).localeCompare(String(b.note_id));
+        });
+        return events;
+      }
+
+      function buildPlaybackEventsForRegion() {
+        if (state.selectionRegion && Number.isFinite(Number(state.selectionRegion.startTick)) && Number.isFinite(Number(state.selectionRegion.endTick))) {
+          const regionStart = Math.max(0, Math.round(Number(state.selectionRegion.startTick)));
+          const regionEnd = Math.max(regionStart + 1, Math.round(Number(state.selectionRegion.endTick)));
+          const regionNotes = session.notes.filter(function (note) {
+            if (note.muted === true) {
+              return false;
+            }
+            const startTick = Math.max(0, Math.round(Number(note.start_tick || 0)));
+            const endTick = Math.max(startTick, Math.round(Number(note.end_tick || startTick)));
+            return startTick < regionEnd && endTick > regionStart;
+          });
+          return buildPlaybackEventsForNotes(regionNotes, regionStart);
+        }
+        return buildPlaybackEventsForNotes(getSelectedNotes());
+      }
+
+      function buildPlaybackEventsForAll() {
+        const allNotes = session.notes.filter(function (note) {
+          return note && note.muted !== true;
+        });
+        if (!allNotes.length) {
+          return [];
+        }
+        const earliestTick = Math.min.apply(null, allNotes.map(function (note) {
+          return Math.max(0, Math.round(Number(note.start_tick || 0)));
+        }));
+        return buildPlaybackEventsForNotes(allNotes, earliestTick);
+      }
+
+      function playPlaybackEvents(events, statusLabel) {
+        const output = resolveSelectedMidiOutput();
+        if (!state.midiEnabled || !output) {
+          setStatus("Enable MIDI Out and select a MIDI output port first.", true);
+          return false;
+        }
+
+        stopMidiPlayback({ sendPanic: true });
+        if (!Array.isArray(events) || !events.length) {
+          setStatus("No playable notes for audition.", false);
+          return false;
+        }
+
+        for (const event of events) {
+          schedulePlaybackTimer(function () {
+            sendMidiNoteOn(event);
+          }, event.start_ms);
+
+          schedulePlaybackTimer(function () {
+            sendMidiNoteOff(event);
+          }, event.start_ms + event.duration_ms);
+        }
+
+        const endMs = Math.max.apply(null, events.map(function (event) {
+          return Number(event.start_ms || 0) + Number(event.duration_ms || 0);
+        }));
+        state.midiPlaybackRunning = true;
+        schedulePlaybackTimer(function () {
+          state.midiPlaybackRunning = false;
+          updateMidiOutControls();
+        }, endMs + 30);
+        updateMidiOutControls();
+        setStatus(String(statusLabel || "Audition started."), false);
+        return true;
+      }
+
+      function playSelectedNotes() {
+        const selected = getSelectedNotes();
+        if (!selected.length) {
+          setStatus("No notes selected to play.", false);
+          return false;
+        }
+        const events = buildPlaybackEventsForNotes(selected);
+        return playPlaybackEvents(events, "Selected playback started.");
+      }
+
+      function playSelectedRegion() {
+        const hasRegion = Boolean(
+          state.selectionRegion
+          && Number.isFinite(Number(state.selectionRegion.startTick))
+          && Number.isFinite(Number(state.selectionRegion.endTick))
+        );
+        if (!hasRegion && getSelectedNotes().length === 0) {
+          setStatus("No region or notes selected to play.", false);
+          return false;
+        }
+        const events = buildPlaybackEventsForRegion();
+        return playPlaybackEvents(events, "Region playback started.");
+      }
+
+      function playAllNotes() {
+        const events = buildPlaybackEventsForAll();
+        return playPlaybackEvents(events, "All notes playback started.");
+      }
+
+      function auditionNote(note) {
+        if (!note || note.muted === true || !state.midiEnabled || !resolveSelectedMidiOutput()) {
+          return false;
+        }
+        const pitch = clampPitchMidi(note.pitch_midi);
+        const velocity = clampMidiVelocityOn(velocityValue(note));
+        const channel = clampMidiChannel(note.channel);
+        sendMidiNoteOn({ pitch: pitch, velocity: velocity, channel: channel });
+        schedulePlaybackTimer(function () {
+          sendMidiNoteOff({ pitch: pitch, channel: channel });
+        }, 250);
+        return true;
+      }
+
+      function setMidiOutEnabledForTest(enabled) {
+        state.midiEnabled = Boolean(enabled);
+        if (!state.midiEnabled) {
+          state.midiOutputTestOverride = null;
+          state.midiOutputId = null;
+        } else {
+          if (!state.midiOutputTestOverride) {
+            state.midiOutputTestOverride = {
+              sentMessages: [],
+              send: function (message) {
+                this.sentMessages.push(Array.from(message || []));
+              },
+            };
+          }
+          state.midiOutputId = "__test__";
+        }
+        updateMidiOutControls();
+        return getMidiOutState();
+      }
+
+      function setSelectedMidiOutputForTest(outputId) {
+        state.midiOutputId = outputId === null || outputId === undefined ? null : String(outputId);
+        if (state.midiOutputId === "__test__" && !state.midiOutputTestOverride) {
+          state.midiOutputTestOverride = {
+            sentMessages: [],
+            send: function (message) {
+              this.sentMessages.push(Array.from(message || []));
+            },
+          };
+        }
+        updateMidiOutControls();
+        return state.midiOutputId;
       }
 
       function normalizeRepeatCount(value, options) {
@@ -3845,6 +4366,9 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         const hit = getNoteBoxAt(point.x, point.y);
         if (hit) {
           setKeyboardFocusMode(KEYBOARD_FOCUS_NOTES);
+          if (auditionOnClickEl && auditionOnClickEl.checked) {
+            auditionNote(hit.note);
+          }
           startNoteEditDrag(hit, point, additive);
           updateCanvasCursorForPoint(point);
           redraw();
@@ -4402,6 +4926,46 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
             setLoopRepeatCount(loopRepeatsEl.value, { notify: true });
           });
         }
+        if (midiOutEnableButton) {
+          midiOutEnableButton.addEventListener("click", function () {
+            enableMidiOut();
+          });
+        }
+        if (midiOutPortEl) {
+          midiOutPortEl.addEventListener("change", function () {
+            selectMidiOutputPort(midiOutPortEl.value ? String(midiOutPortEl.value) : null);
+            if (state.midiOutputId) {
+              setStatus("Selected MIDI output: " + String(midiOutPortEl.options[midiOutPortEl.selectedIndex].text || state.midiOutputId), false);
+            }
+          });
+        }
+        if (auditionSelectedButton) {
+          auditionSelectedButton.addEventListener("click", function () {
+            playSelectedNotes();
+          });
+        }
+        if (playRegionButton) {
+          playRegionButton.addEventListener("click", function () {
+            playSelectedRegion();
+          });
+        }
+        if (playAllButton) {
+          playAllButton.addEventListener("click", function () {
+            playAllNotes();
+          });
+        }
+        if (stopMidiButton) {
+          stopMidiButton.addEventListener("click", function () {
+            stopMidiPlayback({ sendPanic: true });
+            setStatus("Playback stopped.", false);
+          });
+        }
+        if (panicMidiButton) {
+          panicMidiButton.addEventListener("click", function () {
+            panicMidiOut();
+            setStatus("MIDI panic sent.", false);
+          });
+        }
         undoButton.addEventListener("click", undoHistory);
         redoButton.addEventListener("click", redoHistory);
         document.getElementById("add-track-btn").addEventListener("click", addTrack);
@@ -4512,8 +5076,10 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           velocityValuesVisibleEl.checked = false;
         }
         setTool("select");
+        restoreStoredMidiOutputId();
         bindToolbarActions();
         bindCanvasActions();
+        updateMidiOutControls();
 
         window.addEventListener("keydown", function (event) {
           if (isEditableTypingTarget(event.target)) {
@@ -4621,6 +5187,24 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           setLoopRepeatCount: function (value) {
             return setLoopRepeatCount(value, { notify: true });
           },
+          getMidiOutState: getMidiOutState,
+          setMidiOutEnabledForTest: setMidiOutEnabledForTest,
+          setSelectedMidiOutputForTest: setSelectedMidiOutputForTest,
+          getMidiOutputPorts: getMidiOutputPorts,
+          enableMidiOut: enableMidiOut,
+          selectMidiOutputPort: selectMidiOutputPort,
+          sendMidiNoteOn: sendMidiNoteOn,
+          sendMidiNoteOff: sendMidiNoteOff,
+          buildPlaybackEventsForNotes: buildPlaybackEventsForNotes,
+          buildPlaybackEventsForRegion: buildPlaybackEventsForRegion,
+          buildPlaybackEventsForAll: buildPlaybackEventsForAll,
+          playPlaybackEvents: playPlaybackEvents,
+          playSelectedNotes: playSelectedNotes,
+          playSelectedRegion: playSelectedRegion,
+          playAllNotes: playAllNotes,
+          auditionNote: auditionNote,
+          panicMidiOut: panicMidiOut,
+          stopMidiPlayback: stopMidiPlayback,
           setPasteCursorTick: function (tick) {
             setPasteCursorTick(tick, { snap: true });
             redraw();
