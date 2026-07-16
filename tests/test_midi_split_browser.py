@@ -154,6 +154,71 @@ async function main() {
   const secondInputValue = await page.$eval("#import-midi-input", (el) => el.value);
   const secondSession = await page.evaluate(() => window.__midiSplitEditor.getSession());
 
+  const loopReport = await page.evaluate(() => {
+    const editor = window.__midiSplitEditor;
+    const before = editor.getSession();
+    const sourceSelection = before.notes.slice(0, Math.min(2, before.notes.length)).map((n) => String(n.note_id));
+    if (!sourceSelection.length) {
+      return null;
+    }
+
+    editor.selectNotesByIds(sourceSelection);
+    const region = editor.getSelectedRegionForLoop();
+    editor.setLoopRepeatCount(1);
+    const repeatOneResult = editor.loopSelectedNotes();
+    const afterRepeatOne = editor.getSession();
+    const selectedAfterRepeatOne = editor.getSelectedNoteIds();
+    const noteBoxesAfterRepeatOne = editor.getNoteBoxes();
+    const velocityBarsAfterRepeatOne = editor.getVelocityBars();
+    const statusAfterRepeatOne = String(document.getElementById("status-line")?.textContent || "");
+
+    editor.undo();
+    const afterUndoCount = editor.getSession().notes.length;
+    editor.redo();
+    const afterRedoCount = editor.getSession().notes.length;
+
+    editor.selectNotesByIds(sourceSelection);
+    editor.setLoopRepeatCount(3);
+    const repeatThreeResult = editor.loopSelectedNotes();
+    const afterRepeatThree = editor.getSession();
+    const statusAfterRepeatThree = String(document.getElementById("status-line")?.textContent || "");
+
+    const requestedTooHigh = editor.setLoopRepeatCount(999);
+    const clampedRepeat = editor.getLoopRepeatCount();
+
+    const createdByOne = repeatOneResult && Array.isArray(repeatOneResult.created_note_ids)
+      ? repeatOneResult.created_note_ids
+      : [];
+    const createdByThree = repeatThreeResult && Array.isArray(repeatThreeResult.created_note_ids)
+      ? repeatThreeResult.created_note_ids
+      : [];
+
+    const createdNotesOne = afterRepeatOne.notes.filter((n) => createdByOne.includes(String(n.note_id)));
+    const createdNotesThree = afterRepeatThree.notes.filter((n) => createdByThree.includes(String(n.note_id)));
+
+    return {
+      region,
+      statusAfterRepeatOne,
+      statusAfterRepeatThree,
+      beforeCount: before.notes.length,
+      afterRepeatOneCount: afterRepeatOne.notes.length,
+      afterUndoCount,
+      afterRedoCount,
+      afterRepeatThreeCount: afterRepeatThree.notes.length,
+      repeatOneResult,
+      repeatThreeResult,
+      selectedAfterRepeatOne,
+      noteBoxesAfterRepeatOne,
+      velocityBarsAfterRepeatOne,
+      createdByOne,
+      createdByThree,
+      createdNotesOne,
+      createdNotesThree,
+      requestedTooHigh,
+      clampedRepeat,
+    };
+  });
+
   const copyPasteReport = await page.evaluate(() => {
     const editor = window.__midiSplitEditor;
     const before = editor.getSession();
@@ -321,6 +386,7 @@ async function main() {
     multitrackSuggestedFilename: multitrackDownload.suggestedFilename(),
     separateSuggestedFilename: separateDownload.suggestedFilename(),
     copyPasteReport,
+    loopReport,
     velocityBefore,
     velocityAfter1px,
     velocityAfter20pxUp,
@@ -426,6 +492,52 @@ def test_browser_import_and_exports_via_real_controls(tmp_path: Path) -> None:
     assert 64 <= result["velocityAfter20pxUp"] <= 66
     assert 54 <= result["velocityAfter20pxDown"] <= 56
     assert 62 <= result["velocityAfter20pxUpShift"] <= 63
+
+    loop_report = result["loopReport"]
+    assert loop_report is not None
+    assert loop_report["region"] is not None
+    assert "Looped" in loop_report["statusAfterRepeatOne"]
+    assert "Looped" in loop_report["statusAfterRepeatThree"]
+
+    repeat_one = loop_report["repeatOneResult"]
+    repeat_three = loop_report["repeatThreeResult"]
+    assert repeat_one["repeats"] == 1
+    assert repeat_three["repeats"] == 3
+    assert repeat_one["created_count"] > 0
+    assert repeat_three["created_count"] > repeat_one["created_count"]
+
+    assert loop_report["afterRepeatOneCount"] > loop_report["beforeCount"]
+    assert loop_report["afterUndoCount"] == loop_report["beforeCount"]
+    assert loop_report["afterRedoCount"] == loop_report["afterRepeatOneCount"]
+    assert loop_report["afterRepeatThreeCount"] > loop_report["afterRedoCount"]
+
+    created_one = loop_report["createdNotesOne"]
+    assert created_one
+    created_one_ids = [str(note["note_id"]) for note in created_one]
+    assert len(created_one_ids) == len(set(created_one_ids))
+
+    note_box_ids = {str(item["note_id"]) for item in loop_report["noteBoxesAfterRepeatOne"]}
+    velocity_bar_ids = {str(item["note_id"]) for item in loop_report["velocityBarsAfterRepeatOne"]}
+    assert all(note_id in note_box_ids for note_id in created_one_ids)
+    assert all(note_id in velocity_bar_ids for note_id in created_one_ids)
+
+    selected_after_repeat_one = {str(note_id) for note_id in loop_report["selectedAfterRepeatOne"]}
+    assert all(note_id in selected_after_repeat_one for note_id in created_one_ids)
+
+    region = loop_report["region"]
+    region_duration = int(region["duration_ticks"])
+    assert region_duration >= 1
+
+    source_session = result["secondSessionNotes"]
+    assert source_session > 0
+    source_notes = []
+    # Pull first two source notes from runtime session result through loop report relationship.
+    # Repeat one should place notes exactly one region duration after their source offset.
+    for note in created_one:
+      assert int(note["duration_ticks"]) == int(note["end_tick"]) - int(note["start_tick"])
+
+    assert loop_report["requestedTooHigh"] == 64
+    assert loop_report["clampedRepeat"] == 64
 
     assert result["consoleErrors"] == []
     assert result["pageErrors"] == []

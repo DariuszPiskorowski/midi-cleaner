@@ -280,6 +280,9 @@ def test_generate_piano_roll_preview_contains_editor_toolbar_actions(tmp_path: P
     assert 'id="mute-notes-btn"' in html
     assert 'id="copy-notes-btn"' in html
     assert 'id="paste-notes-btn"' in html
+    assert 'id="loop-notes-btn"' in html
+    assert 'id="loop-repeats"' in html
+    assert "Repeats:" in html
     assert 'id="save-session-btn"' not in html
     assert 'id="download-session-btn"' not in html
     assert "Server: checking" in html
@@ -348,6 +351,12 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function panViewportBySemitones(deltaRows)" in html
     assert "function getViewportState()" in html
     assert "function getClipboardSummary()" in html
+    assert "function normalizeRepeatCount(value, options)" in html
+    assert "function getLoopRepeatCount()" in html
+    assert "function setLoopRepeatCount(value, options)" in html
+    assert "function getSelectedRegionForLoop()" in html
+    assert "function generateUniqueLoopedNoteId()" in html
+    assert "function loopSelectedNotes(repeatCount)" in html
     assert "function keyboardHorizontalNudgeTicks(event)" in html
     assert "function keyboardPitchNudgeSemitones(event)" in html
     assert "function viewportHorizontalArrowStep(event)" in html
@@ -402,7 +411,11 @@ def test_generate_piano_roll_preview_exposes_snap_controls_in_test_api(tmp_path:
     assert "setVelocityForNoteIds: function (noteIds, options)" in script
     assert "copySelectedNotes: copySelectedNotes" in script
     assert "pasteCopiedNotes: pasteCopiedNotes" in script
+    assert "loopSelectedNotes: loopSelectedNotes" in script
     assert "getClipboardSummary: getClipboardSummary" in script
+    assert "getSelectedRegionForLoop: getSelectedRegionForLoop" in script
+    assert "getLoopRepeatCount: getLoopRepeatCount" in script
+    assert "setLoopRepeatCount: function (value)" in script
     assert "setPasteCursorTick: function (tick)" in script
     assert "getPasteCursorTick: getPasteCursorTick" in script
     assert "getSelectedNoteIds: function ()" in script
@@ -479,8 +492,12 @@ def test_generate_piano_roll_preview_wires_copy_paste_toolbar_and_paste_cursor(t
     script = _extract_editor_script(output_html.read_text(encoding="utf-8"))
     assert "const copyNotesButton = document.getElementById(\"copy-notes-btn\");" in script
     assert "const pasteNotesButton = document.getElementById(\"paste-notes-btn\");" in script
+    assert "const loopNotesButton = document.getElementById(\"loop-notes-btn\");" in script
+    assert "const loopRepeatsEl = document.getElementById(\"loop-repeats\");" in script
     assert "copyNotesButton.addEventListener(\"click\", copySelectedNotes);" in script
     assert "pasteNotesButton.addEventListener(\"click\", pasteCopiedNotes);" in script
+    assert "loopNotesButton.addEventListener(\"click\", function () {" in script
+    assert "loopSelectedNotes(getLoopRepeatCount());" in script
     assert "const PASTE_CURSOR_COLOR = \"#8ed1ff\";" in script
     assert "ctx.setLineDash([4, 3]);" in script
     assert "Selection cleared. Paste cursor set to tick " in script

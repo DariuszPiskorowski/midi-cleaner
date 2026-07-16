@@ -39,7 +39,8 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
     }
     #toolbar button,
     #toolbar .toolbar-button,
-    #toolbar select {
+    #toolbar select,
+    #toolbar input[type="number"] {
       padding: 4px 8px;
       font-size: 12px;
       border: 1px solid #666;
@@ -51,6 +52,10 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
     #toolbar .toolbar-button {
       display: inline-block;
       line-height: 1.2;
+    }
+    #loop-repeats {
+      width: 62px;
+      text-align: right;
     }
     #toolbar button.active-tool {
       border-color: #9ab8ff;
@@ -149,6 +154,9 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
     <button id="redo-btn" type="button" disabled>Redo</button>
     <button id="copy-notes-btn" type="button" disabled>Copy</button>
     <button id="paste-notes-btn" type="button" disabled>Paste</button>
+    <button id="loop-notes-btn" type="button" disabled>Loop</button>
+    <label for="loop-repeats">Repeats:</label>
+    <input id="loop-repeats" type="number" min="1" max="64" step="1" value="2" />
 
     <span>|</span>
     <button id="tool-select-btn" type="button">Select</button>
@@ -305,6 +313,8 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       const muteNotesButton = document.getElementById("mute-notes-btn");
       const copyNotesButton = document.getElementById("copy-notes-btn");
       const pasteNotesButton = document.getElementById("paste-notes-btn");
+      const loopNotesButton = document.getElementById("loop-notes-btn");
+      const loopRepeatsEl = document.getElementById("loop-repeats");
       const snapEnabledEl = document.getElementById("snap-enabled");
       const snapGridEl = document.getElementById("snap-grid");
       const velocityLaneVisibleEl = document.getElementById("velocity-lane-visible");
@@ -340,6 +350,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         clipboard: null,
         pasteCursorTick: null,
         pasteIdCounter: 1,
+        loopIdCounter: 1,
         keyboardFocusMode: KEYBOARD_FOCUS_VIEWPORT,
         focusedVelocityNoteId: null,
         focusedVelocityGroupNoteIds: null,
@@ -764,6 +775,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       function updateClipboardButtons() {
         copyNotesButton.disabled = state.selectedNoteIds.size === 0;
         pasteNotesButton.disabled = !state.clipboard || !Array.isArray(state.clipboard.notes) || state.clipboard.notes.length === 0;
+        loopNotesButton.disabled = state.selectedNoteIds.size === 0;
       }
 
       function updateEditorActionButtons() {
@@ -1435,6 +1447,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         state.clipboard = null;
         state.pasteCursorTick = null;
         state.pasteIdCounter = 1;
+        state.loopIdCounter = 1;
         state.keyboardFocusMode = KEYBOARD_FOCUS_VIEWPORT;
         state.focusedVelocityNoteId = null;
         state.focusedVelocityGroupNoteIds = null;
@@ -2430,6 +2443,212 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           region_start_tick: Number(state.clipboard.regionStartTick),
           region_end_tick: Number(state.clipboard.regionEndTick),
           region_duration_ticks: Number(state.clipboard.regionDurationTicks),
+        };
+      }
+
+      function normalizeRepeatCount(value, options) {
+        const opts = options && typeof options === "object" ? options : {};
+        const notify = opts.notify !== false;
+        let parsed = Math.round(Number(value));
+        if (!Number.isFinite(parsed)) {
+          parsed = 2;
+        }
+        const clamped = Math.max(1, Math.min(64, parsed));
+        if (notify && clamped !== parsed) {
+          setStatus("Repeat count clamped to " + String(clamped) + ".", false);
+        }
+        return clamped;
+      }
+
+      function getLoopRepeatCount() {
+        if (!loopRepeatsEl) {
+          return 2;
+        }
+        return normalizeRepeatCount(loopRepeatsEl.value, { notify: false });
+      }
+
+      function setLoopRepeatCount(value, options) {
+        const normalized = normalizeRepeatCount(value, options || {});
+        if (loopRepeatsEl) {
+          loopRepeatsEl.value = String(normalized);
+        }
+        return normalized;
+      }
+
+      function getSelectedRegionForLoop() {
+        const selectedNotes = getSelectedNotes();
+        if (!selectedNotes.length) {
+          return null;
+        }
+
+        let regionStart = null;
+        let regionEnd = null;
+        if (
+          state.selectionRegion
+          && Number.isFinite(Number(state.selectionRegion.startTick))
+          && Number.isFinite(Number(state.selectionRegion.endTick))
+        ) {
+          regionStart = Math.max(0, Math.round(Number(state.selectionRegion.startTick)));
+          regionEnd = Math.max(regionStart + 1, Math.round(Number(state.selectionRegion.endTick)));
+        } else {
+          regionStart = Math.min.apply(null, selectedNotes.map(function (note) {
+            return Math.round(Number(note.start_tick || 0));
+          }));
+          regionEnd = Math.max.apply(null, selectedNotes.map(function (note) {
+            return Math.round(Number(note.end_tick || note.start_tick || 0));
+          }));
+          regionEnd = Math.max(regionStart + 1, regionEnd);
+        }
+
+        return {
+          start_tick: regionStart,
+          end_tick: regionEnd,
+          duration_ticks: Math.max(1, regionEnd - regionStart),
+          note_count: selectedNotes.length,
+        };
+      }
+
+      function generateUniqueLoopedNoteId() {
+        const existing = new Set(session.notes.map(function (note) {
+          return String(note.note_id);
+        }));
+
+        for (let guard = 0; guard < 200000; guard += 1) {
+          const candidate = "looped_" + String(Date.now()) + "_" + String(state.loopIdCounter).padStart(6, "0");
+          state.loopIdCounter += 1;
+          if (!existing.has(candidate)) {
+            return candidate;
+          }
+        }
+
+        return "looped_" + String(Date.now()) + "_" + String(Math.floor(Math.random() * 1000000));
+      }
+
+      function loopSelectedNotes(repeatCount) {
+        const selectedNotes = getSelectedNotes();
+        if (!selectedNotes.length) {
+          setStatus("No notes selected to loop.", false);
+          return {
+            created_count: 0,
+            repeats: 0,
+            region_duration_ticks: 0,
+          };
+        }
+
+        const normalizedRepeats = setLoopRepeatCount(
+          repeatCount !== undefined ? repeatCount : getLoopRepeatCount(),
+          { notify: true }
+        );
+        const region = getSelectedRegionForLoop();
+        if (!region) {
+          setStatus("No notes selected to loop.", false);
+          return {
+            created_count: 0,
+            repeats: 0,
+            region_duration_ticks: 0,
+          };
+        }
+
+        const selectionBefore = Array.from(state.selectedNoteIds).filter(function (noteId) {
+          return state.noteById.has(String(noteId));
+        });
+        const createdSnapshots = [];
+        const createdIds = [];
+        let fallbackTrackCount = 0;
+
+        for (let repeatIndex = 1; repeatIndex <= normalizedRepeats; repeatIndex += 1) {
+          const repeatOffset = repeatIndex * Number(region.duration_ticks || 1);
+          for (const sourceNote of selectedNotes) {
+            const note = cloneNoteSnapshot(sourceNote);
+            note.note_id = generateUniqueLoopedNoteId();
+
+            const sourceStart = Math.round(Number(sourceNote.start_tick || 0));
+            const sourceEnd = Math.max(sourceStart, Math.round(Number(sourceNote.end_tick || sourceStart)));
+            const offsetStart = sourceStart - Number(region.start_tick || 0);
+            const offsetEnd = sourceEnd - Number(region.start_tick || 0);
+
+            note.start_tick = Math.max(0, Math.round(Number(region.start_tick || 0) + repeatOffset + offsetStart));
+            note.end_tick = Math.max(note.start_tick, Math.round(Number(region.start_tick || 0) + repeatOffset + offsetEnd));
+            note.duration_ticks = Math.max(0, note.end_tick - note.start_tick);
+
+            const existingTrack = getTrackByIndex(Number(note.editable_track_index || 0));
+            if (!existingTrack) {
+              const fallbackTrack = getTrackByIndex(Number(targetTrackEl.value || 0)) || (session.tracks.length ? session.tracks[0] : null);
+              if (fallbackTrack) {
+                note.editable_track_index = Number(fallbackTrack.editable_track_index);
+                note.editable_track_name = String(fallbackTrack.name || "Track");
+                fallbackTrackCount += 1;
+              }
+            }
+
+            syncNoteTimingFromTicks(note);
+            session.notes.push(note);
+            createdSnapshots.push(cloneNoteSnapshot(note));
+            createdIds.push(String(note.note_id));
+          }
+        }
+
+        if (!createdSnapshots.length) {
+          setStatus("No notes selected to loop.", false);
+          return {
+            created_count: 0,
+            repeats: 0,
+            region_duration_ticks: Number(region.duration_ticks || 0),
+          };
+        }
+
+        pushHistoryTransaction({
+          label: "loop-notes",
+          beforeNotes: [],
+          afterNotes: createdSnapshots,
+          selectionBefore: selectionBefore,
+          selectionAfter: createdIds.slice(),
+        });
+
+        sortNotes();
+        rebuildTrackSources();
+        rebuildNoteLookup();
+        setSelectionFromList(createdIds.slice());
+        setKeyboardFocusMode(KEYBOARD_FOCUS_NOTES);
+        updateTargetTrackDropdown();
+        renderTrackPanel();
+
+        const createdStartTick = Math.min.apply(null, createdSnapshots.map(function (note) {
+          return Math.round(Number(note.start_tick || 0));
+        }));
+        const createdEndTick = Math.max.apply(null, createdSnapshots.map(function (note) {
+          return Math.round(Number(note.end_tick || note.start_tick || 0));
+        }));
+        ensureTickRangeVisible(createdStartTick, createdEndTick);
+
+        if (Number.isFinite(Number(state.pasteCursorTick))) {
+          const nextCursor = Math.round(Number(region.start_tick || 0) + (normalizedRepeats + 1) * Number(region.duration_ticks || 1));
+          setPasteCursorTick(nextCursor, { snap: true });
+        }
+
+        redraw();
+        updateEditorActionButtons();
+
+        if (fallbackTrackCount > 0) {
+          setStatus(
+            "Looped " + String(selectedNotes.length) + " note(s) x " + String(normalizedRepeats)
+              + " repeat(s). " + String(fallbackTrackCount) + " note(s) used fallback track.",
+            false
+          );
+        } else {
+          setStatus(
+            "Looped " + String(selectedNotes.length) + " note(s) x " + String(normalizedRepeats) + " repeat(s).",
+            false
+          );
+        }
+
+        return {
+          created_count: createdSnapshots.length,
+          repeats: normalizedRepeats,
+          region_duration_ticks: Number(region.duration_ticks || 0),
+          region_start_tick: Number(region.start_tick || 0),
+          region_end_tick: Number(region.end_tick || 0),
+          created_note_ids: createdIds.slice(),
         };
       }
 
@@ -4175,6 +4394,14 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         document.getElementById("mute-notes-btn").addEventListener("click", toggleMuteSelectedNotes);
         copyNotesButton.addEventListener("click", copySelectedNotes);
         pasteNotesButton.addEventListener("click", pasteCopiedNotes);
+        loopNotesButton.addEventListener("click", function () {
+          loopSelectedNotes(getLoopRepeatCount());
+        });
+        if (loopRepeatsEl) {
+          loopRepeatsEl.addEventListener("change", function () {
+            setLoopRepeatCount(loopRepeatsEl.value, { notify: true });
+          });
+        }
         undoButton.addEventListener("click", undoHistory);
         redoButton.addEventListener("click", redoHistory);
         document.getElementById("add-track-btn").addEventListener("click", addTrack);
@@ -4387,7 +4614,13 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           },
           copySelectedNotes: copySelectedNotes,
           pasteCopiedNotes: pasteCopiedNotes,
+          loopSelectedNotes: loopSelectedNotes,
           getClipboardSummary: getClipboardSummary,
+          getSelectedRegionForLoop: getSelectedRegionForLoop,
+          getLoopRepeatCount: getLoopRepeatCount,
+          setLoopRepeatCount: function (value) {
+            return setLoopRepeatCount(value, { notify: true });
+          },
           setPasteCursorTick: function (tick) {
             setPasteCursorTick(tick, { snap: true });
             redraw();
