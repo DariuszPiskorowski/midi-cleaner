@@ -98,6 +98,51 @@ def _write_long_browser_test_midi(path: Path) -> None:
     midi.save(path)
 
 
+def _write_long_invalid_key_signature_browser_midi(path: Path) -> None:
+    midi = mido.MidiFile(type=1, ticks_per_beat=480)
+
+    tempo_track = mido.MidiTrack()
+    tempo_track.append(mido.MetaMessage("set_tempo", tempo=500000, time=0))
+    midi.tracks.append(tempo_track)
+
+    synth_track = mido.MidiTrack()
+    synth_track.append(mido.MetaMessage("track_name", name="Played With Fire - Deep House (Synth)", time=0))
+    synth_track.append(mido.MetaMessage("key_signature", key="C", time=0))
+
+    events = [
+        (2400, 960, 36, 100),
+        (4800, 480, 48, 96),
+        (38400, 960, 52, 95),
+        (76800, 960, 55, 94),
+        (153600, 960, 57, 92),
+        (230400, 960, 59, 90),
+        (300000, 960, 62, 88),
+        (309550, 130, 65, 86),
+    ]
+
+    current_tick = 0
+    for start_tick, duration_tick, pitch, velocity in events:
+        delta = max(0, int(start_tick) - int(current_tick))
+        synth_track.append(
+            mido.Message("note_on", note=int(pitch), velocity=int(velocity), channel=0, time=delta)
+        )
+        synth_track.append(
+            mido.Message("note_off", note=int(pitch), velocity=0, channel=0, time=int(duration_tick))
+        )
+        current_tick = int(start_tick) + int(duration_tick)
+
+    midi.tracks.append(synth_track)
+    midi.save(path)
+
+    raw = bytearray(path.read_bytes())
+    marker = bytes([0xFF, 0x59, 0x02])
+    marker_index = raw.find(marker)
+    assert marker_index >= 0
+    raw[marker_index + 3] = 0x0E
+    raw[marker_index + 4] = 0x01
+    path.write_bytes(raw)
+
+
 def _build_server():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _MidiSplitEditorRequestHandler)
     server.editor_state = _EditorState(_default_session())  # type: ignore[attr-defined]
@@ -719,6 +764,191 @@ main().catch((error) => {
 """.strip()
 
 
+def _node_long_user_file_script_content() -> str:
+    return """
+const fs = require("fs");
+const { chromium } = require("playwright");
+
+const [baseUrl, midiPath, outResultPath] = process.argv.slice(2);
+
+function tickToSeconds(tick, tempoMap, ticksPerBeat) {
+  const targetTick = Math.max(0, Number(tick || 0));
+  if (!Array.isArray(tempoMap) || !tempoMap.length) {
+    return (targetTick / Math.max(1, Number(ticksPerBeat || 480))) * 0.5;
+  }
+
+  const sorted = tempoMap
+    .map((event) => ({
+      tick: Number(event.tick || 0),
+      sec: Number(event.sec || 0),
+      tempo: Number(event.tempo_us_per_beat || 500000),
+    }))
+    .sort((a, b) => a.tick - b.tick);
+
+  let current = sorted[0];
+  let sec = Number(current.sec || 0);
+  for (let index = 1; index < sorted.length; index += 1) {
+    const next = sorted[index];
+    if (targetTick <= next.tick) {
+      return sec + ((targetTick - current.tick) / ticksPerBeat) * (current.tempo / 1_000_000);
+    }
+    sec += ((next.tick - current.tick) / ticksPerBeat) * (current.tempo / 1_000_000);
+    current = next;
+  }
+
+  return sec + ((targetTick - current.tick) / ticksPerBeat) * (current.tempo / 1_000_000);
+}
+
+async function main() {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  page.on("console", (msg) => {
+    if (msg.type() === "error") {
+      consoleErrors.push(msg.text());
+    }
+  });
+
+  page.on("pageerror", (error) => {
+    pageErrors.push(String(error));
+  });
+
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#server-status");
+  await page.waitForFunction(() => {
+    const el = document.getElementById("server-status");
+    return !!el && /connected/i.test(el.textContent || "");
+  }, { timeout: 15000 });
+
+  await page.setInputFiles("#import-midi-input", midiPath);
+  await page.waitForFunction(() => {
+    const editor = window.__midiSplitEditor;
+    return !!editor && editor.getSession().notes.length > 0;
+  }, { timeout: 15000 });
+
+  const report = await page.evaluate(async () => {
+    const editor = window.__midiSplitEditor;
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const session = editor.getSession();
+    const notes = Array.isArray(session.notes) ? session.notes.slice() : [];
+    const ticksPerBeat = Math.max(1, Number(session.ticks_per_beat || 480));
+
+    const tickToSeconds = (tick, tempoMap, ticksPerBeatValue) => {
+      const targetTick = Math.max(0, Number(tick || 0));
+      if (!Array.isArray(tempoMap) || !tempoMap.length) {
+        return (targetTick / Math.max(1, Number(ticksPerBeatValue || 480))) * 0.5;
+      }
+
+      const sorted = tempoMap
+        .map((event) => ({
+          tick: Number(event.tick || 0),
+          sec: Number(event.sec || 0),
+          tempo: Number(event.tempo_us_per_beat || 500000),
+        }))
+        .sort((a, b) => a.tick - b.tick);
+
+      let current = sorted[0];
+      let sec = Number(current.sec || 0);
+      for (let index = 1; index < sorted.length; index += 1) {
+        const next = sorted[index];
+        if (targetTick <= next.tick) {
+          return sec + ((targetTick - current.tick) / ticksPerBeatValue) * (current.tempo / 1_000_000);
+        }
+        sec += ((next.tick - current.tick) / ticksPerBeatValue) * (current.tempo / 1_000_000);
+        current = next;
+      }
+
+      return sec + ((targetTick - current.tick) / ticksPerBeatValue) * (current.tempo / 1_000_000);
+    };
+
+    const maxEndTick = notes.reduce((maxTick, note) => {
+      return Math.max(maxTick, Number(note?.end_tick || note?.start_tick || 0));
+    }, 0);
+    const maxEndSec = notes.reduce((maxSec, note) => {
+      return Math.max(maxSec, Number(note?.end_sec || note?.start_sec || 0));
+    }, 0);
+    const notesAfter40 = notes.filter((note) => Number(note?.end_sec || 0) >= 40).length;
+
+    editor.setXOffsetTicksForTest(maxEndTick);
+    const viewAfterEndPan = editor.getViewState();
+    const visibleIds = editor.getVisibleNoteIds ? editor.getVisibleNoteIds() : [];
+
+    const lastTen = notes
+      .slice()
+      .sort((a, b) => Number(a?.end_tick || 0) - Number(b?.end_tick || 0))
+      .slice(-10)
+      .map((note) => String(note.note_id));
+    const lastSet = new Set(lastTen);
+    const visibleLastIds = visibleIds.filter((noteId) => lastSet.has(String(noteId)));
+
+    editor.setMidiOutEnabledForTest(false);
+    editor.setFollowPlayheadForTest(true);
+
+    const beforeMax = Number(editor.getSessionMaxTick());
+    const started = editor.playAllNotes();
+    await wait(2500);
+
+    const stateAfterWait = editor.getPlaybackVisualState();
+    const playheadTickAfterWait = Number(stateAfterWait.currentTick || 0);
+    const playheadSecAfterWait = tickToSeconds(
+      playheadTickAfterWait,
+      session.tempo_map,
+      ticksPerBeat,
+    );
+
+    const ffTick = Number(editor.getPlayheadTickForElapsedMs(45000));
+    const ffSec = tickToSeconds(ffTick, session.tempo_map, ticksPerBeat);
+
+    editor.setPlaybackVisualStateForTest({
+      isPlaying: true,
+      timingStartTick: Number(stateAfterWait.timingStartTick || 0),
+      playbackEndTick: Number(stateAfterWait.playbackEndTick || beforeMax),
+      currentTick: ffTick,
+      durationMs: Number(stateAfterWait.durationMs || 0),
+      followPlayhead: true,
+    });
+    editor.centerViewportOnTick(ffTick);
+    const viewAfterFastForward = editor.getViewState();
+
+    editor.stopMidiPlayback({ sendPanic: true });
+
+    return {
+      sourceMidi: String(session.source_midi || ""),
+      noteCount: notes.length,
+      maxEndTick,
+      maxEndSec,
+      notesAfter40,
+      viewAfterEndPan,
+      visibleIdsCount: visibleIds.length,
+      visibleLastIdsCount: visibleLastIds.length,
+      beforeMax,
+      started,
+      playheadTickAfterWait,
+      playheadSecAfterWait,
+      ffTick,
+      ffSec,
+      viewAfterFastForward,
+    };
+  });
+
+  await browser.close();
+
+  fs.writeFileSync(
+    outResultPath,
+    JSON.stringify({ report, consoleErrors, pageErrors }, null, 2)
+  );
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+""".strip()
+
+
 def test_browser_import_and_exports_via_real_controls(tmp_path: Path) -> None:
     midi_path = tmp_path / "browser_flow.mid"
     _write_browser_test_midi(midi_path)
@@ -973,3 +1203,61 @@ def test_browser_long_session_viewport_uses_full_session_range(tmp_path: Path) -
     assert report["regionEventMaxEndTick"] <= report["sessionMaxByApi"]
     assert report["visualAtRegionStart"]["playbackEndTick"] <= report["sessionMaxByApi"]
     assert report["globalMaxBeforeRegionPlay"] == pytest.approx(report["globalMaxDuringRegionPlay"], abs=1e-6)
+
+
+def test_browser_import_preserves_long_invalid_key_signature_over_40_seconds(tmp_path: Path) -> None:
+    midi_path = tmp_path / "Played_With_Fire_-_Deep_House__Synth___Synth_.mid"
+    _write_long_invalid_key_signature_browser_midi(midi_path)
+
+    node_path = shutil.which("node")
+    assert node_path is not None
+
+    result_path = tmp_path / "browser_long_user_file_result.json"
+    script_path = tmp_path / "browser_long_user_file.js"
+    script_path.write_text(_node_long_user_file_script_content() + "\n", encoding="utf-8")
+
+    server, thread, base_url = _build_server()
+    try:
+        completed = subprocess.run(
+            [
+                node_path,
+                str(script_path),
+                base_url,
+                str(midi_path),
+                str(result_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert completed.returncode == 0, (
+        "Browser long malformed-key-signature script failed\n"
+        f"STDOUT:\n{completed.stdout}\n"
+        f"STDERR:\n{completed.stderr}"
+    )
+
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert payload["consoleErrors"] == []
+    assert payload["pageErrors"] == []
+
+    report = payload["report"]
+    assert report["sourceMidi"] == "Played_With_Fire_-_Deep_House__Synth___Synth_.mid"
+    assert report["noteCount"] >= 8
+    assert report["maxEndTick"] > 38400
+    assert report["maxEndSec"] > 40.0
+    assert report["notesAfter40"] >= 1
+    assert report["visibleIdsCount"] >= 1
+    assert report["visibleLastIdsCount"] >= 1
+    assert report["viewAfterEndPan"]["xOffsetTicks"] > 0
+
+    assert report["started"] is True
+    assert report["beforeMax"] == pytest.approx(report["maxEndTick"], abs=1e-6)
+    assert report["ffTick"] > 0
+    assert report["ffSec"] > 40.0
+    assert report["viewAfterFastForward"]["xOffsetTicks"] > 0

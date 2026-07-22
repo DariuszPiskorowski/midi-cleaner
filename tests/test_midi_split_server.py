@@ -11,7 +11,9 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import mido
+import pytest
 
+from midi_cleaner.midi.importer import import_midi_candidate
 from midi_cleaner.midi_split.models import MidiSplitSession
 from midi_cleaner.midi_split.server import _MidiSplitEditorRequestHandler
 from midi_cleaner.midi_split.server import _EditorState
@@ -42,6 +44,46 @@ def _write_test_midi(path: Path) -> None:
     midi.tracks.append(notes_track_b)
 
     midi.save(path)
+
+
+def _write_long_invalid_key_signature_test_midi(path: Path) -> None:
+    midi = mido.MidiFile(type=1, ticks_per_beat=480)
+
+    tempo_track = mido.MidiTrack()
+    tempo_track.append(mido.MetaMessage("set_tempo", tempo=500000, time=0))
+    midi.tracks.append(tempo_track)
+
+    note_track = mido.MidiTrack()
+    note_track.append(mido.MetaMessage("track_name", name="Played With Fire - Deep House (Synth)", time=0))
+    note_track.append(mido.MetaMessage("key_signature", key="C", time=0))
+
+    events = [
+        (0, 480, 60, 100),
+        (38400, 960, 62, 96),
+        (60000, 960, 64, 94),
+    ]
+
+    current_tick = 0
+    for start_tick, duration_ticks, pitch, velocity in events:
+        delta = max(0, int(start_tick) - int(current_tick))
+        note_track.append(
+            mido.Message("note_on", note=int(pitch), velocity=int(velocity), channel=0, time=delta)
+        )
+        note_track.append(
+            mido.Message("note_off", note=int(pitch), velocity=0, channel=0, time=int(duration_ticks))
+        )
+        current_tick = int(start_tick) + int(duration_ticks)
+
+    midi.tracks.append(note_track)
+    midi.save(path)
+
+    raw = bytearray(path.read_bytes())
+    marker = bytes([0xFF, 0x59, 0x02])
+    marker_index = raw.find(marker)
+    assert marker_index >= 0
+    raw[marker_index + 3] = 0x0E
+    raw[marker_index + 4] = 0x01
+    path.write_bytes(raw)
 
 
 def _build_server(initial_session: MidiSplitSession):
@@ -223,6 +265,44 @@ def test_api_import_midi_accepts_user_style_filename(tmp_path: Path) -> None:
         assert body["source_midi"] == user_style_name
         assert len(body["notes"]) == 3
         assert len(body["tracks"]) == 2
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
+def test_api_import_midi_preserves_long_session_over_40_seconds_for_user_style_filename(
+    tmp_path: Path,
+) -> None:
+    midi_path = tmp_path / "Played_With_Fire_-_Deep_House__Synth___Synth_.mid"
+    _write_long_invalid_key_signature_test_midi(midi_path)
+
+    expected_document, _report = import_midi_candidate(midi_path, source="manual", layer="midi")
+    expected_max_end_tick = max((int(note.end_tick) for note in expected_document.notes), default=0)
+    expected_max_end_sec = max((float(note.end_sec) for note in expected_document.notes), default=0.0)
+
+    user_style_name = "Played_With_Fire_-_Deep_House__Synth___Synth_.mid"
+    server, thread, base_url = _build_server(_default_session())
+    try:
+        payload = midi_path.read_bytes()
+        status, _headers, body = _request_json(
+            "POST",
+            f"{base_url}/api/import-midi?filename={quote(user_style_name, safe='')}",
+            payload=payload,
+            content_type="application/octet-stream",
+        )
+
+        response_notes = body["notes"]
+        response_max_end_tick = max((int(note["end_tick"]) for note in response_notes), default=0)
+        response_max_end_sec = max((float(note["end_sec"]) for note in response_notes), default=0.0)
+
+        assert status == 200
+        assert body["source_midi"] == user_style_name
+        assert len(response_notes) == len(expected_document.notes)
+        assert response_max_end_tick == expected_max_end_tick
+        assert response_max_end_sec == pytest.approx(expected_max_end_sec, abs=1e-9)
+        assert response_max_end_sec > 40.0
+        assert any(float(note["end_sec"]) >= 40.0 for note in response_notes)
     finally:
         server.shutdown()
         thread.join(timeout=2)

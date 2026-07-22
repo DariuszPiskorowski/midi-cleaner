@@ -6,6 +6,7 @@ from pathlib import Path
 import mido
 import pytest
 
+from midi_cleaner.midi.importer import import_midi_candidate
 from midi_cleaner.midi_split import (
     MidiSplitSessionError,
     add_empty_track,
@@ -41,6 +42,46 @@ def _write_split_source_midi(path: Path) -> None:
     midi.tracks.append(pad_track)
 
     midi.save(path)
+
+
+def _write_long_invalid_key_signature_split_midi(path: Path) -> None:
+    midi = mido.MidiFile(type=1, ticks_per_beat=480)
+
+    tempo_track = mido.MidiTrack()
+    tempo_track.append(mido.MetaMessage("set_tempo", tempo=500000, time=0))
+    midi.tracks.append(tempo_track)
+
+    synth_track = mido.MidiTrack()
+    synth_track.append(mido.MetaMessage("track_name", name="Played With Fire - Deep House (Synth)", time=0))
+    synth_track.append(mido.MetaMessage("key_signature", key="C", time=0))
+
+    events = [
+        (0, 480, 60, 100),
+        (38400, 960, 62, 96),
+        (60000, 960, 64, 94),
+    ]
+
+    current_tick = 0
+    for start_tick, duration_ticks, pitch, velocity in events:
+        delta = max(0, int(start_tick) - int(current_tick))
+        synth_track.append(
+            mido.Message("note_on", note=int(pitch), velocity=int(velocity), channel=0, time=delta)
+        )
+        synth_track.append(
+            mido.Message("note_off", note=int(pitch), velocity=0, channel=0, time=int(duration_ticks))
+        )
+        current_tick = int(start_tick) + int(duration_ticks)
+
+    midi.tracks.append(synth_track)
+    midi.save(path)
+
+    raw = bytearray(path.read_bytes())
+    marker = bytes([0xFF, 0x59, 0x02])
+    marker_index = raw.find(marker)
+    assert marker_index >= 0
+    raw[marker_index + 3] = 0x0E
+    raw[marker_index + 4] = 0x01
+    path.write_bytes(raw)
 
 
 def _extract_note_spans_by_track(midi_path: Path) -> dict[int, list[tuple[int, int, int, int, int]]]:
@@ -101,6 +142,28 @@ def test_create_split_session_preserves_underlying_import_error_detail(tmp_path:
     message = str(exc_info.value)
     assert "Failed to create split session from MIDI 'bad.mid':" in message
     assert "Failed to parse MIDI file 'bad.mid':" in message
+
+
+def test_create_split_session_preserves_max_end_over_40_seconds_for_invalid_key_signature(
+    tmp_path: Path,
+) -> None:
+    midi_path = tmp_path / "Played_With_Fire_-_Deep_House__Synth___Synth_.mid"
+    _write_long_invalid_key_signature_split_midi(midi_path)
+
+    document, _report = import_midi_candidate(midi_path, source="manual", layer="midi")
+    session = create_split_session(midi_path, source="manual", layer="midi", display_name=midi_path.name)
+
+    document_max_end_tick = max((int(note.end_tick) for note in document.notes), default=0)
+    document_max_end_sec = max((float(note.end_sec) for note in document.notes), default=0.0)
+    session_max_end_tick = max((int(note.end_tick) for note in session.notes), default=0)
+    session_max_end_sec = max((float(note.end_sec) for note in session.notes), default=0.0)
+
+    assert len(session.notes) == len(document.notes)
+    assert session_max_end_tick == document_max_end_tick
+    assert session_max_end_sec == pytest.approx(document_max_end_sec, abs=1e-9)
+    assert session_max_end_tick > 38400
+    assert session_max_end_sec > 40.0
+    assert any(float(note.end_sec) >= 40.0 for note in session.notes)
 
 
 def _extract_editor_script(html: str) -> str:

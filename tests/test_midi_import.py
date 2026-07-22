@@ -20,6 +20,46 @@ def _write_midi_file(path: Path, tracks: list[mido.MidiTrack], ticks_per_beat: i
     midi.save(path)
 
 
+def _write_long_invalid_key_signature_midi(path: Path) -> None:
+    midi = mido.MidiFile(ticks_per_beat=480)
+
+    tempo_track = mido.MidiTrack()
+    tempo_track.append(mido.MetaMessage("set_tempo", tempo=500000, time=0))
+    midi.tracks.append(tempo_track)
+
+    note_track = mido.MidiTrack()
+    note_track.append(mido.MetaMessage("track_name", name="Played With Fire Synth", time=0))
+    note_track.append(mido.MetaMessage("key_signature", key="C", time=0))
+
+    events = [
+        (0, 480, 60, 100),
+        (38400, 960, 62, 96),
+        (60000, 960, 64, 94),
+    ]
+
+    current_tick = 0
+    for start_tick, duration_ticks, note, velocity in events:
+        delta = max(0, int(start_tick) - int(current_tick))
+        note_track.append(
+            mido.Message("note_on", note=int(note), velocity=int(velocity), channel=0, time=delta)
+        )
+        note_track.append(
+            mido.Message("note_off", note=int(note), velocity=0, channel=0, time=int(duration_ticks))
+        )
+        current_tick = int(start_tick) + int(duration_ticks)
+
+    midi.tracks.append(note_track)
+    midi.save(path)
+
+    raw = bytearray(path.read_bytes())
+    marker = bytes([0xFF, 0x59, 0x02])
+    marker_index = raw.find(marker)
+    assert marker_index >= 0
+    raw[marker_index + 3] = 0x0E  # 14 sharps forces strict mido key-signature decode failure.
+    raw[marker_index + 4] = 0x01
+    path.write_bytes(raw)
+
+
 def test_import_simple_single_note(tmp_path: Path) -> None:
     track = mido.MidiTrack()
     track.append(mido.Message("note_on", note=60, velocity=100, time=0, channel=0))
@@ -123,6 +163,25 @@ def test_import_leniently_handles_invalid_key_signature_metadata(tmp_path: Path)
     assert len(document.notes) == 1
     assert report.warning_count >= 1
     assert any("unsupported key signature metadata" in warning for warning in report.warnings)
+
+
+def test_import_lenient_key_signature_preserves_notes_after_40_seconds(tmp_path: Path) -> None:
+    input_path = tmp_path / "Played_With_Fire_-_Deep_House__Synth___Synth_.mid"
+    _write_long_invalid_key_signature_midi(input_path)
+
+    document, report = import_midi_candidate(input_path, source="manual", layer="midi")
+
+    max_end_tick = max((int(note.end_tick) for note in document.notes), default=0)
+    max_end_sec = max((float(note.end_sec) for note in document.notes), default=0.0)
+    notes_after_40 = [note for note in document.notes if float(note.end_sec) >= 40.0]
+
+    assert report.status == "ok"
+    assert report.warning_count >= 1
+    assert any("unsupported key signature metadata" in warning for warning in report.warnings)
+    assert len(document.notes) == 3
+    assert max_end_tick > 38400
+    assert max_end_sec > 40.0
+    assert len(notes_after_40) >= 1
 
 
 def test_cli_import_writes_output_and_report(tmp_path: Path) -> None:
