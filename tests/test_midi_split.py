@@ -388,6 +388,8 @@ def test_generate_piano_roll_preview_contains_editor_toolbar_actions(tmp_path: P
     assert 'id="velocity-lane-visible"' in html
     assert "Velocity values" in html
     assert 'id="velocity-values-visible"' in html
+    assert 'id="playback-time-display"' in html
+    assert "Time: 00:00.000 / 00:00.000" in html
 
 
 def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tmp_path: Path) -> None:
@@ -451,7 +453,13 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function getFollowPlayheadForTest()" in html
     assert "function isNoteActiveForPlayback(noteId)" in html
     assert "function setActivePlaybackNotesForTest(noteIds)" in html
+    assert "function syncActivePlaybackNotesForTick(tick)" in html
+    assert "function formatPlaybackTime(seconds)" in html
+    assert "function getPlaybackCurrentSec()" in html
+    assert "function getPlaybackDurationSec()" in html
+    assert "function updatePlaybackTimeDisplay()" in html
     assert "function getPlaybackVisualState()" in html
+    assert "function getPlaybackCurrentTickFromElapsedMs(elapsedMs)" in html
     assert "function getPlayheadTickForElapsedMs(elapsedMs)" in html
     assert "function followPlaybackTickIfNeeded(tick)" in html
     assert "function stepPlaybackVisualFrame(timestampMs)" in html
@@ -601,6 +609,11 @@ def test_generate_piano_roll_preview_exposes_snap_controls_in_test_api(tmp_path:
     assert "stopPlaybackVisuals: stopPlaybackVisuals" in script
     assert "setActivePlaybackNotesForTest: setActivePlaybackNotesForTest" in script
     assert "isNoteActiveForPlayback: isNoteActiveForPlayback" in script
+    assert "formatPlaybackTime: formatPlaybackTime" in script
+    assert "getPlaybackCurrentSec: getPlaybackCurrentSec" in script
+    assert "getPlaybackDurationSec: getPlaybackDurationSec" in script
+    assert "getPlaybackTimeDisplayText: function ()" in script
+    assert "getPlaybackCurrentTickFromElapsedMs: getPlaybackCurrentTickFromElapsedMs" in script
     assert "getPlayheadTickForElapsedMs: getPlayheadTickForElapsedMs" in script
     assert "setPasteCursorTick: function (tick)" in script
     assert "getPasteCursorTick: getPasteCursorTick" in script
@@ -652,8 +665,9 @@ def test_generate_piano_roll_preview_web_midi_playback_builder_behavior_markers(
     assert "function getPlaybackTickRangeFromEvents(events)" in script
     assert "function getPlaybackEndTickForEvents(events)" in script
     assert "schedulePlaybackTimer(function () {" in script
-    assert "state.playbackVisualState.activeNoteIds.add(noteId);" in script
-    assert "state.playbackVisualState.activeNoteIds.delete(noteId);" in script
+    assert "const playbackEventWindows = events.map(function (event) {" in script
+    assert "playbackEventWindows: playbackEventWindows," in script
+    assert "const activeChanged = syncActivePlaybackNotesForTick(nextTick);" in script
     assert "startPlaybackVisuals({" in script
     assert "setStatus(\"Playback finished.\", false);" in script
 
@@ -691,11 +705,27 @@ def test_generate_piano_roll_preview_follow_playhead_visual_markers(tmp_path: Pa
     assert "followPlayheadEl.addEventListener(\"change\", function () {" in script
     assert "setFollowPlayhead(Boolean(followPlayheadEl.checked));" in script
     assert "if (active && !muted) {" in script
-    assert "const deadZone = Math.max(1, Number(range.span_ticks) * 0.14);" in script
-    assert "return centerViewportOnTick(tick);" in script
+    assert "const deadZone = Math.max(1, spanTicks * 0.14);" in script
+    assert "const minAllowedTick = centerTick - deadZone;" in script
+    assert "const maxAllowedTick = centerTick + deadZone;" in script
+    assert "state.xOffsetTicks = nextOffset;" in script
     assert "const topY = TOP_PAD;" in script
     assert "const bottomY = state.velocityLaneVisible ? velocityLaneBottomY() : pianoRollBottomY();" in script
     assert "drawPlaybackPlayhead(ctx);" in script
+
+
+def test_generate_piano_roll_preview_playback_time_format_markers(tmp_path: Path) -> None:
+    session = _create_session(tmp_path)
+    output_html = tmp_path / "split_editor.html"
+
+    generate_piano_roll_preview(session, output_html)
+
+    script = _extract_editor_script(output_html.read_text(encoding="utf-8"))
+    assert "const totalMs = Math.max(0, Math.round(Number(seconds || 0) * 1000));" in script
+    assert "String(minutes).padStart(2, \"0\")" in script
+    assert "String(secondsPart).padStart(2, \"0\")" in script
+    assert "String(millisPart).padStart(3, \"0\")" in script
+    assert "playbackTimeDisplayEl.textContent = \"Time: \"" in script
 
 
 def test_generate_piano_roll_preview_velocity_bar_geometry_and_hit_zone_logic(tmp_path: Path) -> None:

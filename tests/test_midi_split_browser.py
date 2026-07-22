@@ -79,8 +79,8 @@ def _write_long_browser_test_midi(path: Path) -> None:
     long_track.append(mido.MetaMessage("track_name", name="Long Browser Track", time=0))
 
     events = [
-        (0, 240, 40, 100),
-        (960, 240, 43, 98),
+      (0, 7200, 40, 100),
+      (11520, 480, 43, 98),
         (28800, 480, 45, 96),
         (57600, 480, 47, 95),
         (115200, 960, 48, 94),
@@ -236,12 +236,43 @@ async function main() {
     const playRegionButton = document.getElementById("play-region-btn");
     const playAllButton = document.getElementById("play-all-btn");
     const stopButton = document.getElementById("stop-midi-btn");
+    const panicButton = document.getElementById("panic-midi-btn");
+    const playbackTimeEl = document.getElementById("playback-time-display");
+
+    const parsePlaybackTime = (label) => {
+      const text = String(label || "");
+      const match = /Time:\\s*(\\d+):(\\d{2})\\.(\\d{3})\\s*\\/\\s*(\\d+):(\\d{2})\\.(\\d{3})/.exec(text);
+      if (!match) {
+        return {
+          valid: false,
+          currentMs: null,
+          durationMs: null,
+        };
+      }
+      const currentMs = (Number(match[1]) * 60000) + (Number(match[2]) * 1000) + Number(match[3]);
+      const durationMs = (Number(match[4]) * 60000) + (Number(match[5]) * 1000) + Number(match[6]);
+      return {
+        valid: true,
+        currentMs,
+        durationMs,
+      };
+    };
 
     const notes = editor.getSession().notes || [];
     const playableNotes = notes.filter((note) => note && note.muted !== true);
     if (!playableNotes.length) {
       return null;
     }
+
+    const formatSamples = {
+      zero: editor.formatPlaybackTime(0),
+      onePointTwo: editor.formatPlaybackTime(1.2),
+      sixtyFivePoint034: editor.formatPlaybackTime(65.034),
+      longValue: editor.formatPlaybackTime(745.678),
+    };
+    const hasPlaybackTimeDisplay = Boolean(playbackTimeEl);
+    const playbackTimeInitialText = String(playbackTimeEl?.textContent || "");
+    const playbackTimeInitial = parsePlaybackTime(playbackTimeInitialText);
 
     editor.setMidiOutEnabledForTest(false);
     editor.selectNotesByIds([String(playableNotes[0].note_id)]);
@@ -295,30 +326,58 @@ async function main() {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
 
+    const playbackTimeDuringFollowOnText = String(playbackTimeEl?.textContent || "");
+    const playbackTimeDuringFollowOn = parsePlaybackTime(playbackTimeDuringFollowOnText);
+    const playbackCurrentSecDuringFollowOn = Number(editor.getPlaybackCurrentSec());
+    const playbackDurationSecDuringFollowOn = Number(editor.getPlaybackDurationSec());
     const viewportDuringFollowOn = editor.getViewState();
     editor.stopMidiPlayback({ sendPanic: true });
     const visualAfterStopNoMidi = editor.getPlaybackVisualState();
+    const playbackTimeAfterStopNoMidiText = String(playbackTimeEl?.textContent || "");
+    const playbackTimeAfterStopNoMidi = parsePlaybackTime(playbackTimeAfterStopNoMidiText);
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    const playbackTimeAfterStopNoMidiLaterText = String(playbackTimeEl?.textContent || "");
+    const playbackTimeAfterStopNoMidiLater = parsePlaybackTime(playbackTimeAfterStopNoMidiLaterText);
 
     editor.panViewportByTicks(5000);
     const viewportBeforeFollowOff = editor.getViewState();
     editor.setFollowPlayheadForTest(false);
     const startedFollowOff = editor.playSelectedRegion();
     const statusAfterRegionNoMidi = String(statusEl?.textContent || "");
+    const playbackTimeAtFollowOffStartText = String(playbackTimeEl?.textContent || "");
+    const playbackTimeAtFollowOffStart = parsePlaybackTime(playbackTimeAtFollowOffStartText);
     await new Promise((resolve) => setTimeout(resolve, 120));
     const viewportDuringFollowOff = editor.getViewState();
+    const playbackTimeDuringFollowOffText = String(playbackTimeEl?.textContent || "");
+    const playbackTimeDuringFollowOff = parsePlaybackTime(playbackTimeDuringFollowOffText);
     editor.stopMidiPlayback({ sendPanic: true });
     const visualAfterFollowOffStop = editor.getPlaybackVisualState();
+    const playbackTimeAfterFollowOffStopText = String(playbackTimeEl?.textContent || "");
+    const playbackTimeAfterFollowOffStop = parsePlaybackTime(playbackTimeAfterFollowOffStopText);
 
     editor.setMidiOutEnabledForTest(true);
     editor.setSelectedMidiOutputForTest("__test__");
     editor.selectNotesByIds([String(playableNotes[0].note_id)]);
     const midiStateBefore = editor.getMidiOutState();
+    const panicEnabledWithMidi = panicButton ? !panicButton.disabled : false;
     const startedWithMidi = editor.playSelectedNotes();
-    await new Promise((resolve) => setTimeout(resolve, 220));
-    editor.stopMidiPlayback({ sendPanic: true });
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    const visualBeforePanic = editor.getPlaybackVisualState();
+    if (panicButton) {
+      panicButton.click();
+    } else {
+      editor.stopMidiPlayback({ sendPanic: true });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const visualAfterPanic = editor.getPlaybackVisualState();
+    const statusAfterPanic = String(statusEl?.textContent || "");
     const midiStateAfter = editor.getMidiOutState();
 
     return {
+      formatSamples,
+      hasPlaybackTimeDisplay,
+      playbackTimeInitialText,
+      playbackTimeInitial,
       selectedState,
       regionState,
       playAllEnabledWithoutMidi,
@@ -329,16 +388,34 @@ async function main() {
       visualAtStartFollowOn,
       stopEnabledDuringFollowOn,
       sawActiveHighlight,
+      playbackTimeDuringFollowOnText,
+      playbackTimeDuringFollowOn,
+      playbackCurrentSecDuringFollowOn,
+      playbackDurationSecDuringFollowOn,
       viewportBeforeFollowOn,
       viewportDuringFollowOn,
       visualAfterStopNoMidi,
+      playbackTimeAfterStopNoMidiText,
+      playbackTimeAfterStopNoMidi,
+      playbackTimeAfterStopNoMidiLaterText,
+      playbackTimeAfterStopNoMidiLater,
       startedFollowOff,
       statusAfterRegionNoMidi,
+      playbackTimeAtFollowOffStartText,
+      playbackTimeAtFollowOffStart,
       viewportBeforeFollowOff,
       viewportDuringFollowOff,
+      playbackTimeDuringFollowOffText,
+      playbackTimeDuringFollowOff,
       visualAfterFollowOffStop,
+      playbackTimeAfterFollowOffStopText,
+      playbackTimeAfterFollowOffStop,
       midiStateBefore,
+      panicEnabledWithMidi,
       startedWithMidi,
+      visualBeforePanic,
+      visualAfterPanic,
+      statusAfterPanic,
       midiStateAfter,
     };
   });
@@ -677,6 +754,7 @@ async function main() {
 
     editor.setMidiOutEnabledForTest(false);
     const statusEl = document.getElementById("status-line");
+    const playbackTimeEl = document.getElementById("playback-time-display");
 
     const waitForActiveHighlight = async (timeoutMs) => {
       const startedAt = Date.now();
@@ -688,6 +766,25 @@ async function main() {
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
       return false;
+    };
+
+    const parsePlaybackTime = (label) => {
+      const text = String(label || "");
+      const match = /Time:\\s*(\\d+):(\\d{2})\\.(\\d{3})\\s*\\/\\s*(\\d+):(\\d{2})\\.(\\d{3})/.exec(text);
+      if (!match) {
+        return {
+          valid: false,
+          currentMs: null,
+          durationMs: null,
+        };
+      }
+      const currentMs = (Number(match[1]) * 60000) + (Number(match[2]) * 1000) + Number(match[3]);
+      const durationMs = (Number(match[4]) * 60000) + (Number(match[5]) * 1000) + Number(match[6]);
+      return {
+        valid: true,
+        currentMs,
+        durationMs,
+      };
     };
 
     editor.setTool("zoom");
@@ -713,13 +810,35 @@ async function main() {
     editor.setFollowPlayheadForTest(true);
     const startedFollowOn = editor.playAllNotes();
     const statusAfterFollowOnPlay = String(statusEl?.textContent || "");
+    const playbackTimeAtFollowOnStartText = String(playbackTimeEl?.textContent || "");
+    const playbackTimeAtFollowOnStart = parsePlaybackTime(playbackTimeAtFollowOnStartText);
     const sawActiveFollowOn = await waitForActiveHighlight(1800);
-    await new Promise((resolve) => setTimeout(resolve, 4500));
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const sustainSampleAVisual = editor.getPlaybackVisualState();
+    const sustainSampleATimeText = String(playbackTimeEl?.textContent || "");
+    const sustainSampleATime = parsePlaybackTime(sustainSampleATimeText);
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    const sustainSampleBVisual = editor.getPlaybackVisualState();
+    const sustainSampleBTimeText = String(playbackTimeEl?.textContent || "");
+    const sustainSampleBTime = parsePlaybackTime(sustainSampleBTimeText);
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const gapSampleAVisual = editor.getPlaybackVisualState();
+    const gapSampleATimeText = String(playbackTimeEl?.textContent || "");
+    const gapSampleATime = parsePlaybackTime(gapSampleATimeText);
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    const gapSampleBVisual = editor.getPlaybackVisualState();
+    const gapSampleBTimeText = String(playbackTimeEl?.textContent || "");
+    const gapSampleBTime = parsePlaybackTime(gapSampleBTimeText);
     const viewportAfterFollowOn = editor.getViewState();
     const visualDuringFollowOn = editor.getPlaybackVisualState();
     const globalMaxDuringFollowOn = Number(editor.getSessionMaxTick());
     editor.stopMidiPlayback({ sendPanic: true });
     const visualAfterFollowOnStop = editor.getPlaybackVisualState();
+    const playbackTimeAfterFollowOnStopText = String(playbackTimeEl?.textContent || "");
+    const playbackTimeAfterFollowOnStop = parsePlaybackTime(playbackTimeAfterFollowOnStopText);
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    const playbackTimeAfterFollowOnStopLaterText = String(playbackTimeEl?.textContent || "");
+    const playbackTimeAfterFollowOnStopLater = parsePlaybackTime(playbackTimeAfterFollowOnStopLaterText);
     const globalMaxAfterFollowOnStop = Number(editor.getSessionMaxTick());
 
     editor.setXOffsetTicksForTest(6000);
@@ -728,16 +847,23 @@ async function main() {
     editor.setFollowPlayheadForTest(false);
     const startedFollowOff = editor.playAllNotes();
     const statusAfterFollowOffPlay = String(statusEl?.textContent || "");
+    const playbackTimeAtFollowOffStartText = String(playbackTimeEl?.textContent || "");
+    const playbackTimeAtFollowOffStart = parsePlaybackTime(playbackTimeAtFollowOffStartText);
     const sawActiveFollowOff = await waitForActiveHighlight(1800);
     const viewportBeforeFollowOffManualPan = editor.getViewState();
     const manualPanChanged = editor.panViewportByTicks(4000);
     const viewportAfterFollowOffManualPan = editor.getViewState();
     await new Promise((resolve) => setTimeout(resolve, 1200));
     const viewportAfterFollowOffWait = editor.getViewState();
+    const playbackTimeDuringFollowOffText = String(playbackTimeEl?.textContent || "");
+    const playbackTimeDuringFollowOff = parsePlaybackTime(playbackTimeDuringFollowOffText);
+    const playbackCurrentSecDuringFollowOff = Number(editor.getPlaybackCurrentSec());
     const visualDuringFollowOff = editor.getPlaybackVisualState();
     const globalMaxDuringFollowOff = Number(editor.getSessionMaxTick());
     editor.stopMidiPlayback({ sendPanic: true });
     const visualAfterFollowOffStop = editor.getPlaybackVisualState();
+    const playbackTimeAfterFollowOffStopText = String(playbackTimeEl?.textContent || "");
+    const playbackTimeAfterFollowOffStop = parsePlaybackTime(playbackTimeAfterFollowOffStopText);
     const globalMaxAfterFollowOffStop = Number(editor.getSessionMaxTick());
 
     const firstNote = notes.reduce((best, note) => {
@@ -780,17 +906,37 @@ async function main() {
       playAllMaxEndTick,
       startedFollowOn,
       statusAfterFollowOnPlay,
+      playbackTimeAtFollowOnStartText,
+      playbackTimeAtFollowOnStart,
       sawActiveFollowOn,
+      sustainSampleAVisual,
+      sustainSampleATimeText,
+      sustainSampleATime,
+      sustainSampleBVisual,
+      sustainSampleBTimeText,
+      sustainSampleBTime,
+      gapSampleAVisual,
+      gapSampleATimeText,
+      gapSampleATime,
+      gapSampleBVisual,
+      gapSampleBTimeText,
+      gapSampleBTime,
       viewportBeforeFollowOn,
       viewportAfterFollowOn,
       followOnOffsetDelta: Number(viewportAfterFollowOn.xOffsetTicks || 0) - Number(viewportBeforeFollowOn.xOffsetTicks || 0),
       visualDuringFollowOn,
       visualAfterFollowOnStop,
+      playbackTimeAfterFollowOnStopText,
+      playbackTimeAfterFollowOnStop,
+      playbackTimeAfterFollowOnStopLaterText,
+      playbackTimeAfterFollowOnStopLater,
       globalMaxBeforeFollowOn,
       globalMaxDuringFollowOn,
       globalMaxAfterFollowOnStop,
       startedFollowOff,
       statusAfterFollowOffPlay,
+      playbackTimeAtFollowOffStartText,
+      playbackTimeAtFollowOffStart,
       sawActiveFollowOff,
       viewportBeforeFollowOff,
       viewportBeforeFollowOffManualPan,
@@ -799,8 +945,13 @@ async function main() {
       manualPanChanged,
       manualPanDelta: Number(viewportAfterFollowOffManualPan.xOffsetTicks || 0) - Number(viewportBeforeFollowOffManualPan.xOffsetTicks || 0),
       followOffOffsetDrift: Number(viewportAfterFollowOffWait.xOffsetTicks || 0) - Number(viewportAfterFollowOffManualPan.xOffsetTicks || 0),
+      playbackTimeDuringFollowOffText,
+      playbackTimeDuringFollowOff,
+      playbackCurrentSecDuringFollowOff,
       visualDuringFollowOff,
       visualAfterFollowOffStop,
+      playbackTimeAfterFollowOffStopText,
+      playbackTimeAfterFollowOffStop,
       globalMaxBeforeFollowOff,
       globalMaxDuringFollowOff,
       globalMaxAfterFollowOffStop,
@@ -1077,6 +1228,14 @@ def test_browser_import_and_exports_via_real_controls(tmp_path: Path) -> None:
 
     playback = result["playbackReport"]
     assert playback is not None
+    assert playback["hasPlaybackTimeDisplay"] is True
+    assert playback["formatSamples"]["zero"] == "00:00.000"
+    assert playback["formatSamples"]["onePointTwo"] == "00:01.200"
+    assert playback["formatSamples"]["sixtyFivePoint034"] == "01:05.034"
+    assert playback["formatSamples"]["longValue"] == "12:25.678"
+    assert playback["playbackTimeInitial"]["valid"] is True
+    assert playback["playbackTimeInitial"]["currentMs"] == 0
+    assert playback["playbackTimeInitial"]["durationMs"] == 0
     assert playback["playAllEnabledWithoutMidi"] is True
     assert playback["playSelectedEnabledWithoutMidi"] is True
     assert playback["playRegionEnabledWithoutMidi"] is True
@@ -1088,22 +1247,40 @@ def test_browser_import_and_exports_via_real_controls(tmp_path: Path) -> None:
     assert playback["stopEnabledDuringFollowOn"] is True
     assert playback["sawActiveHighlight"] is True
     assert "Visual playback only. Enable MIDI Out for external sound." in playback["statusAfterPlayAllNoMidi"]
+    assert playback["playbackTimeDuringFollowOn"]["valid"] is True
+    assert playback["playbackTimeDuringFollowOn"]["currentMs"] > 0
+    assert playback["playbackTimeDuringFollowOn"]["durationMs"] > 0
+    assert playback["playbackCurrentSecDuringFollowOn"] > 0
+    assert playback["playbackDurationSecDuringFollowOn"] > 0
 
     if playback["viewportBeforeFollowOn"]["xOffsetTicks"] > 1:
       assert playback["viewportDuringFollowOn"]["xOffsetTicks"] < playback["viewportBeforeFollowOn"]["xOffsetTicks"]
 
     assert playback["startedFollowOff"] is True
     assert "Visual playback only. Enable MIDI Out for external sound." in playback["statusAfterRegionNoMidi"]
+    assert playback["playbackTimeAtFollowOffStart"]["valid"] is True
+    assert playback["playbackTimeDuringFollowOff"]["valid"] is True
+    assert playback["playbackTimeDuringFollowOff"]["currentMs"] > playback["playbackTimeAtFollowOffStart"]["currentMs"]
     assert abs(
       playback["viewportDuringFollowOff"]["xOffsetTicks"]
       - playback["viewportBeforeFollowOff"]["xOffsetTicks"]
     ) < 1
     assert playback["visualAfterStopNoMidi"]["isPlaying"] is False
     assert playback["visualAfterStopNoMidi"]["activeNoteIds"] == []
+    assert playback["playbackTimeAfterStopNoMidi"]["valid"] is True
+    assert playback["playbackTimeAfterStopNoMidiLater"]["valid"] is True
+    assert playback["playbackTimeAfterStopNoMidiLater"]["currentMs"] == playback["playbackTimeAfterStopNoMidi"]["currentMs"]
     assert playback["visualAfterFollowOffStop"]["isPlaying"] is False
     assert playback["visualAfterFollowOffStop"]["activeNoteIds"] == []
+    assert playback["playbackTimeAfterFollowOffStop"]["valid"] is True
     assert playback["midiStateBefore"]["can_send_midi_out"] is True
+    assert playback["panicEnabledWithMidi"] is True
     assert playback["startedWithMidi"] is True
+    assert playback["visualBeforePanic"]["isPlaying"] is True
+    assert playback["visualAfterPanic"]["isPlaying"] is False
+    assert playback["visualAfterPanic"]["activeNoteIds"] == []
+    assert playback["visualAfterPanic"]["animationFrameActive"] is False
+    assert "MIDI panic sent." in playback["statusAfterPanic"]
     assert playback["midiStateAfter"]["test_sent_message_count"] > playback["midiStateBefore"]["test_sent_message_count"]
 
     copy_paste = result["copyPasteReport"]
@@ -1257,7 +1434,28 @@ def test_browser_long_session_viewport_uses_full_session_range(tmp_path: Path) -
 
     assert report["startedFollowOn"] is True
     assert "Visual playback only. Enable MIDI Out for external sound." in report["statusAfterFollowOnPlay"]
+    assert report["playbackTimeAtFollowOnStart"]["valid"] is True
     assert report["sawActiveFollowOn"] is True
+    assert report["sustainSampleATime"]["valid"] is True
+    assert report["sustainSampleBTime"]["valid"] is True
+    assert report["sustainSampleATime"]["currentMs"] > report["playbackTimeAtFollowOnStart"]["currentMs"]
+    assert report["sustainSampleBTime"]["currentMs"] > report["sustainSampleATime"]["currentMs"]
+    assert report["sustainSampleAVisual"]["currentTick"] is not None
+    assert report["sustainSampleBVisual"]["currentTick"] is not None
+    assert report["sustainSampleBVisual"]["currentTick"] > report["sustainSampleAVisual"]["currentTick"]
+    assert len(report["sustainSampleAVisual"]["activeNoteIds"]) >= 1
+    assert len(report["sustainSampleBVisual"]["activeNoteIds"]) >= 1
+
+    assert report["gapSampleATime"]["valid"] is True
+    assert report["gapSampleBTime"]["valid"] is True
+    assert report["gapSampleATime"]["currentMs"] > report["sustainSampleBTime"]["currentMs"]
+    assert report["gapSampleBTime"]["currentMs"] > report["gapSampleATime"]["currentMs"]
+    assert report["gapSampleAVisual"]["currentTick"] is not None
+    assert report["gapSampleBVisual"]["currentTick"] is not None
+    assert report["gapSampleBVisual"]["currentTick"] > report["gapSampleAVisual"]["currentTick"]
+    assert report["gapSampleAVisual"]["activeNoteIds"] == []
+    assert report["gapSampleBVisual"]["activeNoteIds"] == []
+
     assert report["followOnOffsetDelta"] > 100
     assert report["visualDuringFollowOn"]["isPlaying"] is True
     assert report["visualDuringFollowOn"]["followPlayhead"] is True
@@ -1268,13 +1466,20 @@ def test_browser_long_session_viewport_uses_full_session_range(tmp_path: Path) -
     assert report["visualAfterFollowOnStop"]["currentTick"] is None
     assert report["visualAfterFollowOnStop"]["activeNoteIds"] == []
     assert report["visualAfterFollowOnStop"]["animationFrameActive"] is False
+    assert report["playbackTimeAfterFollowOnStop"]["valid"] is True
+    assert report["playbackTimeAfterFollowOnStopLater"]["valid"] is True
+    assert report["playbackTimeAfterFollowOnStopLater"]["currentMs"] == report["playbackTimeAfterFollowOnStop"]["currentMs"]
 
     assert report["startedFollowOff"] is True
     assert "Visual playback only. Enable MIDI Out for external sound." in report["statusAfterFollowOffPlay"]
+    assert report["playbackTimeAtFollowOffStart"]["valid"] is True
     assert report["sawActiveFollowOff"] is True
     assert report["manualPanChanged"] is True
     assert report["manualPanDelta"] == pytest.approx(4000, abs=1)
     assert abs(report["followOffOffsetDrift"]) < 1
+    assert report["playbackTimeDuringFollowOff"]["valid"] is True
+    assert report["playbackTimeDuringFollowOff"]["currentMs"] > report["playbackTimeAtFollowOffStart"]["currentMs"]
+    assert report["playbackCurrentSecDuringFollowOff"] > 0
     assert report["visualDuringFollowOff"]["isPlaying"] is True
     assert report["visualDuringFollowOff"]["followPlayhead"] is False
     assert report["visualDuringFollowOff"]["currentTick"] is not None
@@ -1284,6 +1489,7 @@ def test_browser_long_session_viewport_uses_full_session_range(tmp_path: Path) -
     assert report["visualAfterFollowOffStop"]["currentTick"] is None
     assert report["visualAfterFollowOffStop"]["activeNoteIds"] == []
     assert report["visualAfterFollowOffStop"]["animationFrameActive"] is False
+    assert report["playbackTimeAfterFollowOffStop"]["valid"] is True
 
     assert report["startedRegion"] is True
     assert report["regionEventMaxEndTick"] >= report["regionStart"]
