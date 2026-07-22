@@ -68,6 +68,36 @@ def _write_browser_test_midi(path: Path) -> None:
     midi.save(path)
 
 
+def _write_long_browser_test_midi(path: Path) -> None:
+    midi = mido.MidiFile(type=1, ticks_per_beat=480)
+
+    tempo_track = mido.MidiTrack()
+    tempo_track.append(mido.MetaMessage("set_tempo", tempo=500000, time=0))
+    midi.tracks.append(tempo_track)
+
+    long_track = mido.MidiTrack()
+    long_track.append(mido.MetaMessage("track_name", name="Long Browser Track", time=0))
+
+    events = [
+        (0, 240, 40, 100),
+        (960, 240, 43, 98),
+        (28800, 480, 45, 96),
+        (57600, 480, 47, 95),
+        (115200, 960, 48, 94),
+        (230400, 960, 50, 92),
+    ]
+
+    current_tick = 0
+    for start_tick, duration_tick, pitch, velocity in events:
+        delta = max(0, int(start_tick) - int(current_tick))
+        long_track.append(mido.Message("note_on", note=int(pitch), velocity=int(velocity), channel=0, time=delta))
+        long_track.append(mido.Message("note_off", note=int(pitch), velocity=0, channel=0, time=int(duration_tick)))
+        current_tick = int(start_tick) + int(duration_tick)
+
+    midi.tracks.append(long_track)
+    midi.save(path)
+
+
 def _build_server():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _MidiSplitEditorRequestHandler)
     server.editor_state = _EditorState(_default_session())  # type: ignore[attr-defined]
@@ -521,6 +551,174 @@ main().catch((error) => {
 """.strip()
 
 
+def _node_long_viewport_script_content() -> str:
+    return """
+const fs = require("fs");
+const { chromium } = require("playwright");
+
+const [baseUrl, midiPath, outResultPath] = process.argv.slice(2);
+
+async function main() {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  page.on("console", (msg) => {
+    if (msg.type() === "error") {
+      consoleErrors.push(msg.text());
+    }
+  });
+
+  page.on("pageerror", (error) => {
+    pageErrors.push(String(error));
+  });
+
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#server-status");
+  await page.waitForFunction(() => {
+    const el = document.getElementById("server-status");
+    return !!el && /connected/i.test(el.textContent || "");
+  }, { timeout: 15000 });
+
+  await page.setInputFiles("#import-midi-input", midiPath);
+  await page.waitForFunction(() => {
+    const editor = window.__midiSplitEditor;
+    return !!editor && editor.getSession().notes.length >= 6;
+  }, { timeout: 15000 });
+
+  const report = await page.evaluate(async () => {
+    const editor = window.__midiSplitEditor;
+    const session = editor.getSession();
+    const notes = Array.isArray(session.notes) ? session.notes.slice() : [];
+
+    const sessionMaxByData = notes.reduce((maxTick, note) => {
+      const startTick = Number(note?.start_tick || 0);
+      const endTick = Number(note?.end_tick);
+      if (Number.isFinite(endTick)) {
+        return Math.max(maxTick, Math.max(startTick, endTick));
+      }
+      const durationTick = Number(note?.duration_ticks || 0);
+      return Math.max(maxTick, Math.max(startTick, startTick + Math.max(0, durationTick)));
+    }, 0);
+
+    const sessionMaxByApi = Number(editor.getSessionMaxTick());
+    const viewportStart = editor.getViewState();
+    const viewportMaxOffset = Number(editor.getViewportMaxOffsetTicks());
+    const expectedMinOffset = Math.max(0, sessionMaxByApi - Number(viewportStart.visibleTickSpan || 0));
+
+    const lastNote = notes.reduce((best, note) => {
+      if (!best) {
+        return note;
+      }
+      const currentEnd = Number(note?.end_tick || note?.start_tick || 0);
+      const bestEnd = Number(best?.end_tick || best?.start_tick || 0);
+      return currentEnd > bestEnd ? note : best;
+    }, null);
+    const lastNoteId = lastNote ? String(lastNote.note_id) : null;
+
+    const nearEndRequest = Math.max(0, sessionMaxByApi - Number(viewportStart.visibleTickSpan || 0) * 0.5);
+    const offsetNearEnd = Number(editor.setXOffsetTicksForTest(nearEndRequest));
+    const viewportNearEnd = editor.getViewState();
+    const visibleNoteIdsNearEnd = editor.getVisibleNoteIds();
+    const noteBoxesNearEnd = editor.getNoteBoxes();
+    const nearEndContainsLast = Boolean(lastNoteId && visibleNoteIdsNearEnd.includes(lastNoteId));
+
+    const playAllEvents = editor.buildPlaybackEventsForAll();
+    const playAllMaxEndTick = playAllEvents.reduce((maxTick, event) => {
+      return Math.max(maxTick, Number(event.end_tick || event.start_tick || 0));
+    }, 0);
+
+    editor.setMidiOutEnabledForTest(false);
+
+    const globalMaxBeforeFollowOn = Number(editor.getSessionMaxTick());
+    editor.setFollowPlayheadForTest(true);
+    const startedFollowOn = editor.playAllNotes();
+    await new Promise((resolve) => setTimeout(resolve, 220));
+    const visualDuringFollowOn = editor.getPlaybackVisualState();
+    const globalMaxDuringFollowOn = Number(editor.getSessionMaxTick());
+    editor.stopMidiPlayback({ sendPanic: true });
+
+    const globalMaxBeforeFollowOff = Number(editor.getSessionMaxTick());
+    editor.setFollowPlayheadForTest(false);
+    const startedFollowOff = editor.playAllNotes();
+    await new Promise((resolve) => setTimeout(resolve, 220));
+    const visualDuringFollowOff = editor.getPlaybackVisualState();
+    const globalMaxDuringFollowOff = Number(editor.getSessionMaxTick());
+    editor.stopMidiPlayback({ sendPanic: true });
+
+    const firstNote = notes.reduce((best, note) => {
+      if (!best) {
+        return note;
+      }
+      return Number(note.start_tick || 0) < Number(best.start_tick || 0) ? note : best;
+    }, null);
+    const regionStart = firstNote ? Math.max(0, Math.round(Number(firstNote.start_tick || 0))) : 0;
+    const regionEnd = firstNote
+      ? Math.max(regionStart + 1, Math.round(Number(firstNote.end_tick || regionStart + 1)))
+      : regionStart + 1;
+    editor.setSelectionRegionForTest(regionStart, regionEnd);
+    const regionEvents = editor.buildPlaybackEventsForRegion();
+    const regionEventMaxEndTick = regionEvents.reduce((maxTick, event) => {
+      return Math.max(maxTick, Number(event.end_tick || event.start_tick || 0));
+    }, 0);
+
+    const globalMaxBeforeRegionPlay = Number(editor.getSessionMaxTick());
+    const startedRegion = editor.playSelectedRegion();
+    const visualAtRegionStart = editor.getPlaybackVisualState();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const globalMaxDuringRegionPlay = Number(editor.getSessionMaxTick());
+    editor.stopMidiPlayback({ sendPanic: true });
+
+    return {
+      sessionNoteCount: notes.length,
+      sessionMaxByData,
+      sessionMaxByApi,
+      viewportStart,
+      viewportMaxOffset,
+      expectedMinOffset,
+      lastNoteId,
+      offsetNearEnd,
+      viewportNearEnd,
+      visibleNoteIdsNearEnd,
+      noteBoxesNearEndCount: noteBoxesNearEnd.length,
+      nearEndContainsLast,
+      playAllEventCount: playAllEvents.length,
+      playAllMaxEndTick,
+      startedFollowOn,
+      visualDuringFollowOn,
+      globalMaxBeforeFollowOn,
+      globalMaxDuringFollowOn,
+      startedFollowOff,
+      visualDuringFollowOff,
+      globalMaxBeforeFollowOff,
+      globalMaxDuringFollowOff,
+      startedRegion,
+      visualAtRegionStart,
+      regionStart,
+      regionEnd,
+      regionEventMaxEndTick,
+      globalMaxBeforeRegionPlay,
+      globalMaxDuringRegionPlay,
+    };
+  });
+
+  await browser.close();
+
+  fs.writeFileSync(
+    outResultPath,
+    JSON.stringify({ report, consoleErrors, pageErrors }, null, 2)
+  );
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+""".strip()
+
+
 def test_browser_import_and_exports_via_real_controls(tmp_path: Path) -> None:
     midi_path = tmp_path / "browser_flow.mid"
     _write_browser_test_midi(midi_path)
@@ -705,3 +903,73 @@ def test_browser_import_and_exports_via_real_controls(tmp_path: Path) -> None:
             midi_data = archive.read(name)
             parsed = mido.MidiFile(file=io.BytesIO(midi_data))
             assert len(parsed.tracks) > 0
+
+
+def test_browser_long_session_viewport_uses_full_session_range(tmp_path: Path) -> None:
+    midi_path = tmp_path / "browser_long_viewport.mid"
+    _write_long_browser_test_midi(midi_path)
+
+    node_path = shutil.which("node")
+    assert node_path is not None
+
+    result_path = tmp_path / "browser_long_viewport_result.json"
+    script_path = tmp_path / "browser_long_viewport.js"
+    script_path.write_text(_node_long_viewport_script_content() + "\n", encoding="utf-8")
+
+    server, thread, base_url = _build_server()
+    try:
+        completed = subprocess.run(
+            [
+                node_path,
+                str(script_path),
+                base_url,
+                str(midi_path),
+                str(result_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert completed.returncode == 0, (
+        "Browser long-session viewport script failed\n"
+        f"STDOUT:\n{completed.stdout}\n"
+        f"STDERR:\n{completed.stderr}"
+    )
+
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert payload["consoleErrors"] == []
+    assert payload["pageErrors"] == []
+
+    report = payload["report"]
+    assert report["sessionNoteCount"] >= 6
+    assert report["sessionMaxByData"] >= 231360
+    assert report["sessionMaxByApi"] >= report["sessionMaxByData"]
+    assert report["viewportMaxOffset"] > 0
+    assert report["viewportMaxOffset"] >= report["expectedMinOffset"] - 1
+    assert report["offsetNearEnd"] > 0
+    assert report["offsetNearEnd"] <= report["viewportMaxOffset"] + 1
+    assert report["nearEndContainsLast"] is True
+    assert report["noteBoxesNearEndCount"] >= 1
+
+    assert report["playAllEventCount"] >= report["sessionNoteCount"]
+    assert report["playAllMaxEndTick"] >= report["sessionMaxByData"]
+
+    assert report["startedFollowOn"] is True
+    assert report["visualDuringFollowOn"]["isPlaying"] is True
+    assert report["globalMaxBeforeFollowOn"] == pytest.approx(report["globalMaxDuringFollowOn"], abs=1e-6)
+
+    assert report["startedFollowOff"] is True
+    assert report["visualDuringFollowOff"]["isPlaying"] is True
+    assert report["globalMaxBeforeFollowOff"] == pytest.approx(report["globalMaxDuringFollowOff"], abs=1e-6)
+
+    assert report["startedRegion"] is True
+    assert report["regionEventMaxEndTick"] >= report["regionStart"]
+    assert report["regionEventMaxEndTick"] <= report["sessionMaxByApi"]
+    assert report["visualAtRegionStart"]["playbackEndTick"] <= report["sessionMaxByApi"]
+    assert report["globalMaxBeforeRegionPlay"] == pytest.approx(report["globalMaxDuringRegionPlay"], abs=1e-6)

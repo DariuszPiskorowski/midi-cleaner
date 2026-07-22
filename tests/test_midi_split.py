@@ -365,6 +365,9 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function ensureTickRangeVisible(startTick, endTick)" in html
     assert "function panViewportByTicks(deltaTicks)" in html
     assert "function panViewportBySemitones(deltaRows)" in html
+    assert "function normalizedNoteEndTick(note)" in html
+    assert "function getSessionMaxTick()" in html
+    assert "function getViewportMaxOffsetTicks()" in html
     assert "function getViewportState()" in html
     assert "function getVisibleTickRange()" in html
     assert "function centerViewportOnTick(tick)" in html
@@ -529,11 +532,15 @@ def test_generate_piano_roll_preview_exposes_snap_controls_in_test_api(tmp_path:
     assert "getSelectedNoteIds: function ()" in script
     assert "setKeyboardFocusMode: setKeyboardFocusMode" in script
     assert "getKeyboardFocusMode: getKeyboardFocusMode" in script
+    assert "getSessionMaxTick: getSessionMaxTick" in script
+    assert "getViewportMaxOffsetTicks: getViewportMaxOffsetTicks" in script
     assert "panViewportByTicks: function (deltaTicks)" in script
+    assert "setXOffsetTicksForTest: function (tick)" in script
     assert "panViewportBySemitones: function (deltaRows)" in script
     assert "centerViewportOnTick: function (tick)" in script
     assert "getVisibleTickRange: getVisibleTickRange" in script
     assert "getViewportState: getViewportState" in script
+    assert "getVisibleNoteIds: function ()" in script
     assert "moveSelectedNotesByKeyboard: moveSelectedNotesByKeyboard" in script
     assert "adjustSelectedVelocityByKeyboard: adjustSelectedVelocityByKeyboard" in script
 
@@ -568,6 +575,7 @@ def test_generate_piano_roll_preview_web_midi_playback_builder_behavior_markers(
     assert "test_sent_message_count:" in script
     assert "setStatus(String(statusLabel || \"Playing notes.\"), false);" in script
     assert "function getPlaybackTickRangeFromEvents(events)" in script
+    assert "function getPlaybackEndTickForEvents(events)" in script
     assert "schedulePlaybackTimer(function () {" in script
     assert "state.playbackVisualState.activeNoteIds.add(noteId);" in script
     assert "state.playbackVisualState.activeNoteIds.delete(noteId);" in script

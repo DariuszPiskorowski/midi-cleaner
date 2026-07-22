@@ -1232,12 +1232,31 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         return null;
       }
 
-      function getMaxTick() {
+      function normalizedNoteEndTick(note) {
+        const startTick = Math.max(0, Math.round(Number(note && note.start_tick || 0)));
+        const explicitEndTick = Number(note && note.end_tick);
+        if (Number.isFinite(explicitEndTick)) {
+          return Math.max(startTick, Math.round(explicitEndTick));
+        }
+
+        const durationTicks = Number(note && note.duration_ticks);
+        if (Number.isFinite(durationTicks)) {
+          return Math.max(startTick, startTick + Math.max(0, Math.round(durationTicks)));
+        }
+
+        return startTick;
+      }
+
+      function getSessionMaxTick() {
         let maxTick = Math.max(0, Number(session.ticks_per_beat) * 8);
         for (const note of session.notes) {
-          maxTick = Math.max(maxTick, Number(note.end_tick || 0));
+          maxTick = Math.max(maxTick, normalizedNoteEndTick(note));
         }
         return maxTick;
+      }
+
+      function getMaxTick() {
+        return getSessionMaxTick();
       }
 
       function getVisibleTickSpan() {
@@ -1245,10 +1264,18 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         return widthPx / state.pixelsPerTick;
       }
 
+      function getViewportMaxOffsetTicks() {
+        const sessionMaxTick = getSessionMaxTick();
+        const visibleTickSpan = Math.max(1, getVisibleTickSpan());
+        const tailMarginTicks = Math.max(1, Number(session.ticks_per_beat || 480) * 2);
+        return Math.max(0, sessionMaxTick - visibleTickSpan + tailMarginTicks);
+      }
+
       function clampXOffsetTicks() {
-        const maxTick = getMaxTick();
-        const maxOffset = Math.max(0, maxTick - getVisibleTickSpan() + Number(session.ticks_per_beat || 480) * 2);
-        state.xOffsetTicks = Math.max(0, Math.min(state.xOffsetTicks, maxOffset));
+        const maxOffset = getViewportMaxOffsetTicks();
+        const currentOffset = Number(state.xOffsetTicks);
+        const normalizedOffset = Number.isFinite(currentOffset) ? currentOffset : 0;
+        state.xOffsetTicks = Math.max(0, Math.min(normalizedOffset, maxOffset));
       }
 
       function updatePitchRange() {
@@ -3312,7 +3339,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         let maxEndTick = 0;
         for (const event of events) {
           const startTick = Math.max(0, Math.round(Number(event.start_tick || 0)));
-          const endTick = Math.max(startTick, Math.round(Number(event.end_tick || startTick)));
+          const endTick = Math.max(startTick, normalizedNoteEndTick(event));
           minStartTick = Math.min(minStartTick, startTick);
           maxEndTick = Math.max(maxEndTick, endTick);
         }
@@ -3320,6 +3347,14 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           start_tick: Number.isFinite(minStartTick) ? minStartTick : 0,
           end_tick: maxEndTick,
         };
+      }
+
+      function getPlaybackEndTickForEvents(events) {
+        const tickRange = getPlaybackTickRangeFromEvents(events);
+        if (!tickRange) {
+          return 0;
+        }
+        return Math.max(0, Math.round(Number(tickRange.end_tick || 0)));
       }
 
       function playPlaybackEvents(events, statusLabel, options) {
@@ -3338,7 +3373,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           : Number(tickRange && tickRange.start_tick || 0);
         const playbackEndTick = Number.isFinite(Number(opts.playbackEndTick))
           ? Math.max(timingStartTick, Math.round(Number(opts.playbackEndTick)))
-          : Number(tickRange && tickRange.end_tick || timingStartTick);
+          : Math.max(timingStartTick, getPlaybackEndTickForEvents(events));
 
         for (const event of events) {
           schedulePlaybackTimer(function () {
@@ -5782,12 +5817,23 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           },
           setKeyboardFocusMode: setKeyboardFocusMode,
           getKeyboardFocusMode: getKeyboardFocusMode,
+          getSessionMaxTick: getSessionMaxTick,
+          getViewportMaxOffsetTicks: getViewportMaxOffsetTicks,
           panViewportByTicks: function (deltaTicks) {
             const changed = panViewportByTicks(deltaTicks);
             if (changed) {
               redraw();
             }
             return changed;
+          },
+          setXOffsetTicksForTest: function (tick) {
+            if (!Number.isFinite(Number(tick))) {
+              return Number(state.xOffsetTicks || 0);
+            }
+            state.xOffsetTicks = Number(tick);
+            clampXOffsetTicks();
+            redraw();
+            return Number(state.xOffsetTicks || 0);
           },
           panViewportBySemitones: function (deltaRows) {
             const changed = panViewportBySemitones(deltaRows);
@@ -5854,6 +5900,11 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
                 w: box.w,
                 h: box.h,
               };
+            });
+          },
+          getVisibleNoteIds: function () {
+            return state.noteBoxes.map(function (box) {
+              return String(box.note.note_id);
             });
           },
         };
