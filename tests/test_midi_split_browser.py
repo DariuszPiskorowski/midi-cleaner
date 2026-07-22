@@ -154,6 +154,120 @@ async function main() {
   const secondInputValue = await page.$eval("#import-midi-input", (el) => el.value);
   const secondSession = await page.evaluate(() => window.__midiSplitEditor.getSession());
 
+  const playbackReport = await page.evaluate(async () => {
+    const editor = window.__midiSplitEditor;
+    const statusEl = document.getElementById("status-line");
+    const playSelectedButton = document.getElementById("audition-selected-btn");
+    const playRegionButton = document.getElementById("play-region-btn");
+    const playAllButton = document.getElementById("play-all-btn");
+    const stopButton = document.getElementById("stop-midi-btn");
+
+    const notes = editor.getSession().notes || [];
+    const playableNotes = notes.filter((note) => note && note.muted !== true);
+    if (!playableNotes.length) {
+      return null;
+    }
+
+    editor.setMidiOutEnabledForTest(false);
+    editor.selectNotesByIds([String(playableNotes[0].note_id)]);
+
+    const selectedState = editor.getPlaybackControlState();
+    const playAllEnabledWithoutMidi = !playAllButton.disabled;
+    const playSelectedEnabledWithoutMidi = !playSelectedButton.disabled;
+
+    const regionStart = Math.max(0, Math.round(Number(playableNotes[0].start_tick || 0)));
+    const regionEnd = Math.max(
+      regionStart + 1,
+      Math.round(Number(playableNotes[0].end_tick || playableNotes[0].start_tick || 0))
+    );
+    editor.setSelectionRegionForTest(regionStart, regionEnd);
+    const regionState = editor.getPlaybackControlState();
+    const playRegionEnabledWithoutMidi = !playRegionButton.disabled;
+
+    editor.setTool("zoom");
+    const canvas = document.getElementById("roll-canvas");
+    if (canvas) {
+      const rect = canvas.getBoundingClientRect();
+      for (let i = 0; i < 10; i += 1) {
+        const zoomEvent = new WheelEvent("wheel", {
+          deltaY: -120,
+          clientX: rect.left + rect.width * 0.72,
+          clientY: rect.top + rect.height * 0.3,
+          bubbles: true,
+          cancelable: true,
+        });
+        canvas.dispatchEvent(zoomEvent);
+      }
+    }
+    editor.setTool("select");
+
+    editor.panViewportByTicks(6000);
+    const viewportBeforeFollowOn = editor.getViewState();
+    editor.setFollowPlayheadForTest(true);
+    const startedFollowOn = editor.playAllNotes();
+    const statusAfterPlayAllNoMidi = String(statusEl?.textContent || "");
+    const visualAtStartFollowOn = editor.getPlaybackVisualState();
+    const stopEnabledDuringFollowOn = !stopButton.disabled;
+
+    let sawActiveHighlight = false;
+    const activeStart = Date.now();
+    while (Date.now() - activeStart < 1500) {
+      const visualState = editor.getPlaybackVisualState();
+      if (Array.isArray(visualState.activeNoteIds) && visualState.activeNoteIds.length > 0) {
+        sawActiveHighlight = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    const viewportDuringFollowOn = editor.getViewState();
+    editor.stopMidiPlayback({ sendPanic: true });
+    const visualAfterStopNoMidi = editor.getPlaybackVisualState();
+
+    editor.panViewportByTicks(5000);
+    const viewportBeforeFollowOff = editor.getViewState();
+    editor.setFollowPlayheadForTest(false);
+    const startedFollowOff = editor.playSelectedRegion();
+    const statusAfterRegionNoMidi = String(statusEl?.textContent || "");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const viewportDuringFollowOff = editor.getViewState();
+    editor.stopMidiPlayback({ sendPanic: true });
+    const visualAfterFollowOffStop = editor.getPlaybackVisualState();
+
+    editor.setMidiOutEnabledForTest(true);
+    editor.setSelectedMidiOutputForTest("__test__");
+    editor.selectNotesByIds([String(playableNotes[0].note_id)]);
+    const midiStateBefore = editor.getMidiOutState();
+    const startedWithMidi = editor.playSelectedNotes();
+    await new Promise((resolve) => setTimeout(resolve, 220));
+    editor.stopMidiPlayback({ sendPanic: true });
+    const midiStateAfter = editor.getMidiOutState();
+
+    return {
+      selectedState,
+      regionState,
+      playAllEnabledWithoutMidi,
+      playSelectedEnabledWithoutMidi,
+      playRegionEnabledWithoutMidi,
+      startedFollowOn,
+      statusAfterPlayAllNoMidi,
+      visualAtStartFollowOn,
+      stopEnabledDuringFollowOn,
+      sawActiveHighlight,
+      viewportBeforeFollowOn,
+      viewportDuringFollowOn,
+      visualAfterStopNoMidi,
+      startedFollowOff,
+      statusAfterRegionNoMidi,
+      viewportBeforeFollowOff,
+      viewportDuringFollowOff,
+      visualAfterFollowOffStop,
+      midiStateBefore,
+      startedWithMidi,
+      midiStateAfter,
+    };
+  });
+
   const loopReport = await page.evaluate(() => {
     const editor = window.__midiSplitEditor;
     const before = editor.getSession();
@@ -380,6 +494,7 @@ async function main() {
     firstSessionTracks: firstSession.tracks.length,
     secondSessionNotes: secondSession.notes.length,
     secondSessionTracks: secondSession.tracks.length,
+    playbackReport,
     firstNoteBoxCount,
     hasSaveJsonButton,
     hasDownloadJsonButton,
@@ -466,6 +581,37 @@ def test_browser_import_and_exports_via_real_controls(tmp_path: Path) -> None:
     assert "Imported" in result["secondStatus"]
     assert result["firstInputValue"] == ""
     assert result["secondInputValue"] == ""
+
+    playback = result["playbackReport"]
+    assert playback is not None
+    assert playback["playAllEnabledWithoutMidi"] is True
+    assert playback["playSelectedEnabledWithoutMidi"] is True
+    assert playback["playRegionEnabledWithoutMidi"] is True
+    assert playback["selectedState"]["play_selected_enabled"] is True
+    assert playback["regionState"]["play_region_enabled"] is True
+    assert playback["selectedState"]["can_send_midi_out"] is False
+    assert playback["startedFollowOn"] is True
+    assert playback["visualAtStartFollowOn"]["isPlaying"] is True
+    assert playback["stopEnabledDuringFollowOn"] is True
+    assert playback["sawActiveHighlight"] is True
+    assert "Visual playback only. Enable MIDI Out for external sound." in playback["statusAfterPlayAllNoMidi"]
+
+    if playback["viewportBeforeFollowOn"]["xOffsetTicks"] > 1:
+      assert playback["viewportDuringFollowOn"]["xOffsetTicks"] < playback["viewportBeforeFollowOn"]["xOffsetTicks"]
+
+    assert playback["startedFollowOff"] is True
+    assert "Visual playback only. Enable MIDI Out for external sound." in playback["statusAfterRegionNoMidi"]
+    assert abs(
+      playback["viewportDuringFollowOff"]["xOffsetTicks"]
+      - playback["viewportBeforeFollowOff"]["xOffsetTicks"]
+    ) < 1
+    assert playback["visualAfterStopNoMidi"]["isPlaying"] is False
+    assert playback["visualAfterStopNoMidi"]["activeNoteIds"] == []
+    assert playback["visualAfterFollowOffStop"]["isPlaying"] is False
+    assert playback["visualAfterFollowOffStop"]["activeNoteIds"] == []
+    assert playback["midiStateBefore"]["can_send_midi_out"] is True
+    assert playback["startedWithMidi"] is True
+    assert playback["midiStateAfter"]["test_sent_message_count"] > playback["midiStateBefore"]["test_sent_message_count"]
 
     copy_paste = result["copyPasteReport"]
     assert "Copied" in copy_paste["statusAfterCopy"]

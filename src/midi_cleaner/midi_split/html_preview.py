@@ -2926,37 +2926,55 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         return Boolean(resolveSelectedMidiOutput());
       }
 
-      function canUseMidiPlayback() {
+      function canSendMidiOut() {
         return Boolean(state.midiEnabled && hasSelectedMidiOutput());
+      }
+
+      function canUseMidiPlayback() {
+        return canSendMidiOut();
+      }
+
+      function isVisualPlaybackAvailableForMode(mode) {
+        const normalized = String(mode || "all").toLowerCase();
+        if (normalized === "selected") {
+          return hasPlayableSelectedNotes();
+        }
+        if (normalized === "region") {
+          return hasPlayableRegionOrSelection();
+        }
+        return hasPlayableNotes();
       }
 
       function getPlaybackControlState() {
         const output = resolveSelectedMidiOutput();
         const hasOutput = Boolean(output);
         const midiEnabled = Boolean(state.midiEnabled);
-        const canSend = Boolean(midiEnabled && hasOutput);
-        const playableNotes = hasPlayableNotes();
-        const playableSelectedNotes = hasPlayableSelectedNotes();
-        const playableRegionOrSelection = hasPlayableRegionOrSelection();
-        const playbackRunning = Boolean(state.midiPlaybackRunning);
+        const canSend = canSendMidiOut();
+        const playableNotes = isVisualPlaybackAvailableForMode("all");
+        const playableSelectedNotes = isVisualPlaybackAvailableForMode("selected");
+        const playableRegionOrSelection = isVisualPlaybackAvailableForMode("region");
+        const visualPlaybackRunning = Boolean(state.playbackVisualState.isPlaying);
+        const playbackRunning = Boolean(state.midiPlaybackRunning || visualPlaybackRunning);
 
         return {
           midi_enabled: midiEnabled,
           has_selected_output: hasOutput,
           can_send: canSend,
+          can_send_midi_out: canSend,
           has_playable_notes: playableNotes,
           has_playable_selected_notes: playableSelectedNotes,
           has_playable_region_or_selection: playableRegionOrSelection,
           playback_running: playbackRunning,
-          play_all_enabled: Boolean(canSend && playableNotes),
-          play_selected_enabled: Boolean(canSend && playableSelectedNotes),
-          play_region_enabled: Boolean(canSend && playableRegionOrSelection),
-          stop_enabled: Boolean(midiEnabled || playbackRunning),
+          visual_playback_running: visualPlaybackRunning,
+          play_all_enabled: playableNotes,
+          play_selected_enabled: playableSelectedNotes,
+          play_region_enabled: playableRegionOrSelection,
+          stop_enabled: playbackRunning,
           panic_enabled: midiEnabled,
         };
       }
 
-      function updatePlaybackButtonState() {
+      function updatePlaybackControls() {
         const playbackState = getPlaybackControlState();
         if (auditionSelectedButton) {
           auditionSelectedButton.disabled = !playbackState.play_selected_enabled;
@@ -2976,6 +2994,10 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         return playbackState;
       }
 
+      function updatePlaybackButtonState() {
+        return updatePlaybackControls();
+      }
+
       function getMidiOutState() {
         const playbackState = getPlaybackControlState();
         return {
@@ -2985,12 +3007,20 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           selected_output_id: state.midiOutputId,
           selected_output_available: playbackState.has_selected_output,
           can_playback: playbackState.can_send,
+          can_send_midi_out: playbackState.can_send_midi_out,
           play_all_enabled: playbackState.play_all_enabled,
           play_selected_enabled: playbackState.play_selected_enabled,
           play_region_enabled: playbackState.play_region_enabled,
           stop_enabled: playbackState.stop_enabled,
           panic_enabled: playbackState.panic_enabled,
           playback_running: Boolean(state.midiPlaybackRunning),
+          visual_playback_running: playbackState.visual_playback_running,
+          test_sent_message_count: (
+            state.midiOutputTestOverride
+            && Array.isArray(state.midiOutputTestOverride.sentMessages)
+          )
+            ? state.midiOutputTestOverride.sentMessages.length
+            : 0,
           audition_on_click: Boolean(auditionOnClickEl && auditionOnClickEl.checked),
         };
       }
@@ -3002,7 +3032,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         if (midiOutPortEl) {
           midiOutPortEl.disabled = !state.midiEnabled;
         }
-        updatePlaybackButtonState();
+        updatePlaybackControls();
       }
 
       function refreshMidiOutPortList() {
@@ -3152,7 +3182,9 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       }
 
       function panicMidiOut() {
-        if (!state.midiEnabled) {
+        if (!canSendMidiOut()) {
+          state.midiActiveNotes.clear();
+          updatePlaybackControls();
           return false;
         }
         for (let channel = 0; channel < 16; channel += 1) {
@@ -3163,6 +3195,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           sendMidiMessage([0xB0 | channel, 120, 0]);
         }
         state.midiActiveNotes.clear();
+        updatePlaybackControls();
         return true;
       }
 
@@ -3173,8 +3206,11 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         }
         state.midiPlaybackTimerIds = [];
         state.midiPlaybackRunning = false;
-        if (opts.sendPanic !== false) {
+        const shouldSendPanic = opts.sendPanic !== false && canSendMidiOut();
+        if (shouldSendPanic) {
           panicMidiOut();
+        } else {
+          state.midiActiveNotes.clear();
         }
         stopPlaybackVisuals({ redraw: opts.redrawVisuals !== false, preserveFollowPlayhead: true });
         updateMidiOutControls();
@@ -3287,21 +3323,13 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       }
 
       function playPlaybackEvents(events, statusLabel, options) {
-        if (!state.midiEnabled) {
-          setStatus("Enable MIDI Out first.", true);
-          return false;
-        }
-        const output = resolveSelectedMidiOutput();
-        if (!output) {
-          setStatus("Select a MIDI output first.", true);
-          return false;
-        }
-
-        stopMidiPlayback({ sendPanic: true });
         if (!Array.isArray(events) || !events.length) {
           setStatus("No playable notes for audition.", false);
           return false;
         }
+
+        const shouldSendMidi = canSendMidiOut();
+        stopMidiPlayback({ sendPanic: shouldSendMidi });
 
         const opts = options && typeof options === "object" ? options : {};
         const tickRange = getPlaybackTickRangeFromEvents(events);
@@ -3314,21 +3342,23 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
 
         for (const event of events) {
           schedulePlaybackTimer(function () {
-            const noteWasSent = sendMidiNoteOn(event);
-            if (noteWasSent) {
-              const noteId = String(event.note_id || "");
-              if (noteId && state.noteById.has(noteId)) {
-                const note = state.noteById.get(noteId);
-                if (note && note.muted !== true) {
-                  state.playbackVisualState.activeNoteIds.add(noteId);
-                }
+            const noteId = String(event.note_id || "");
+            if (noteId && state.noteById.has(noteId)) {
+              const note = state.noteById.get(noteId);
+              if (note && note.muted !== true) {
+                state.playbackVisualState.activeNoteIds.add(noteId);
               }
-              redraw();
             }
+            if (shouldSendMidi) {
+              sendMidiNoteOn(event);
+            }
+            redraw();
           }, event.start_ms);
 
           schedulePlaybackTimer(function () {
-            sendMidiNoteOff(event);
+            if (shouldSendMidi) {
+              sendMidiNoteOff(event);
+            }
             const noteId = String(event.note_id || "");
             if (noteId) {
               state.playbackVisualState.activeNoteIds.delete(noteId);
@@ -3354,7 +3384,11 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           setStatus("Playback finished.", false);
         }, endMs + 30);
         updateMidiOutControls();
-        setStatus(String(statusLabel || "Audition started."), false);
+        if (shouldSendMidi) {
+          setStatus(String(statusLabel || "Playing notes."), false);
+        } else {
+          setStatus("Visual playback only. Enable MIDI Out for external sound.", false);
+        }
         return true;
       }
 
@@ -3372,7 +3406,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         const tickRange = getPlaybackTickRangeFromEvents(events);
         const startTick = Number(tickRange && tickRange.start_tick || 0);
         const endTick = Number(tickRange && tickRange.end_tick || startTick);
-        return playPlaybackEvents(events, "Selected playback started.", {
+        return playPlaybackEvents(events, "Playing selected notes.", {
           timingStartTick: startTick,
           playbackEndTick: endTick,
         });
@@ -3403,7 +3437,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         const playbackEndTick = tickRange
           ? Math.max(regionEnd, Number(tickRange.end_tick || regionEnd))
           : regionEnd;
-        return playPlaybackEvents(events, "Region playback started.", {
+        return playPlaybackEvents(events, "Playing selected region.", {
           timingStartTick: regionStart,
           playbackEndTick: playbackEndTick,
         });
@@ -3418,7 +3452,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         const tickRange = getPlaybackTickRangeFromEvents(events);
         const startTick = Number(tickRange && tickRange.start_tick || 0);
         const endTick = Number(tickRange && tickRange.end_tick || startTick);
-        return playPlaybackEvents(events, "All notes playback started.", {
+        return playPlaybackEvents(events, "Playing all notes.", {
           timingStartTick: startTick,
           playbackEndTick: endTick,
         });
@@ -3451,6 +3485,8 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
                 this.sentMessages.push(Array.from(message || []));
               },
             };
+          } else if (Array.isArray(state.midiOutputTestOverride.sentMessages)) {
+            state.midiOutputTestOverride.sentMessages = [];
           }
           state.midiOutputId = "__test__";
         }
@@ -5720,8 +5756,11 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           hasPlayableSelectedNotes: hasPlayableSelectedNotes,
           hasPlayableRegionOrSelection: hasPlayableRegionOrSelection,
           hasSelectedMidiOutput: hasSelectedMidiOutput,
+          canSendMidiOut: canSendMidiOut,
           canUseMidiPlayback: canUseMidiPlayback,
+          isVisualPlaybackAvailableForMode: isVisualPlaybackAvailableForMode,
           getPlaybackControlState: getPlaybackControlState,
+          updatePlaybackControls: updatePlaybackControls,
           updatePlaybackButtonState: updatePlaybackButtonState,
           getPlaybackVisualState: getPlaybackVisualState,
           setFollowPlayheadForTest: setFollowPlayheadForTest,
