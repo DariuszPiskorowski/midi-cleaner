@@ -289,11 +289,13 @@ def test_generate_piano_roll_preview_contains_editor_toolbar_actions(tmp_path: P
     assert 'id="play-all-btn"' in html
     assert 'id="stop-midi-btn"' in html
     assert 'id="panic-midi-btn"' in html
+    assert 'id="follow-playhead"' in html
     assert 'id="audition-on-click"' in html
     assert "MIDI Out:" in html
     assert "Play Selected" in html
     assert "Play Region" in html
     assert "Play All" in html
+    assert "Follow playhead" in html
     assert "Panic" in html
     assert "Repeats:" in html
     assert 'id="save-session-btn"' not in html
@@ -350,6 +352,7 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function getVelocityBars()" in html
     assert "function velocityBarForNoteId(noteId)" in html
     assert "function drawVelocityLane()" in html
+    assert "function drawPlaybackPlayhead(context)" in html
     assert "function hitTestVelocityBar(x, y)" in html
     assert "function hitTestVelocityBarForApi(x, y)" in html
     assert "function setPasteCursorTick(tick, options)" in html
@@ -363,6 +366,22 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function panViewportByTicks(deltaTicks)" in html
     assert "function panViewportBySemitones(deltaRows)" in html
     assert "function getViewportState()" in html
+    assert "function getVisibleTickRange()" in html
+    assert "function centerViewportOnTick(tick)" in html
+    assert "function setFollowPlayhead(enabled)" in html
+    assert "function setFollowPlayheadForTest(enabled)" in html
+    assert "function getFollowPlayheadForTest()" in html
+    assert "function isNoteActiveForPlayback(noteId)" in html
+    assert "function setActivePlaybackNotesForTest(noteIds)" in html
+    assert "function getPlaybackVisualState()" in html
+    assert "function getPlayheadTickForElapsedMs(elapsedMs)" in html
+    assert "function followPlaybackTickIfNeeded(tick)" in html
+    assert "function stepPlaybackVisualFrame(timestampMs)" in html
+    assert "function startPlaybackVisualFrameLoop()" in html
+    assert "function startPlaybackVisuals(options)" in html
+    assert "function stopPlaybackVisuals(options)" in html
+    assert "function clearPlaybackVisualState()" in html
+    assert "function setPlaybackVisualStateForTest(nextState)" in html
     assert "function getClipboardSummary()" in html
     assert "function clampMidiChannel(value)" in html
     assert "function clampMidiVelocityOn(value)" in html
@@ -376,7 +395,7 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function buildPlaybackEventsForNotes(notes, anchorTick)" in html
     assert "function buildPlaybackEventsForRegion()" in html
     assert "function buildPlaybackEventsForAll()" in html
-    assert "function playPlaybackEvents(events, statusLabel)" in html
+    assert "function playPlaybackEvents(events, statusLabel, options)" in html
     assert "function playSelectedNotes()" in html
     assert "function panicMidiOut()" in html
     assert "function stopMidiPlayback(options)" in html
@@ -424,6 +443,9 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "No MIDI outputs found. Enable Default Basic App Loopback or another virtual MIDI output." in script
     assert "sendMidiMessage([0xB0 | channel, 123, 0]);" in script
     assert "sendMidiMessage([0xB0 | channel, 120, 0]);" in script
+    assert "window.requestAnimationFrame(stepPlaybackVisualFrame);" in script
+    assert "window.cancelAnimationFrame(visuals.animationFrameId);" in script
+    assert "drawPlaybackPlayhead(ctx);" in script
     assert "function setErrorStatus" in html
     assert "console.error(\"MIDI split editor error:\", details);" in script
 
@@ -472,6 +494,16 @@ def test_generate_piano_roll_preview_exposes_snap_controls_in_test_api(tmp_path:
     assert "auditionNote: auditionNote" in script
     assert "panicMidiOut: panicMidiOut" in script
     assert "stopMidiPlayback: stopMidiPlayback" in script
+    assert "getPlaybackVisualState: getPlaybackVisualState" in script
+    assert "setFollowPlayheadForTest: setFollowPlayheadForTest" in script
+    assert "getFollowPlayheadForTest: getFollowPlayheadForTest" in script
+    assert "setPlaybackVisualStateForTest: setPlaybackVisualStateForTest" in script
+    assert "clearPlaybackVisualState: clearPlaybackVisualState" in script
+    assert "startPlaybackVisuals: startPlaybackVisuals" in script
+    assert "stopPlaybackVisuals: stopPlaybackVisuals" in script
+    assert "setActivePlaybackNotesForTest: setActivePlaybackNotesForTest" in script
+    assert "isNoteActiveForPlayback: isNoteActiveForPlayback" in script
+    assert "getPlayheadTickForElapsedMs: getPlayheadTickForElapsedMs" in script
     assert "setPasteCursorTick: function (tick)" in script
     assert "getPasteCursorTick: getPasteCursorTick" in script
     assert "getSelectedNoteIds: function ()" in script
@@ -479,6 +511,8 @@ def test_generate_piano_roll_preview_exposes_snap_controls_in_test_api(tmp_path:
     assert "getKeyboardFocusMode: getKeyboardFocusMode" in script
     assert "panViewportByTicks: function (deltaTicks)" in script
     assert "panViewportBySemitones: function (deltaRows)" in script
+    assert "centerViewportOnTick: function (tick)" in script
+    assert "getVisibleTickRange: getVisibleTickRange" in script
     assert "getViewportState: getViewportState" in script
     assert "moveSelectedNotesByKeyboard: moveSelectedNotesByKeyboard" in script
     assert "adjustSelectedVelocityByKeyboard: adjustSelectedVelocityByKeyboard" in script
@@ -500,9 +534,14 @@ def test_generate_piano_roll_preview_web_midi_playback_builder_behavior_markers(
     assert "channel: clampMidiChannel(note.channel)" in script
     assert "setStatus(\"No notes selected to play.\", false);" in script
     assert "setStatus(\"No region or notes selected to play.\", false);" in script
+    assert "function getPlaybackTickRangeFromEvents(events)" in script
     assert "schedulePlaybackTimer(function () {" in script
-    assert "sendMidiNoteOn(event);" in script
+    assert "const noteWasSent = sendMidiNoteOn(event);" in script
     assert "sendMidiNoteOff(event);" in script
+    assert "state.playbackVisualState.activeNoteIds.add(noteId);" in script
+    assert "state.playbackVisualState.activeNoteIds.delete(noteId);" in script
+    assert "startPlaybackVisuals({" in script
+    assert "setStatus(\"Playback finished.\", false);" in script
 
 
 def test_generate_piano_roll_preview_web_midi_stop_and_panic_behavior_markers(tmp_path: Path) -> None:
@@ -521,8 +560,28 @@ def test_generate_piano_roll_preview_web_midi_stop_and_panic_behavior_markers(tm
     assert "sendMidiMessage([0xB0 | channel, 123, 0]);" in script
     assert "sendMidiMessage([0xB0 | channel, 120, 0]);" in script
     assert "state.midiActiveNotes.clear();" in script
+    assert "stopPlaybackVisuals({ redraw: opts.redrawVisuals !== false, preserveFollowPlayhead: true });" in script
+    assert "stopMidiPlayback({ sendPanic: true });" in script
     assert "setStatus(\"Playback stopped.\", false);" in script
     assert "setStatus(\"MIDI panic sent.\", false);" in script
+
+
+def test_generate_piano_roll_preview_follow_playhead_visual_markers(tmp_path: Path) -> None:
+    session = _create_session(tmp_path)
+    output_html = tmp_path / "split_editor.html"
+
+    generate_piano_roll_preview(session, output_html)
+
+    script = _extract_editor_script(output_html.read_text(encoding="utf-8"))
+    assert 'const followPlayheadEl = document.getElementById("follow-playhead");' in script
+    assert "followPlayheadEl.addEventListener(\"change\", function () {" in script
+    assert "setFollowPlayhead(Boolean(followPlayheadEl.checked));" in script
+    assert "if (active && !muted) {" in script
+    assert "const deadZone = Math.max(1, Number(range.span_ticks) * 0.14);" in script
+    assert "return centerViewportOnTick(tick);" in script
+    assert "const topY = TOP_PAD;" in script
+    assert "const bottomY = state.velocityLaneVisible ? velocityLaneBottomY() : pianoRollBottomY();" in script
+    assert "drawPlaybackPlayhead(ctx);" in script
 
 
 def test_generate_piano_roll_preview_velocity_bar_geometry_and_hit_zone_logic(tmp_path: Path) -> None:

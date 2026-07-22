@@ -168,6 +168,8 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
     <button id="play-all-btn" type="button" disabled>Play All</button>
     <button id="stop-midi-btn" type="button" disabled>Stop</button>
     <button id="panic-midi-btn" type="button" disabled>Panic</button>
+    <label for="follow-playhead">Follow playhead</label>
+    <input id="follow-playhead" type="checkbox" checked />
     <label for="audition-on-click">Audition on click</label>
     <input id="audition-on-click" type="checkbox" checked />
 
@@ -335,6 +337,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       const playAllButton = document.getElementById("play-all-btn");
       const stopMidiButton = document.getElementById("stop-midi-btn");
       const panicMidiButton = document.getElementById("panic-midi-btn");
+      const followPlayheadEl = document.getElementById("follow-playhead");
       const auditionOnClickEl = document.getElementById("audition-on-click");
       const snapEnabledEl = document.getElementById("snap-enabled");
       const snapGridEl = document.getElementById("snap-grid");
@@ -380,6 +383,17 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         midiPlaybackRunning: false,
         midiOutStateChangeHandler: null,
         midiActiveNotes: new Set(),
+        playbackVisualState: {
+          isPlaying: false,
+          timingStartTick: 0,
+          playbackEndTick: 0,
+          currentTick: null,
+          durationMs: 0,
+          frameStartPerfMs: null,
+          animationFrameId: null,
+          activeNoteIds: new Set(),
+          followPlayhead: true,
+        },
         keyboardFocusMode: KEYBOARD_FOCUS_VIEWPORT,
         focusedVelocityNoteId: null,
         focusedVelocityGroupNoteIds: null,
@@ -1486,6 +1500,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         state.velocityValuesVisible = false;
         state.pixelsPerTick = DEFAULT_PIXELS_PER_TICK;
         state.xOffsetTicks = 0;
+        stopPlaybackVisuals({ redraw: false, preserveFollowPlayhead: true });
         clearSelection();
         if (velocityLaneVisibleEl) {
           velocityLaneVisibleEl.checked = true;
@@ -1493,6 +1508,9 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         if (velocityValuesVisibleEl) {
           velocityValuesVisibleEl.checked = false;
           velocityValuesVisibleEl.disabled = false;
+        }
+        if (followPlayheadEl) {
+          followPlayheadEl.checked = Boolean(state.playbackVisualState.followPlayhead);
         }
       }
 
@@ -1521,7 +1539,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       }
 
       function setSessionData(newSession) {
-        stopMidiPlayback({ sendPanic: true });
+        stopMidiPlayback({ sendPanic: true, redrawVisuals: false });
         session = normalizeSession(newSession);
         sortTracks();
         sortNotes();
@@ -2055,6 +2073,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         for (const bar of state.velocityBars) {
           const note = bar.note;
           const selected = state.selectedNoteIds.has(String(note.note_id));
+          const active = isNoteActiveForPlayback(note.note_id);
           const muted = note.muted === true;
           const color = colorForTrack(Number(note.editable_track_index || 0));
 
@@ -2071,6 +2090,15 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           if (selected) {
             ctx.strokeStyle = muted ? "#ffd29a" : "#ffffff";
             ctx.lineWidth = 2;
+            ctx.strokeRect(bar.x + 0.5, bar.y + 0.5, Math.max(1, bar.w - 1), Math.max(1, bar.h - 1));
+            ctx.lineWidth = 1;
+          }
+
+          if (active && !muted) {
+            ctx.fillStyle = "rgba(125, 211, 255, 0.35)";
+            ctx.fillRect(bar.x, bar.y, bar.w, bar.h);
+            ctx.strokeStyle = "#7dd3ff";
+            ctx.lineWidth = 1.5;
             ctx.strokeRect(bar.x + 0.5, bar.y + 0.5, Math.max(1, bar.w - 1), Math.max(1, bar.h - 1));
             ctx.lineWidth = 1;
           }
@@ -2104,6 +2132,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           const trackIndex = Number(note.editable_track_index || 0);
           const color = colorForTrack(trackIndex);
           const selected = state.selectedNoteIds.has(String(note.note_id));
+          const active = isNoteActiveForPlayback(note.note_id);
           const muted = note.muted === true;
 
           ctx.fillStyle = color;
@@ -2126,6 +2155,15 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
             ctx.strokeStyle = selected ? "#ffffff" : "#000000";
             ctx.lineWidth = selected ? 2 : 1;
             ctx.strokeRect(box.x + 0.5, box.y + 0.5, Math.max(0, box.w - 1), Math.max(0, box.h - 1));
+
+            if (active) {
+              ctx.fillStyle = "rgba(125, 211, 255, 0.35)";
+              ctx.fillRect(box.x, box.y, box.w, box.h);
+              ctx.strokeStyle = "#7dd3ff";
+              ctx.lineWidth = selected ? 1.5 : 2;
+              ctx.strokeRect(box.x + 1.5, box.y + 1.5, Math.max(0, box.w - 3), Math.max(0, box.h - 3));
+              ctx.lineWidth = 1;
+            }
           }
         }
         ctx.globalAlpha = 1.0;
@@ -2151,6 +2189,29 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         ctx.setLineDash([]);
       }
 
+      function drawPlaybackPlayhead(context) {
+        const visuals = state.playbackVisualState;
+        if (!Number.isFinite(Number(visuals.currentTick))) {
+          return;
+        }
+
+        const x = Math.round(xForTick(Number(visuals.currentTick))) + 0.5;
+        if (x < LEFT_PAD || x > canvas.width - RIGHT_PAD) {
+          return;
+        }
+
+        const topY = TOP_PAD;
+        const bottomY = state.velocityLaneVisible ? velocityLaneBottomY() : pianoRollBottomY();
+        context.strokeStyle = "#7dd3ff";
+        context.lineWidth = 1.5;
+        context.setLineDash([]);
+        context.beginPath();
+        context.moveTo(x, topY);
+        context.lineTo(x, bottomY);
+        context.stroke();
+        context.lineWidth = 1;
+      }
+
       function redraw() {
         updatePitchRange();
         updateCanvasSize();
@@ -2162,6 +2223,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         drawVelocityLane();
         drawSelectionRectangle();
         drawDrawPreview();
+        drawPlaybackPlayhead(ctx);
       }
 
       function hitTestVelocityBar(x, y) {
@@ -2451,6 +2513,268 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           pitchViewportShift: state.pitchViewportShift,
           visibleTickSpan: getVisibleTickSpan(),
         };
+      }
+
+      function getVisibleTickRange() {
+        const startTick = viewportTickStart();
+        const spanTicks = Math.max(1, getVisibleTickSpan());
+        return {
+          start_tick: startTick,
+          end_tick: startTick + spanTicks,
+          span_ticks: spanTicks,
+        };
+      }
+
+      function centerViewportOnTick(tick) {
+        const parsedTick = Number(tick);
+        if (!Number.isFinite(parsedTick)) {
+          return false;
+        }
+        const visibleSpan = Math.max(1, getVisibleTickSpan());
+        const before = Number(state.xOffsetTicks || 0);
+        state.xOffsetTicks = parsedTick - visibleSpan * 0.5;
+        clampXOffsetTicks();
+        return Math.abs(Number(state.xOffsetTicks || 0) - before) >= 0.25;
+      }
+
+      function setFollowPlayhead(enabled) {
+        state.playbackVisualState.followPlayhead = Boolean(enabled);
+        if (followPlayheadEl) {
+          followPlayheadEl.checked = state.playbackVisualState.followPlayhead;
+        }
+        if (
+          state.playbackVisualState.isPlaying
+          && state.playbackVisualState.followPlayhead
+          && Number.isFinite(Number(state.playbackVisualState.currentTick))
+        ) {
+          const changed = centerViewportOnTick(Number(state.playbackVisualState.currentTick));
+          if (changed) {
+            redraw();
+          }
+        }
+        return state.playbackVisualState.followPlayhead;
+      }
+
+      function setFollowPlayheadForTest(enabled) {
+        return setFollowPlayhead(enabled);
+      }
+
+      function getFollowPlayheadForTest() {
+        return Boolean(state.playbackVisualState.followPlayhead);
+      }
+
+      function isNoteActiveForPlayback(noteId) {
+        const normalized = String(noteId);
+        if (!state.playbackVisualState.activeNoteIds.has(normalized)) {
+          return false;
+        }
+        const note = state.noteById.get(normalized);
+        return Boolean(note && note.muted !== true);
+      }
+
+      function setActivePlaybackNotesForTest(noteIds) {
+        state.playbackVisualState.activeNoteIds.clear();
+        for (const noteId of noteIds || []) {
+          const normalized = String(noteId);
+          const note = state.noteById.get(normalized);
+          if (note && note.muted !== true) {
+            state.playbackVisualState.activeNoteIds.add(normalized);
+          }
+        }
+        redraw();
+        return getPlaybackVisualState();
+      }
+
+      function getPlaybackVisualState() {
+        return {
+          isPlaying: Boolean(state.playbackVisualState.isPlaying),
+          timingStartTick: Number(state.playbackVisualState.timingStartTick || 0),
+          playbackEndTick: Number(state.playbackVisualState.playbackEndTick || 0),
+          currentTick: Number.isFinite(Number(state.playbackVisualState.currentTick))
+            ? Number(state.playbackVisualState.currentTick)
+            : null,
+          durationMs: Number(state.playbackVisualState.durationMs || 0),
+          followPlayhead: Boolean(state.playbackVisualState.followPlayhead),
+          activeNoteIds: Array.from(state.playbackVisualState.activeNoteIds),
+          animationFrameActive: state.playbackVisualState.animationFrameId !== null,
+        };
+      }
+
+      function getPlayheadTickForElapsedMs(elapsedMs) {
+        const visuals = state.playbackVisualState;
+        const startTick = Math.max(0, Number(visuals.timingStartTick || 0));
+        const endTick = Math.max(startTick, Number(visuals.playbackEndTick || startTick));
+        const elapsed = Math.max(0, Number(elapsedMs || 0));
+        const startSec = tickToSeconds(startTick);
+        const currentTick = secondsToTick(startSec + elapsed / 1000);
+        return Math.max(startTick, Math.min(endTick, currentTick));
+      }
+
+      function followPlaybackTickIfNeeded(tick) {
+        const visuals = state.playbackVisualState;
+        if (!visuals.isPlaying || !visuals.followPlayhead) {
+          return false;
+        }
+        const range = getVisibleTickRange();
+        const centerTick = Number(range.start_tick) + Number(range.span_ticks) * 0.5;
+        const deadZone = Math.max(1, Number(range.span_ticks) * 0.14);
+        if (Number(tick) < centerTick - deadZone || Number(tick) > centerTick + deadZone) {
+          return centerViewportOnTick(tick);
+        }
+        return false;
+      }
+
+      function stepPlaybackVisualFrame(timestampMs) {
+        const visuals = state.playbackVisualState;
+        if (!visuals.isPlaying) {
+          visuals.animationFrameId = null;
+          return;
+        }
+
+        const timestamp = Number(timestampMs || window.performance.now());
+        if (!Number.isFinite(Number(visuals.frameStartPerfMs))) {
+          visuals.frameStartPerfMs = timestamp;
+        }
+
+        const elapsedMs = Math.max(0, timestamp - Number(visuals.frameStartPerfMs || timestamp));
+        const nextTick = getPlayheadTickForElapsedMs(elapsedMs);
+        const previousTick = Number.isFinite(Number(visuals.currentTick))
+          ? Number(visuals.currentTick)
+          : null;
+
+        visuals.currentTick = nextTick;
+        const movedViewport = followPlaybackTickIfNeeded(nextTick);
+        const redrawThresholdTicks = Math.max(1, 2 / Math.max(0.01, Number(state.pixelsPerTick || DEFAULT_PIXELS_PER_TICK)));
+        if (
+          movedViewport
+          || previousTick === null
+          || Math.abs(Number(nextTick) - Number(previousTick)) >= redrawThresholdTicks
+        ) {
+          redraw();
+        }
+
+        visuals.animationFrameId = window.requestAnimationFrame(stepPlaybackVisualFrame);
+      }
+
+      function startPlaybackVisualFrameLoop() {
+        const visuals = state.playbackVisualState;
+        if (!visuals.isPlaying) {
+          return;
+        }
+        if (visuals.animationFrameId !== null) {
+          window.cancelAnimationFrame(visuals.animationFrameId);
+          visuals.animationFrameId = null;
+        }
+        visuals.animationFrameId = window.requestAnimationFrame(stepPlaybackVisualFrame);
+      }
+
+      function startPlaybackVisuals(options) {
+        const opts = options && typeof options === "object" ? options : {};
+        const visuals = state.playbackVisualState;
+        const requestedStart = Number(opts.timingStartTick);
+        const requestedEnd = Number(opts.playbackEndTick);
+        visuals.isPlaying = true;
+        visuals.timingStartTick = Number.isFinite(requestedStart) ? Math.max(0, requestedStart) : 0;
+        visuals.playbackEndTick = Number.isFinite(requestedEnd)
+          ? Math.max(visuals.timingStartTick, requestedEnd)
+          : visuals.timingStartTick;
+        visuals.currentTick = visuals.timingStartTick;
+        visuals.durationMs = Math.max(0, Math.round(Number(opts.durationMs || 0)));
+        visuals.frameStartPerfMs = null;
+        visuals.activeNoteIds.clear();
+        if (typeof opts.followPlayhead === "boolean") {
+          visuals.followPlayhead = Boolean(opts.followPlayhead);
+        }
+        if (followPlayheadEl) {
+          followPlayheadEl.checked = visuals.followPlayhead;
+        }
+        if (visuals.followPlayhead) {
+          centerViewportOnTick(visuals.currentTick);
+        }
+        redraw();
+        startPlaybackVisualFrameLoop();
+        return getPlaybackVisualState();
+      }
+
+      function stopPlaybackVisuals(options) {
+        const opts = options && typeof options === "object" ? options : {};
+        const visuals = state.playbackVisualState;
+        const keepFollow = opts.preserveFollowPlayhead !== false;
+        const savedFollow = Boolean(visuals.followPlayhead);
+        const hadVisualState = Boolean(
+          visuals.isPlaying
+          || visuals.currentTick !== null
+          || visuals.activeNoteIds.size > 0
+          || visuals.animationFrameId !== null
+        );
+
+        if (visuals.animationFrameId !== null) {
+          window.cancelAnimationFrame(visuals.animationFrameId);
+        }
+
+        visuals.isPlaying = false;
+        visuals.timingStartTick = 0;
+        visuals.playbackEndTick = 0;
+        visuals.currentTick = null;
+        visuals.durationMs = 0;
+        visuals.frameStartPerfMs = null;
+        visuals.animationFrameId = null;
+        visuals.activeNoteIds.clear();
+        visuals.followPlayhead = keepFollow ? savedFollow : true;
+
+        if (followPlayheadEl) {
+          followPlayheadEl.checked = visuals.followPlayhead;
+        }
+        if (opts.redraw !== false && hadVisualState) {
+          redraw();
+        }
+        return hadVisualState;
+      }
+
+      function clearPlaybackVisualState() {
+        stopPlaybackVisuals({ redraw: true, preserveFollowPlayhead: true });
+        return getPlaybackVisualState();
+      }
+
+      function setPlaybackVisualStateForTest(nextState) {
+        const payload = nextState && typeof nextState === "object" ? nextState : {};
+
+        if (typeof payload.followPlayhead === "boolean") {
+          setFollowPlayhead(payload.followPlayhead);
+        }
+        if (Array.isArray(payload.activeNoteIds)) {
+          setActivePlaybackNotesForTest(payload.activeNoteIds);
+        }
+        if (Number.isFinite(Number(payload.timingStartTick))) {
+          state.playbackVisualState.timingStartTick = Math.max(0, Number(payload.timingStartTick));
+        }
+        if (Number.isFinite(Number(payload.playbackEndTick))) {
+          state.playbackVisualState.playbackEndTick = Math.max(
+            Number(state.playbackVisualState.timingStartTick || 0),
+            Number(payload.playbackEndTick)
+          );
+        }
+        if (payload.currentTick === null) {
+          state.playbackVisualState.currentTick = null;
+        } else if (Number.isFinite(Number(payload.currentTick))) {
+          state.playbackVisualState.currentTick = Number(payload.currentTick);
+        }
+        if (Number.isFinite(Number(payload.durationMs))) {
+          state.playbackVisualState.durationMs = Math.max(0, Math.round(Number(payload.durationMs)));
+        }
+        if (typeof payload.isPlaying === "boolean") {
+          state.playbackVisualState.isPlaying = Boolean(payload.isPlaying);
+        }
+        if (state.playbackVisualState.isPlaying) {
+          startPlaybackVisualFrameLoop();
+        } else if (state.playbackVisualState.animationFrameId !== null) {
+          window.cancelAnimationFrame(state.playbackVisualState.animationFrameId);
+          state.playbackVisualState.animationFrameId = null;
+          state.playbackVisualState.frameStartPerfMs = null;
+        }
+
+        redraw();
+        return getPlaybackVisualState();
       }
 
       function getPasteCursorTick() {
@@ -2763,6 +3087,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         if (opts.sendPanic !== false) {
           panicMidiOut();
         }
+        stopPlaybackVisuals({ redraw: opts.redrawVisuals !== false, preserveFollowPlayhead: true });
         updateMidiOutControls();
       }
 
@@ -2854,7 +3179,25 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         return buildPlaybackEventsForNotes(allNotes, earliestTick);
       }
 
-      function playPlaybackEvents(events, statusLabel) {
+      function getPlaybackTickRangeFromEvents(events) {
+        if (!Array.isArray(events) || !events.length) {
+          return null;
+        }
+        let minStartTick = Number.POSITIVE_INFINITY;
+        let maxEndTick = 0;
+        for (const event of events) {
+          const startTick = Math.max(0, Math.round(Number(event.start_tick || 0)));
+          const endTick = Math.max(startTick, Math.round(Number(event.end_tick || startTick)));
+          minStartTick = Math.min(minStartTick, startTick);
+          maxEndTick = Math.max(maxEndTick, endTick);
+        }
+        return {
+          start_tick: Number.isFinite(minStartTick) ? minStartTick : 0,
+          end_tick: maxEndTick,
+        };
+      }
+
+      function playPlaybackEvents(events, statusLabel, options) {
         const output = resolveSelectedMidiOutput();
         if (!state.midiEnabled || !output) {
           setStatus("Enable MIDI Out and select a MIDI output port first.", true);
@@ -2867,13 +3210,37 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           return false;
         }
 
+        const opts = options && typeof options === "object" ? options : {};
+        const tickRange = getPlaybackTickRangeFromEvents(events);
+        const timingStartTick = Number.isFinite(Number(opts.timingStartTick))
+          ? Math.max(0, Math.round(Number(opts.timingStartTick)))
+          : Number(tickRange && tickRange.start_tick || 0);
+        const playbackEndTick = Number.isFinite(Number(opts.playbackEndTick))
+          ? Math.max(timingStartTick, Math.round(Number(opts.playbackEndTick)))
+          : Number(tickRange && tickRange.end_tick || timingStartTick);
+
         for (const event of events) {
           schedulePlaybackTimer(function () {
-            sendMidiNoteOn(event);
+            const noteWasSent = sendMidiNoteOn(event);
+            if (noteWasSent) {
+              const noteId = String(event.note_id || "");
+              if (noteId && state.noteById.has(noteId)) {
+                const note = state.noteById.get(noteId);
+                if (note && note.muted !== true) {
+                  state.playbackVisualState.activeNoteIds.add(noteId);
+                }
+              }
+              redraw();
+            }
           }, event.start_ms);
 
           schedulePlaybackTimer(function () {
             sendMidiNoteOff(event);
+            const noteId = String(event.note_id || "");
+            if (noteId) {
+              state.playbackVisualState.activeNoteIds.delete(noteId);
+            }
+            redraw();
           }, event.start_ms + event.duration_ms);
         }
 
@@ -2881,9 +3248,17 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           return Number(event.start_ms || 0) + Number(event.duration_ms || 0);
         }));
         state.midiPlaybackRunning = true;
+        startPlaybackVisuals({
+          timingStartTick: timingStartTick,
+          playbackEndTick: playbackEndTick,
+          durationMs: endMs,
+          followPlayhead: state.playbackVisualState.followPlayhead,
+        });
         schedulePlaybackTimer(function () {
           state.midiPlaybackRunning = false;
+          stopPlaybackVisuals({ redraw: true, preserveFollowPlayhead: true });
           updateMidiOutControls();
+          setStatus("Playback finished.", false);
         }, endMs + 30);
         updateMidiOutControls();
         setStatus(String(statusLabel || "Audition started."), false);
@@ -2897,7 +3272,13 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           return false;
         }
         const events = buildPlaybackEventsForNotes(selected);
-        return playPlaybackEvents(events, "Selected playback started.");
+        const tickRange = getPlaybackTickRangeFromEvents(events);
+        const startTick = Number(tickRange && tickRange.start_tick || 0);
+        const endTick = Number(tickRange && tickRange.end_tick || startTick);
+        return playPlaybackEvents(events, "Selected playback started.", {
+          timingStartTick: startTick,
+          playbackEndTick: endTick,
+        });
       }
 
       function playSelectedRegion() {
@@ -2911,12 +3292,31 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           return false;
         }
         const events = buildPlaybackEventsForRegion();
-        return playPlaybackEvents(events, "Region playback started.");
+        const tickRange = getPlaybackTickRangeFromEvents(events);
+        const regionStart = hasRegion
+          ? Math.max(0, Math.round(Number(state.selectionRegion.startTick)))
+          : Number(tickRange && tickRange.start_tick || 0);
+        const regionEnd = hasRegion
+          ? Math.max(regionStart + 1, Math.round(Number(state.selectionRegion.endTick)))
+          : Number(tickRange && tickRange.end_tick || regionStart);
+        const playbackEndTick = tickRange
+          ? Math.max(regionEnd, Number(tickRange.end_tick || regionEnd))
+          : regionEnd;
+        return playPlaybackEvents(events, "Region playback started.", {
+          timingStartTick: regionStart,
+          playbackEndTick: playbackEndTick,
+        });
       }
 
       function playAllNotes() {
         const events = buildPlaybackEventsForAll();
-        return playPlaybackEvents(events, "All notes playback started.");
+        const tickRange = getPlaybackTickRangeFromEvents(events);
+        const startTick = Number(tickRange && tickRange.start_tick || 0);
+        const endTick = Number(tickRange && tickRange.end_tick || startTick);
+        return playPlaybackEvents(events, "All notes playback started.", {
+          timingStartTick: startTick,
+          playbackEndTick: endTick,
+        });
       }
 
       function auditionNote(note) {
@@ -4962,8 +5362,13 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         }
         if (panicMidiButton) {
           panicMidiButton.addEventListener("click", function () {
-            panicMidiOut();
+            stopMidiPlayback({ sendPanic: true });
             setStatus("MIDI panic sent.", false);
+          });
+        }
+        if (followPlayheadEl) {
+          followPlayheadEl.addEventListener("change", function () {
+            setFollowPlayhead(Boolean(followPlayheadEl.checked));
           });
         }
         undoButton.addEventListener("click", undoHistory);
@@ -5075,6 +5480,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         if (velocityValuesVisibleEl) {
           velocityValuesVisibleEl.checked = false;
         }
+        setFollowPlayhead(Boolean(state.playbackVisualState.followPlayhead));
         setTool("select");
         restoreStoredMidiOutputId();
         bindToolbarActions();
@@ -5205,6 +5611,16 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           auditionNote: auditionNote,
           panicMidiOut: panicMidiOut,
           stopMidiPlayback: stopMidiPlayback,
+          getPlaybackVisualState: getPlaybackVisualState,
+          setFollowPlayheadForTest: setFollowPlayheadForTest,
+          getFollowPlayheadForTest: getFollowPlayheadForTest,
+          setPlaybackVisualStateForTest: setPlaybackVisualStateForTest,
+          clearPlaybackVisualState: clearPlaybackVisualState,
+          startPlaybackVisuals: startPlaybackVisuals,
+          stopPlaybackVisuals: stopPlaybackVisuals,
+          setActivePlaybackNotesForTest: setActivePlaybackNotesForTest,
+          isNoteActiveForPlayback: isNoteActiveForPlayback,
+          getPlayheadTickForElapsedMs: getPlayheadTickForElapsedMs,
           setPasteCursorTick: function (tick) {
             setPasteCursorTick(tick, { snap: true });
             redraw();
@@ -5229,6 +5645,14 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
             }
             return changed;
           },
+          centerViewportOnTick: function (tick) {
+            const changed = centerViewportOnTick(tick);
+            if (changed) {
+              redraw();
+            }
+            return changed;
+          },
+          getVisibleTickRange: getVisibleTickRange,
           getViewportState: getViewportState,
           moveSelectedNotesByKeyboard: moveSelectedNotesByKeyboard,
           adjustSelectedVelocityByKeyboard: adjustSelectedVelocityByKeyboard,
