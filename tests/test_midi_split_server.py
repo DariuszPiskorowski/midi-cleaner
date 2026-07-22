@@ -6,6 +6,7 @@ import threading
 import zipfile
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import quote
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -203,22 +204,74 @@ def test_api_import_midi_returns_session_json_with_notes(tmp_path: Path) -> None
         server.server_close()
 
 
+def test_api_import_midi_accepts_user_style_filename(tmp_path: Path) -> None:
+    midi_path = tmp_path / "input.mid"
+    _write_test_midi(midi_path)
+
+    user_style_name = "Played_With_Fire_-_Deep_House__Synth___Synth_.mid"
+    server, thread, base_url = _build_server(_default_session())
+    try:
+        payload = midi_path.read_bytes()
+        status, _headers, body = _request_json(
+            "POST",
+            f"{base_url}/api/import-midi?filename={quote(user_style_name, safe='')}",
+            payload=payload,
+            content_type="application/octet-stream",
+        )
+
+        assert status == 200
+        assert body["source_midi"] == user_style_name
+        assert len(body["notes"]) == 3
+        assert len(body["tracks"]) == 2
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
 def test_api_import_midi_rejects_invalid_payload(tmp_path: Path) -> None:
     _ = tmp_path
     server, thread, base_url = _build_server(_default_session())
     try:
+        payload = b"not-a-midi"
         status, _headers, body = _request_json(
             "POST",
             f"{base_url}/api/import-midi?filename=bad.mid",
-            payload=b"not-a-midi",
+            payload=payload,
             content_type="application/octet-stream",
             allow_error=True,
         )
 
         assert status == 400
         assert body["status"] == "error"
-        assert isinstance(body["message"], str)
-        assert body["message"].strip()
+        assert body["filename"] == "bad.mid"
+        assert body["size_bytes"] == len(payload)
+        assert "Failed to create split session from MIDI 'bad.mid':" in body["message"]
+        assert "Failed to parse MIDI file 'bad.mid':" in body["message"]
+        assert "midi_split_editor_import_" not in body["message"]
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
+def test_api_import_midi_rejects_zero_byte_payload_with_clear_message(tmp_path: Path) -> None:
+    _ = tmp_path
+    server, thread, base_url = _build_server(_default_session())
+    try:
+        status, _headers, body = _request_json(
+            "POST",
+            f"{base_url}/api/import-midi?filename=empty.mid",
+            payload=b"",
+            content_type="application/octet-stream",
+            allow_error=True,
+        )
+
+        assert status == 400
+        assert body["status"] == "error"
+        assert body["message"] == "Empty MIDI payload."
+        assert body["filename"] == "empty.mid"
+        assert body["size_bytes"] == 0
     finally:
         server.shutdown()
         thread.join(timeout=2)

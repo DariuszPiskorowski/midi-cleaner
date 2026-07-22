@@ -91,6 +91,18 @@ def _create_session(tmp_path: Path):
     return create_split_session(midi_path, source="manual", layer="midi")
 
 
+def test_create_split_session_preserves_underlying_import_error_detail(tmp_path: Path) -> None:
+    bad_midi = tmp_path / "bad.mid"
+    bad_midi.write_bytes(b"not-a-midi")
+
+    with pytest.raises(MidiSplitSessionError) as exc_info:
+        create_split_session(bad_midi, source="manual", layer="midi")
+
+    message = str(exc_info.value)
+    assert "Failed to create split session from MIDI 'bad.mid':" in message
+    assert "Failed to parse MIDI file 'bad.mid':" in message
+
+
 def _extract_editor_script(html: str) -> str:
     match = re.search(r"<script>\s*\(function \(\) \{(?P<script>.*)\}\)\(\);\s*</script>", html, re.DOTALL)
     if match is None:

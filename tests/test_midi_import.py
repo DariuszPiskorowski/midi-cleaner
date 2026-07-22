@@ -98,6 +98,33 @@ def test_tempo_change_maps_seconds_deterministically(tmp_path: Path) -> None:
     assert abs(document.notes[0].duration_sec - 1.5) < 1e-9
 
 
+def test_import_leniently_handles_invalid_key_signature_metadata(tmp_path: Path) -> None:
+    track = mido.MidiTrack()
+    track.append(mido.MetaMessage("key_signature", key="C", time=0))
+    track.append(mido.Message("note_on", note=60, velocity=100, time=0, channel=0))
+    track.append(mido.Message("note_off", note=60, velocity=0, time=480, channel=0))
+
+    input_path = tmp_path / "invalid_key_signature.mid"
+    _write_midi_file(input_path, [track])
+
+    raw = bytearray(input_path.read_bytes())
+    marker = bytes([0xFF, 0x59, 0x02])
+    marker_index = raw.find(marker)
+    assert marker_index >= 0
+
+    raw[marker_index + 3] = 0x0E  # 14 sharps is unsupported by strict mido decoding.
+    raw[marker_index + 4] = 0x01
+    input_path.write_bytes(raw)
+
+    document, report = import_midi_candidate(input_path, source="manual", layer="midi")
+
+    assert report.status == "ok"
+    assert report.note_count == 1
+    assert len(document.notes) == 1
+    assert report.warning_count >= 1
+    assert any("unsupported key signature metadata" in warning for warning in report.warnings)
+
+
 def test_cli_import_writes_output_and_report(tmp_path: Path) -> None:
     track = mido.MidiTrack()
     track.append(mido.Message("note_on", note=50, velocity=90, time=0, channel=0))

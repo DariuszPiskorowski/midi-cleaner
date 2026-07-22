@@ -201,24 +201,48 @@ class _MidiSplitEditorRequestHandler(BaseHTTPRequestHandler):
         self._send_error_json(HTTPStatus.NOT_FOUND, f"Unknown endpoint: {parsed.path}")
 
     def _handle_import_midi(self, parsed_url) -> None:
-        raw = self._read_body()
-        if not raw:
-            self._send_error_json(HTTPStatus.BAD_REQUEST, "Empty MIDI payload.")
-            return
-
         query = parse_qs(parsed_url.query)
         filename = query.get("filename", [""])[0]
         if not filename:
             filename = self.headers.get("X-File-Name", "")
+
+        raw = self._read_body()
+        payload_size = len(raw)
         safe_name = _sanitize_filename(filename, "uploaded.mid")
+        display_name = filename.strip() if isinstance(filename, str) and filename.strip() else safe_name
+
+        if not raw:
+            self._send_json(
+                {
+                    "status": "error",
+                    "message": "Empty MIDI payload.",
+                    "filename": display_name,
+                    "size_bytes": payload_size,
+                },
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
 
         with tempfile.TemporaryDirectory(prefix="midi_split_editor_import_") as temp_dir:
             midi_path = Path(temp_dir) / safe_name
             midi_path.write_bytes(raw)
             try:
-                session = create_split_session(midi_path, source="manual", layer="midi")
+                session = create_split_session(
+                    midi_path,
+                    source="manual",
+                    layer="midi",
+                    display_name=display_name,
+                )
             except MidiSplitSessionError as exc:
-                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+                self._send_json(
+                    {
+                        "status": "error",
+                        "message": str(exc),
+                        "filename": display_name,
+                        "size_bytes": payload_size,
+                    },
+                    status=HTTPStatus.BAD_REQUEST,
+                )
                 return
 
         session = session.model_copy(update={"source_midi": safe_name})

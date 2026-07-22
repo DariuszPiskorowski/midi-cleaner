@@ -60,11 +60,17 @@ def create_split_session(
     *,
     source: str = "manual",
     layer: str = "midi",
+    display_name: str | None = None,
 ) -> MidiSplitSession:
+    session_label = display_name.strip() if display_name and display_name.strip() else (input_midi.name.strip() or str(input_midi))
+
     try:
         document, _report = import_midi_candidate(input_midi=input_midi, source=source, layer=layer)
     except MidiImportError as exc:
-        raise MidiSplitSessionError(f"Failed to create split session from MIDI: {input_midi}") from exc
+        detail = str(exc).strip() or type(exc).__name__
+        raise MidiSplitSessionError(
+            f"Failed to create split session from MIDI '{session_label}': {detail}"
+        ) from exc
 
     source_track_indices = sorted({int(note.track_index) for note in document.notes})
     source_track_names: dict[int, str | None] = {}

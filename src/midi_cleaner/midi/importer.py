@@ -3,8 +3,10 @@ from __future__ import annotations
 from bisect import bisect_right
 from collections import defaultdict, deque
 from pathlib import Path
+from threading import Lock
 
 import mido
+from mido.midifiles import meta as mido_meta
 
 from midi_cleaner.midi.models import (
     MidiImportReport,
@@ -19,6 +21,60 @@ SCHEMA_VERSION = "0.1.0"
 
 class MidiImportError(Exception):
     """Raised when a MIDI candidate cannot be imported."""
+
+
+_KEY_SIGNATURE_PATCH_LOCK = Lock()
+
+
+def _display_name_for_error(input_midi: Path) -> str:
+    name = input_midi.name.strip()
+    if name:
+        return name
+    return str(input_midi)
+
+
+def _format_parse_error(input_midi: Path, error: Exception) -> str:
+    detail = str(error).strip() or type(error).__name__
+    return f"Failed to parse MIDI file '{_display_name_for_error(input_midi)}': {detail}"
+
+
+def _is_key_signature_decode_error(error: Exception) -> bool:
+    if isinstance(error, mido_meta.KeySignatureError):
+        return True
+
+    current = error.__cause__
+    while current is not None:
+        if isinstance(current, mido_meta.KeySignatureError):
+            return True
+        current = current.__cause__
+
+    return "Could not decode key with" in str(error)
+
+
+def _load_midi_with_lenient_key_signature(input_midi: Path) -> mido.MidiFile:
+    key_signature_spec = mido_meta._META_SPECS[0x59]
+    original_decode = key_signature_spec.decode
+
+    def decode_lenient(message, data):  # type: ignore[no-untyped-def]
+        try:
+            return original_decode(message, data)
+        except mido_meta.KeySignatureError:
+            if len(data) < 2:
+                raise
+
+            sharps_raw = int(data[0])
+            sharps = sharps_raw if sharps_raw < 128 else sharps_raw - 256
+            mode_raw = int(data[1])
+            clamped_sharps = max(-7, min(7, sharps))
+            normalized_mode = 1 if mode_raw == 1 else 0
+            message.key = mido_meta._key_signature_decode[(clamped_sharps, normalized_mode)]
+
+    with _KEY_SIGNATURE_PATCH_LOCK:
+        key_signature_spec.decode = decode_lenient
+        try:
+            return mido.MidiFile(str(input_midi))
+        finally:
+            key_signature_spec.decode = original_decode
 
 
 def pitch_name_from_midi(note: int) -> str:
@@ -93,16 +149,28 @@ def import_midi_candidate(
     source: str,
     layer: str,
 ) -> tuple[NoteEventDocument, MidiImportReport]:
+    warnings: list[str] = []
+
     if not input_midi.exists() or not input_midi.is_file():
-        raise MidiImportError(f"Input MIDI file does not exist: {input_midi}")
+        raise MidiImportError(
+            f"Input MIDI file does not exist: '{_display_name_for_error(input_midi)}'"
+        )
 
     try:
         midi_file = mido.MidiFile(str(input_midi))
-    except Exception as exc:  # pragma: no cover - library exception type varies
-        raise MidiImportError(f"Failed to parse MIDI file: {input_midi}") from exc
+    except Exception as exc:
+        if _is_key_signature_decode_error(exc):
+            try:
+                midi_file = _load_midi_with_lenient_key_signature(input_midi)
+                warnings.append(
+                    "Encountered unsupported key signature metadata and normalized it during import."
+                )
+            except Exception as fallback_exc:  # pragma: no cover - fallback parse path is rare
+                raise MidiImportError(_format_parse_error(input_midi, fallback_exc)) from fallback_exc
+        else:  # pragma: no cover - library exception type varies
+            raise MidiImportError(_format_parse_error(input_midi, exc)) from exc
 
     ticks_per_beat = midi_file.ticks_per_beat
-    warnings: list[str] = []
 
     tempo_events_raw: list[tuple[int, int, int, int]] = []
     for track_index, track in enumerate(midi_file.tracks):
