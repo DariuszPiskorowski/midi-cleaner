@@ -676,22 +676,69 @@ async function main() {
     }, 0);
 
     editor.setMidiOutEnabledForTest(false);
+    const statusEl = document.getElementById("status-line");
 
+    const waitForActiveHighlight = async (timeoutMs) => {
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < Number(timeoutMs || 0)) {
+        const visualState = editor.getPlaybackVisualState();
+        if (Array.isArray(visualState.activeNoteIds) && visualState.activeNoteIds.length > 0) {
+          return true;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      return false;
+    };
+
+    editor.setTool("zoom");
+    const canvas = document.getElementById("roll-canvas");
+    if (canvas) {
+      const rect = canvas.getBoundingClientRect();
+      for (let i = 0; i < 10; i += 1) {
+        const zoomEvent = new WheelEvent("wheel", {
+          deltaY: -120,
+          clientX: rect.left + rect.width * 0.68,
+          clientY: rect.top + rect.height * 0.3,
+          bubbles: true,
+          cancelable: true,
+        });
+        canvas.dispatchEvent(zoomEvent);
+      }
+    }
+    editor.setTool("select");
+
+    editor.setXOffsetTicksForTest(0);
+    const viewportBeforeFollowOn = editor.getViewState();
     const globalMaxBeforeFollowOn = Number(editor.getSessionMaxTick());
     editor.setFollowPlayheadForTest(true);
     const startedFollowOn = editor.playAllNotes();
-    await new Promise((resolve) => setTimeout(resolve, 220));
+    const statusAfterFollowOnPlay = String(statusEl?.textContent || "");
+    const sawActiveFollowOn = await waitForActiveHighlight(1800);
+    await new Promise((resolve) => setTimeout(resolve, 4500));
+    const viewportAfterFollowOn = editor.getViewState();
     const visualDuringFollowOn = editor.getPlaybackVisualState();
     const globalMaxDuringFollowOn = Number(editor.getSessionMaxTick());
     editor.stopMidiPlayback({ sendPanic: true });
+    const visualAfterFollowOnStop = editor.getPlaybackVisualState();
+    const globalMaxAfterFollowOnStop = Number(editor.getSessionMaxTick());
 
+    editor.setXOffsetTicksForTest(6000);
+    const viewportBeforeFollowOff = editor.getViewState();
     const globalMaxBeforeFollowOff = Number(editor.getSessionMaxTick());
     editor.setFollowPlayheadForTest(false);
     const startedFollowOff = editor.playAllNotes();
-    await new Promise((resolve) => setTimeout(resolve, 220));
+    const statusAfterFollowOffPlay = String(statusEl?.textContent || "");
+    const sawActiveFollowOff = await waitForActiveHighlight(1800);
+    const viewportBeforeFollowOffManualPan = editor.getViewState();
+    const manualPanChanged = editor.panViewportByTicks(4000);
+    const viewportAfterFollowOffManualPan = editor.getViewState();
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    const viewportAfterFollowOffWait = editor.getViewState();
     const visualDuringFollowOff = editor.getPlaybackVisualState();
     const globalMaxDuringFollowOff = Number(editor.getSessionMaxTick());
     editor.stopMidiPlayback({ sendPanic: true });
+    const visualAfterFollowOffStop = editor.getPlaybackVisualState();
+    const globalMaxAfterFollowOffStop = Number(editor.getSessionMaxTick());
 
     const firstNote = notes.reduce((best, note) => {
       if (!best) {
@@ -732,13 +779,31 @@ async function main() {
       playAllEventCount: playAllEvents.length,
       playAllMaxEndTick,
       startedFollowOn,
+      statusAfterFollowOnPlay,
+      sawActiveFollowOn,
+      viewportBeforeFollowOn,
+      viewportAfterFollowOn,
+      followOnOffsetDelta: Number(viewportAfterFollowOn.xOffsetTicks || 0) - Number(viewportBeforeFollowOn.xOffsetTicks || 0),
       visualDuringFollowOn,
+      visualAfterFollowOnStop,
       globalMaxBeforeFollowOn,
       globalMaxDuringFollowOn,
+      globalMaxAfterFollowOnStop,
       startedFollowOff,
+      statusAfterFollowOffPlay,
+      sawActiveFollowOff,
+      viewportBeforeFollowOff,
+      viewportBeforeFollowOffManualPan,
+      viewportAfterFollowOffManualPan,
+      viewportAfterFollowOffWait,
+      manualPanChanged,
+      manualPanDelta: Number(viewportAfterFollowOffManualPan.xOffsetTicks || 0) - Number(viewportBeforeFollowOffManualPan.xOffsetTicks || 0),
+      followOffOffsetDrift: Number(viewportAfterFollowOffWait.xOffsetTicks || 0) - Number(viewportAfterFollowOffManualPan.xOffsetTicks || 0),
       visualDuringFollowOff,
+      visualAfterFollowOffStop,
       globalMaxBeforeFollowOff,
       globalMaxDuringFollowOff,
+      globalMaxAfterFollowOffStop,
       startedRegion,
       visualAtRegionStart,
       regionStart,
@@ -1191,12 +1256,34 @@ def test_browser_long_session_viewport_uses_full_session_range(tmp_path: Path) -
     assert report["playAllMaxEndTick"] >= report["sessionMaxByData"]
 
     assert report["startedFollowOn"] is True
+    assert "Visual playback only. Enable MIDI Out for external sound." in report["statusAfterFollowOnPlay"]
+    assert report["sawActiveFollowOn"] is True
+    assert report["followOnOffsetDelta"] > 100
     assert report["visualDuringFollowOn"]["isPlaying"] is True
+    assert report["visualDuringFollowOn"]["followPlayhead"] is True
+    assert report["visualDuringFollowOn"]["currentTick"] is not None
     assert report["globalMaxBeforeFollowOn"] == pytest.approx(report["globalMaxDuringFollowOn"], abs=1e-6)
+    assert report["globalMaxBeforeFollowOn"] == pytest.approx(report["globalMaxAfterFollowOnStop"], abs=1e-6)
+    assert report["visualAfterFollowOnStop"]["isPlaying"] is False
+    assert report["visualAfterFollowOnStop"]["currentTick"] is None
+    assert report["visualAfterFollowOnStop"]["activeNoteIds"] == []
+    assert report["visualAfterFollowOnStop"]["animationFrameActive"] is False
 
     assert report["startedFollowOff"] is True
+    assert "Visual playback only. Enable MIDI Out for external sound." in report["statusAfterFollowOffPlay"]
+    assert report["sawActiveFollowOff"] is True
+    assert report["manualPanChanged"] is True
+    assert report["manualPanDelta"] == pytest.approx(4000, abs=1)
+    assert abs(report["followOffOffsetDrift"]) < 1
     assert report["visualDuringFollowOff"]["isPlaying"] is True
+    assert report["visualDuringFollowOff"]["followPlayhead"] is False
+    assert report["visualDuringFollowOff"]["currentTick"] is not None
     assert report["globalMaxBeforeFollowOff"] == pytest.approx(report["globalMaxDuringFollowOff"], abs=1e-6)
+    assert report["globalMaxBeforeFollowOff"] == pytest.approx(report["globalMaxAfterFollowOffStop"], abs=1e-6)
+    assert report["visualAfterFollowOffStop"]["isPlaying"] is False
+    assert report["visualAfterFollowOffStop"]["currentTick"] is None
+    assert report["visualAfterFollowOffStop"]["activeNoteIds"] == []
+    assert report["visualAfterFollowOffStop"]["animationFrameActive"] is False
 
     assert report["startedRegion"] is True
     assert report["regionEventMaxEndTick"] >= report["regionStart"]

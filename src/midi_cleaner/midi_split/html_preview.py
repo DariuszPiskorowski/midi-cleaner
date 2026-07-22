@@ -256,6 +256,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       const DEFAULT_TEMPO_US_PER_BEAT = 500000;
       const DEFAULT_TIME_SIGNATURE_NUMERATOR = 4;
       const DEFAULT_TIME_SIGNATURE_DENOMINATOR = 4;
+      const PLAYBACK_VISUAL_FALLBACK_INTERVAL_MS = 40;
       const palette = [
         "#ff6f61", "#6fcf97", "#56ccf2", "#f2c94c", "#bb6bd9", "#f2994a",
         "#2d9cdb", "#9b51e0", "#27ae60", "#eb5757", "#219ebc", "#f77f00"
@@ -389,8 +390,10 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           playbackEndTick: 0,
           currentTick: null,
           durationMs: 0,
+          playbackStartPerfMs: null,
           frameStartPerfMs: null,
           animationFrameId: null,
+          fallbackTimerId: null,
           activeNoteIds: new Set(),
           followPlayhead: true,
         },
@@ -2218,11 +2221,11 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
 
       function drawPlaybackPlayhead(context) {
         const visuals = state.playbackVisualState;
-        if (!Number.isFinite(Number(visuals.currentTick))) {
+        if (typeof visuals.currentTick !== "number" || !Number.isFinite(visuals.currentTick)) {
           return;
         }
 
-        const x = Math.round(xForTick(Number(visuals.currentTick))) + 0.5;
+        const x = Math.round(xForTick(visuals.currentTick)) + 0.5;
         if (x < LEFT_PAD || x > canvas.width - RIGHT_PAD) {
           return;
         }
@@ -2569,12 +2572,14 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         if (followPlayheadEl) {
           followPlayheadEl.checked = state.playbackVisualState.followPlayhead;
         }
+        const currentTick = state.playbackVisualState.currentTick;
         if (
           state.playbackVisualState.isPlaying
           && state.playbackVisualState.followPlayhead
-          && Number.isFinite(Number(state.playbackVisualState.currentTick))
+          && typeof currentTick === "number"
+          && Number.isFinite(currentTick)
         ) {
-          const changed = centerViewportOnTick(Number(state.playbackVisualState.currentTick));
+          const changed = centerViewportOnTick(currentTick);
           if (changed) {
             redraw();
           }
@@ -2613,13 +2618,18 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       }
 
       function getPlaybackVisualState() {
+        const currentTick = (
+          typeof state.playbackVisualState.currentTick === "number"
+          && Number.isFinite(state.playbackVisualState.currentTick)
+        )
+          ? state.playbackVisualState.currentTick
+          : null;
+
         return {
           isPlaying: Boolean(state.playbackVisualState.isPlaying),
           timingStartTick: Number(state.playbackVisualState.timingStartTick || 0),
           playbackEndTick: Number(state.playbackVisualState.playbackEndTick || 0),
-          currentTick: Number.isFinite(Number(state.playbackVisualState.currentTick))
-            ? Number(state.playbackVisualState.currentTick)
-            : null,
+          currentTick: currentTick,
           durationMs: Number(state.playbackVisualState.durationMs || 0),
           followPlayhead: Boolean(state.playbackVisualState.followPlayhead),
           activeNoteIds: Array.from(state.playbackVisualState.activeNoteIds),
@@ -2651,22 +2661,24 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         return false;
       }
 
-      function stepPlaybackVisualFrame(timestampMs) {
+      function advancePlaybackVisualFrame(timestampMs) {
         const visuals = state.playbackVisualState;
         if (!visuals.isPlaying) {
-          visuals.animationFrameId = null;
-          return;
+          return false;
         }
 
-        const timestamp = Number(timestampMs || window.performance.now());
+        const timestamp = Number(window.performance.now());
+        if (!Number.isFinite(Number(visuals.playbackStartPerfMs))) {
+          visuals.playbackStartPerfMs = timestamp;
+        }
         if (!Number.isFinite(Number(visuals.frameStartPerfMs))) {
           visuals.frameStartPerfMs = timestamp;
         }
 
-        const elapsedMs = Math.max(0, timestamp - Number(visuals.frameStartPerfMs || timestamp));
+        const elapsedMs = Math.max(0, timestamp - Number(visuals.playbackStartPerfMs));
         const nextTick = getPlayheadTickForElapsedMs(elapsedMs);
-        const previousTick = Number.isFinite(Number(visuals.currentTick))
-          ? Number(visuals.currentTick)
+        const previousTick = (typeof visuals.currentTick === "number" && Number.isFinite(visuals.currentTick))
+          ? visuals.currentTick
           : null;
 
         visuals.currentTick = nextTick;
@@ -2680,6 +2692,18 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           redraw();
         }
 
+        return true;
+      }
+
+      function stepPlaybackVisualFrame(timestampMs) {
+        const visuals = state.playbackVisualState;
+        if (!visuals.isPlaying) {
+          visuals.animationFrameId = null;
+          return;
+        }
+
+        advancePlaybackVisualFrame(timestampMs);
+
         visuals.animationFrameId = window.requestAnimationFrame(stepPlaybackVisualFrame);
       }
 
@@ -2692,6 +2716,15 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           window.cancelAnimationFrame(visuals.animationFrameId);
           visuals.animationFrameId = null;
         }
+        if (visuals.fallbackTimerId !== null) {
+          window.clearInterval(visuals.fallbackTimerId);
+          visuals.fallbackTimerId = null;
+        }
+
+        visuals.fallbackTimerId = window.setInterval(function () {
+          advancePlaybackVisualFrame(window.performance.now());
+        }, PLAYBACK_VISUAL_FALLBACK_INTERVAL_MS);
+
         visuals.animationFrameId = window.requestAnimationFrame(stepPlaybackVisualFrame);
       }
 
@@ -2707,6 +2740,7 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           : visuals.timingStartTick;
         visuals.currentTick = visuals.timingStartTick;
         visuals.durationMs = Math.max(0, Math.round(Number(opts.durationMs || 0)));
+        visuals.playbackStartPerfMs = Number(window.performance.now());
         visuals.frameStartPerfMs = null;
         visuals.activeNoteIds.clear();
         if (typeof opts.followPlayhead === "boolean") {
@@ -2733,10 +2767,14 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           || visuals.currentTick !== null
           || visuals.activeNoteIds.size > 0
           || visuals.animationFrameId !== null
+          || visuals.fallbackTimerId !== null
         );
 
         if (visuals.animationFrameId !== null) {
           window.cancelAnimationFrame(visuals.animationFrameId);
+        }
+        if (visuals.fallbackTimerId !== null) {
+          window.clearInterval(visuals.fallbackTimerId);
         }
 
         visuals.isPlaying = false;
@@ -2744,8 +2782,10 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         visuals.playbackEndTick = 0;
         visuals.currentTick = null;
         visuals.durationMs = 0;
+        visuals.playbackStartPerfMs = null;
         visuals.frameStartPerfMs = null;
         visuals.animationFrameId = null;
+        visuals.fallbackTimerId = null;
         visuals.activeNoteIds.clear();
         visuals.followPlayhead = keepFollow ? savedFollow : true;
 
@@ -2789,14 +2829,30 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         if (Number.isFinite(Number(payload.durationMs))) {
           state.playbackVisualState.durationMs = Math.max(0, Math.round(Number(payload.durationMs)));
         }
+        if (Number.isFinite(Number(payload.playbackStartPerfMs))) {
+          state.playbackVisualState.playbackStartPerfMs = Number(payload.playbackStartPerfMs);
+        }
         if (typeof payload.isPlaying === "boolean") {
           state.playbackVisualState.isPlaying = Boolean(payload.isPlaying);
         }
         if (state.playbackVisualState.isPlaying) {
+          if (!Number.isFinite(Number(state.playbackVisualState.playbackStartPerfMs))) {
+            state.playbackVisualState.playbackStartPerfMs = Number(window.performance.now());
+          }
           startPlaybackVisualFrameLoop();
         } else if (state.playbackVisualState.animationFrameId !== null) {
           window.cancelAnimationFrame(state.playbackVisualState.animationFrameId);
           state.playbackVisualState.animationFrameId = null;
+          state.playbackVisualState.playbackStartPerfMs = null;
+          state.playbackVisualState.frameStartPerfMs = null;
+          if (state.playbackVisualState.fallbackTimerId !== null) {
+            window.clearInterval(state.playbackVisualState.fallbackTimerId);
+            state.playbackVisualState.fallbackTimerId = null;
+          }
+        } else if (state.playbackVisualState.fallbackTimerId !== null) {
+          window.clearInterval(state.playbackVisualState.fallbackTimerId);
+          state.playbackVisualState.fallbackTimerId = null;
+          state.playbackVisualState.playbackStartPerfMs = null;
           state.playbackVisualState.frameStartPerfMs = null;
         }
 
@@ -3410,7 +3466,9 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           timingStartTick: timingStartTick,
           playbackEndTick: playbackEndTick,
           durationMs: endMs,
-          followPlayhead: state.playbackVisualState.followPlayhead,
+          followPlayhead: followPlayheadEl
+            ? Boolean(followPlayheadEl.checked)
+            : Boolean(state.playbackVisualState.followPlayhead),
         });
         schedulePlaybackTimer(function () {
           state.midiPlaybackRunning = false;
