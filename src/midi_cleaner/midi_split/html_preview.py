@@ -2884,41 +2884,125 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
         });
       }
 
+      function hasPlayableNotes() {
+        return session.notes.some(function (note) {
+          return note && note.muted !== true;
+        });
+      }
+
+      function hasPlayableSelectedNotes() {
+        const selectedNotes = getSelectedNotes();
+        return selectedNotes.some(function (note) {
+          return note && note.muted !== true;
+        });
+      }
+
+      function hasPlayableRegionOrSelection() {
+        const playableSelection = hasPlayableSelectedNotes();
+        const hasRegion = Boolean(
+          state.selectionRegion
+          && Number.isFinite(Number(state.selectionRegion.startTick))
+          && Number.isFinite(Number(state.selectionRegion.endTick))
+        );
+        if (!hasRegion) {
+          return playableSelection;
+        }
+
+        const regionStart = Math.max(0, Math.round(Number(state.selectionRegion.startTick)));
+        const regionEnd = Math.max(regionStart + 1, Math.round(Number(state.selectionRegion.endTick)));
+        const regionHasPlayable = session.notes.some(function (note) {
+          if (!note || note.muted === true) {
+            return false;
+          }
+          const startTick = Math.max(0, Math.round(Number(note.start_tick || 0)));
+          const endTick = Math.max(startTick, Math.round(Number(note.end_tick || startTick)));
+          return startTick < regionEnd && endTick > regionStart;
+        });
+
+        return regionHasPlayable || playableSelection;
+      }
+
+      function hasSelectedMidiOutput() {
+        return Boolean(resolveSelectedMidiOutput());
+      }
+
+      function canUseMidiPlayback() {
+        return Boolean(state.midiEnabled && hasSelectedMidiOutput());
+      }
+
+      function getPlaybackControlState() {
+        const output = resolveSelectedMidiOutput();
+        const hasOutput = Boolean(output);
+        const midiEnabled = Boolean(state.midiEnabled);
+        const canSend = Boolean(midiEnabled && hasOutput);
+        const playableNotes = hasPlayableNotes();
+        const playableSelectedNotes = hasPlayableSelectedNotes();
+        const playableRegionOrSelection = hasPlayableRegionOrSelection();
+        const playbackRunning = Boolean(state.midiPlaybackRunning);
+
+        return {
+          midi_enabled: midiEnabled,
+          has_selected_output: hasOutput,
+          can_send: canSend,
+          has_playable_notes: playableNotes,
+          has_playable_selected_notes: playableSelectedNotes,
+          has_playable_region_or_selection: playableRegionOrSelection,
+          playback_running: playbackRunning,
+          play_all_enabled: Boolean(canSend && playableNotes),
+          play_selected_enabled: Boolean(canSend && playableSelectedNotes),
+          play_region_enabled: Boolean(canSend && playableRegionOrSelection),
+          stop_enabled: Boolean(midiEnabled || playbackRunning),
+          panic_enabled: midiEnabled,
+        };
+      }
+
+      function updatePlaybackButtonState() {
+        const playbackState = getPlaybackControlState();
+        if (auditionSelectedButton) {
+          auditionSelectedButton.disabled = !playbackState.play_selected_enabled;
+        }
+        if (playRegionButton) {
+          playRegionButton.disabled = !playbackState.play_region_enabled;
+        }
+        if (playAllButton) {
+          playAllButton.disabled = !playbackState.play_all_enabled;
+        }
+        if (stopMidiButton) {
+          stopMidiButton.disabled = !playbackState.stop_enabled;
+        }
+        if (panicMidiButton) {
+          panicMidiButton.disabled = !playbackState.panic_enabled;
+        }
+        return playbackState;
+      }
+
       function getMidiOutState() {
+        const playbackState = getPlaybackControlState();
         return {
           web_midi_available: webMidiAvailable(),
           enabled: Boolean(state.midiEnabled),
           output_count: midiOutputCount(),
           selected_output_id: state.midiOutputId,
+          selected_output_available: playbackState.has_selected_output,
+          can_playback: playbackState.can_send,
+          play_all_enabled: playbackState.play_all_enabled,
+          play_selected_enabled: playbackState.play_selected_enabled,
+          play_region_enabled: playbackState.play_region_enabled,
+          stop_enabled: playbackState.stop_enabled,
+          panic_enabled: playbackState.panic_enabled,
           playback_running: Boolean(state.midiPlaybackRunning),
           audition_on_click: Boolean(auditionOnClickEl && auditionOnClickEl.checked),
         };
       }
 
       function updateMidiOutControls() {
-        const output = resolveSelectedMidiOutput();
-        const canSend = Boolean(state.midiEnabled && output);
         if (midiOutEnableButton) {
           midiOutEnableButton.textContent = state.midiEnabled ? "Enabled" : "Enable";
         }
         if (midiOutPortEl) {
           midiOutPortEl.disabled = !state.midiEnabled;
         }
-        if (auditionSelectedButton) {
-          auditionSelectedButton.disabled = !canSend;
-        }
-        if (playRegionButton) {
-          playRegionButton.disabled = !canSend;
-        }
-        if (playAllButton) {
-          playAllButton.disabled = !canSend;
-        }
-        if (stopMidiButton) {
-          stopMidiButton.disabled = !state.midiEnabled;
-        }
-        if (panicMidiButton) {
-          panicMidiButton.disabled = !state.midiEnabled;
-        }
+        updatePlaybackButtonState();
       }
 
       function refreshMidiOutPortList() {
@@ -2996,6 +3080,11 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           refreshMidiOutPortList();
           if (midiOutputCount() > 0) {
             setStatus("MIDI Out enabled.", false);
+            if (!hasSelectedMidiOutput()) {
+              setStatus("Select a MIDI output first.", true);
+            }
+          } else {
+            setStatus("No MIDI outputs found. Enable Default Basic App Loopback or another virtual MIDI output.", false);
           }
           updateMidiOutControls();
           return true;
@@ -3198,9 +3287,13 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       }
 
       function playPlaybackEvents(events, statusLabel, options) {
+        if (!state.midiEnabled) {
+          setStatus("Enable MIDI Out first.", true);
+          return false;
+        }
         const output = resolveSelectedMidiOutput();
-        if (!state.midiEnabled || !output) {
-          setStatus("Enable MIDI Out and select a MIDI output port first.", true);
+        if (!output) {
+          setStatus("Select a MIDI output first.", true);
           return false;
         }
 
@@ -3271,6 +3364,10 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           setStatus("No notes selected to play.", false);
           return false;
         }
+        if (!hasPlayableSelectedNotes()) {
+          setStatus("No notes selected to play.", false);
+          return false;
+        }
         const events = buildPlaybackEventsForNotes(selected);
         const tickRange = getPlaybackTickRangeFromEvents(events);
         const startTick = Number(tickRange && tickRange.start_tick || 0);
@@ -3288,6 +3385,10 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           && Number.isFinite(Number(state.selectionRegion.endTick))
         );
         if (!hasRegion && getSelectedNotes().length === 0) {
+          setStatus("No region or notes selected to play.", false);
+          return false;
+        }
+        if (!hasPlayableRegionOrSelection()) {
           setStatus("No region or notes selected to play.", false);
           return false;
         }
@@ -3309,6 +3410,10 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
       }
 
       function playAllNotes() {
+        if (!hasPlayableNotes()) {
+          setStatus("No notes to play.", false);
+          return false;
+        }
         const events = buildPlaybackEventsForAll();
         const tickRange = getPlaybackTickRangeFromEvents(events);
         const startTick = Number(tickRange && tickRange.start_tick || 0);
@@ -5611,6 +5716,13 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           auditionNote: auditionNote,
           panicMidiOut: panicMidiOut,
           stopMidiPlayback: stopMidiPlayback,
+          hasPlayableNotes: hasPlayableNotes,
+          hasPlayableSelectedNotes: hasPlayableSelectedNotes,
+          hasPlayableRegionOrSelection: hasPlayableRegionOrSelection,
+          hasSelectedMidiOutput: hasSelectedMidiOutput,
+          canUseMidiPlayback: canUseMidiPlayback,
+          getPlaybackControlState: getPlaybackControlState,
+          updatePlaybackButtonState: updatePlaybackButtonState,
           getPlaybackVisualState: getPlaybackVisualState,
           setFollowPlayheadForTest: setFollowPlayheadForTest,
           getFollowPlayheadForTest: getFollowPlayheadForTest,
@@ -5672,6 +5784,21 @@ def render_piano_roll_preview_html(session: MidiSplitSession) -> str:
           clearSelection: function () {
             clearSelection();
             redraw();
+          },
+          setSelectionRegionForTest: function (startTick, endTick) {
+            if (!Number.isFinite(Number(startTick)) || !Number.isFinite(Number(endTick))) {
+              state.selectionRegion = null;
+            } else {
+              const start = Math.max(0, Math.round(Number(startTick)));
+              const end = Math.max(start + 1, Math.round(Number(endTick)));
+              state.selectionRegion = {
+                startTick: start,
+                endTick: end,
+              };
+            }
+            updateEditorActionButtons();
+            redraw();
+            return getPlaybackControlState();
           },
           getViewState: function () {
             return getViewportState();

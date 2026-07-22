@@ -387,6 +387,13 @@ def test_generate_piano_roll_preview_contains_interactive_editor_js_functions(tm
     assert "function clampMidiVelocityOn(value)" in html
     assert "function requestMidiOutAccess()" in html
     assert "function getMidiOutputPorts()" in html
+    assert "function hasPlayableNotes()" in html
+    assert "function hasPlayableSelectedNotes()" in html
+    assert "function hasPlayableRegionOrSelection()" in html
+    assert "function hasSelectedMidiOutput()" in html
+    assert "function canUseMidiPlayback()" in html
+    assert "function getPlaybackControlState()" in html
+    assert "function updatePlaybackButtonState()" in html
     assert "function enableMidiOut()" in html
     assert "function selectMidiOutputPort(portId)" in html
     assert "function sendMidiNoteOn(note)" in html
@@ -494,6 +501,13 @@ def test_generate_piano_roll_preview_exposes_snap_controls_in_test_api(tmp_path:
     assert "auditionNote: auditionNote" in script
     assert "panicMidiOut: panicMidiOut" in script
     assert "stopMidiPlayback: stopMidiPlayback" in script
+    assert "hasPlayableNotes: hasPlayableNotes" in script
+    assert "hasPlayableSelectedNotes: hasPlayableSelectedNotes" in script
+    assert "hasPlayableRegionOrSelection: hasPlayableRegionOrSelection" in script
+    assert "hasSelectedMidiOutput: hasSelectedMidiOutput" in script
+    assert "canUseMidiPlayback: canUseMidiPlayback" in script
+    assert "getPlaybackControlState: getPlaybackControlState" in script
+    assert "updatePlaybackButtonState: updatePlaybackButtonState" in script
     assert "getPlaybackVisualState: getPlaybackVisualState" in script
     assert "setFollowPlayheadForTest: setFollowPlayheadForTest" in script
     assert "getFollowPlayheadForTest: getFollowPlayheadForTest" in script
@@ -534,6 +548,12 @@ def test_generate_piano_roll_preview_web_midi_playback_builder_behavior_markers(
     assert "channel: clampMidiChannel(note.channel)" in script
     assert "setStatus(\"No notes selected to play.\", false);" in script
     assert "setStatus(\"No region or notes selected to play.\", false);" in script
+    assert "setStatus(\"No notes to play.\", false);" in script
+    assert "setStatus(\"Enable MIDI Out first.\", true);" in script
+    assert "setStatus(\"Select a MIDI output first.\", true);" in script
+    assert "play_all_enabled: Boolean(canSend && playableNotes)," in script
+    assert "play_selected_enabled: Boolean(canSend && playableSelectedNotes)," in script
+    assert "play_region_enabled: Boolean(canSend && playableRegionOrSelection)," in script
     assert "function getPlaybackTickRangeFromEvents(events)" in script
     assert "schedulePlaybackTimer(function () {" in script
     assert "const noteWasSent = sendMidiNoteOn(event);" in script
