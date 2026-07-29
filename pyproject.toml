@@ -9,7 +9,7 @@ description = "Hermes MIDI Fidelity Engine - Milestone 1 environment guard"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
-  "typer>=0.26.8,<1.0",
+  "typer>=0.27.0,<1.0",
   "rich>=15.0.0,<16.0",
   "pydantic>=2.8,<3.0",
   "packaging>=26.2,<27.0",
