@@ -22,7 +22,7 @@ jobs:
         uses: astral-sh/setup-uv@v6
 
       - name: Run tests
-        run: python -m uv run pytest
+        run: uv run pytest
 
       - name: Run doctor
-        run: python -m uv run midi-cleaner doctor --json
+        run: uv run midi-cleaner doctor --json
