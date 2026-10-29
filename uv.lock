@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = "==3.11.*"
 
 [[package]]
@@ -250,7 +250,7 @@ wheels = [
 
 [[package]]
 name = "openai"
-version = "3.35.1"
+version = "3.38.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -260,9 +260,9 @@ dependencies = [
     { name = "sniffio" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/87/4c/609b16f2a6e9a99f27a82ce93ff75868e7cb364fe6daff50cc0c1d620772/openai-3.35.1.tar.gz", hash = "sha256:b33e6561b90586e450def8a388e7d364755325da6884fc71348be5542e043bd0", size = 2250942, upload-time = "2026-10-18T01:06:38.964Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e5/f4/8f5ede1d18ea9014588a92ea5e07be317e309b3385319a52596841312a0a/openai-3.38.0.tar.gz", hash = "sha256:bcd9f9157706ae75c45799aa1580f989c4eeba57de778f2edae3782ce7446bb8", size = 2376064, upload-time = "2026-10-26T16:36:03.403Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/22/7b/6d7e70f0762d1b286051bd7cb2fd0c364c1830d0f8826738673aeec05c2b/openai-3.35.1-py3-none-any.whl", hash = "sha256:264fd0fafc889021f526b7c1e5a2df5ca3e8dea874738ecd31da666434f25967", size = 2280230, upload-time = "2026-10-18T01:06:36.16Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/2d/4ea68bbaf0b34aed51dc08431631ed770ddb8b3137252df1b5a592d41299/openai-3.38.0-py3-none-any.whl", hash = "sha256:d5d71ce6bc6a724d32df268cfd17910f56af1f4afe9056e4e7361105c2d92a2a", size = 2352786, upload-time = "2026-10-26T16:36:00.926Z" },
 ]
 
 [[package]]
